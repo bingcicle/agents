@@ -10,13 +10,13 @@
 <br />
 <div align="center">
   <a href="https://github.com/polymarket/agents">
-    <img src="docs/images/cli.png" alt="Logo" width="466" height="262">
+    <img src="docs/images/cli.png" alt="Polymarket Agents CLI" width="466" height="262">
   </a>
 
-<h3 align="center">Polymarket Agents</h3>
+  <h3 align="center">Polymarket Agents</h3>
 
   <p align="center">
-    Trade autonomously on Polymarket using AI Agents
+    Trade autonomously on Polymarket using AI agents
     <br />
     <a href="https://github.com/polymarket/agents"><strong>Explore the docs »</strong></a>
     <br />
@@ -35,175 +35,179 @@
 
 Polymarket Agents is a developer framework and set of utilities for building AI agents for Polymarket.
 
-This code is free and publicly available under MIT License open source license ([terms of service](#terms-of-service))!
+This code is open source under the MIT License. **Note:** using agents to trade on Polymarket is subject to the platform's [Terms of Service](#terms-of-service).
 
 ## Features
 
-- Integration with Polymarket API
-- AI agent utilities for prediction markets
+- Integration with the Polymarket API
+- AI agent utilities tailored for prediction markets
 - Local and remote RAG (Retrieval-Augmented Generation) support
 - Data sourcing from betting services, news providers, and web search
-- Comphrehensive LLM tools for prompt engineering
+- Comprehensive LLM tooling for prompt engineering
 
-# Getting started
+## Getting Started
 
-This repo is inteded for use with Python 3.9
+This repository targets **Python 3.9**.
 
-1. Clone the repository
+1. **Clone the repository**
 
-   ```
-   git clone https://github.com/{username}/polymarket-agents.git
-   cd polymarket-agents
-   ```
-
-2. Create the virtual environment
-
-   ```
-   virtualenv --python=python3.9 .venv
+   ```bash
+   git clone https://github.com/polymarket/agents.git
+   cd agents
    ```
 
-3. Activate the virtual environment
+2. **Create a virtual environment**
 
-   - On Windows:
+   - macOS/Linux:
 
-   ```
-   .venv\Scripts\activate
-   ```
+     ```bash
+     python3.9 -m venv .venv
+     source .venv/bin/activate
+     ```
 
-   - On macOS and Linux:
+   - Windows (PowerShell):
 
-   ```
-   source .venv/bin/activate
-   ```
+     ```powershell
+     py -3.9 -m venv .venv
+     .\.venv\Scripts\Activate.ps1
+     ```
 
-4. Install the required dependencies:
+3. **Upgrade pip and install dependencies**
 
-   ```
+   ```bash
+   python -m pip install --upgrade pip
    pip install -r requirements.txt
    ```
 
-5. Set up your environment variables:
+4. **Set up environment variables**
 
-   - Create a `.env` file in the project root directory
+   Create a `.env` file in the project root (you can copy the example):
 
-   ```
+   ```bash
    cp .env.example .env
    ```
 
-   - Add the following environment variables:
+   Then set the following variables:
 
-   ```
+   ```dotenv
    POLYGON_WALLET_PRIVATE_KEY=""
    OPENAI_API_KEY=""
    ```
 
-6. Load your wallet with USDC.
+5. **Fund your wallet with USDC.**
 
-7. Try the command line interface...
+6. **Run the CLI**
 
-   ```
+   ```bash
    python scripts/python/cli.py
    ```
 
-   Or just go trade! 
+   Or try the trading script:
 
-   ```
+   ```bash
    python agents/application/trade.py
    ```
 
-8. Note: If running the command outside of docker, please set the following env var:
+7. **PYTHONPATH (when running outside Docker)**
 
-   ```
-   export PYTHONPATH="."
-   ```
+   - macOS/Linux:
 
-   If running with docker is preferred, we provide the following scripts:
+     ```bash
+     export PYTHONPATH="."
+     ```
 
-   ```
+   - Windows (PowerShell):
+
+     ```powershell
+     $env:PYTHONPATH = "."
+     ```
+
+8. **Docker (optional)**
+
+   Use the provided helper scripts:
+
+   ```bash
    ./scripts/bash/build-docker.sh
    ./scripts/bash/run-docker-dev.sh
    ```
 
 ## Architecture
 
-The Polymarket Agents architecture features modular components that can be maintained and extended by individual community members.
+Polymarket Agents uses a modular architecture so community members can contribute to and extend individual components.
 
 ### APIs
 
-Polymarket Agents connectors standardize data sources and order types.
+Connectors standardize data sources and order types:
 
-- `Chroma.py`: chroma DB for vectorizing news sources and other API data. Developers are able to add their own vector database implementations.
-
-- `Gamma.py`: defines `GammaMarketClient` class, which interfaces with the Polymarket Gamma API to fetch and parse market and event metadata. Methods to retrieve current and tradable markets, as well as defined information on specific markets and events.
-
-- `Polymarket.py`: defines a Polymarket class that interacts with the Polymarket API to retrieve and manage market and event data, and to execute orders on the Polymarket DEX. It includes methods for API key initialization, market and event data retrieval, and trade execution. The file also provides utility functions for building and signing orders, as well as examples for testing API interactions.
-
-- `Objects.py`: data models using Pydantic; representations for trades, markets, events, and related entities.
+- **`Chroma.py`** — ChromaDB integration for vectorizing news sources and other API data. You can add alternative vector DB implementations.
+- **`Gamma.py`** — `GammaMarketClient` for interacting with the Polymarket Gamma API to fetch/parse market & event metadata. Includes methods to retrieve current/tradable markets and details for specific markets/events.
+- **`Polymarket.py`** — High-level client that interacts with the Polymarket API to retrieve market/event data and execute orders on the Polymarket DEX. Includes utility functions for building/signing orders and testing API interactions.
+- **`Objects.py`** — Pydantic data models representing trades, markets, events, and related entities.
 
 ### Scripts
 
-Files for managing your local environment, server set-up to run the application remotely, and cli for end-user commands.
+Utilities for local environment management, server setup for remote runs, and the CLI for end users.
 
-`cli.py` is the primary user interface for the repo. Users can run various commands to interact with the Polymarket API, retrieve relevant news articles, query local data, send data/prompts to LLMs, and execute trades in Polymarkets.
+`cli.py` is the main entry point for interacting with the Polymarket API, retrieving relevant news, querying local data, prompting LLMs, and executing trades on Polymarket.
 
-Commands should follow this format:
+**Command format:**
 
-`python scripts/python/cli.py command_name [attribute value] [attribute value]`
+```bash
+python scripts/python/cli.py <command> [--flag value] [--flag value]
+```
 
-Example:
+**Example: get all markets** — retrieve and display a list of markets from Polymarket, sorted by volume:
 
-`get-all-markets`
-Retrieve and display a list of markets from Polymarket, sorted by volume.
+```bash
+python scripts/python/cli.py get-all-markets --limit <LIMIT> --sort-by <SORT_BY>
+```
 
-   ```
-   python scripts/python/cli.py get-all-markets --limit <LIMIT> --sort-by <SORT_BY>
-   ```
+- `--limit` — number of markets to retrieve (default: `5`)
+- `--sort-by` — sorting criterion (default: `volume`)
 
-- limit: The number of markets to retrieve (default: 5).
-- sort_by: The sorting criterion, either volume (default) or another valid attribute.
+## Contributing
 
-# Contributing
+Contributions are welcome!
 
-If you would like to contribute to this project, please follow these steps:
+1. Fork the repository
+2. Create a feature branch
+3. Make your changes
+4. Run linters/tests (and pre-commit hooks if enabled)
+5. Open a pull request
 
-1. Fork the repository.
-2. Create a new branch.
-3. Make your changes.
-4. Submit a pull request.
+Initialize pre-commit hooks:
 
-Please run pre-commit hooks before making contributions. To initialize them:
+```bash
+pre-commit install
+```
 
-   ```
-   pre-commit install
-   ```
+## Related Repositories
 
-# Related Repos
+- [py-clob-client](https://github.com/Polymarket/py-clob-client) — Python client for the Polymarket CLOB
+- [python-order-utils](https://github.com/Polymarket/python-order-utils) — Python utilities to generate/sign orders for the Polymarket CLOB
+- [Polymarket CLOB client](https://github.com/Polymarket/clob-client) — TypeScript client for the Polymarket CLOB
+- [LangChain](https://github.com/langchain-ai/langchain) — Utilities for building context-aware reasoning applications
+- [Chroma](https://docs.trychroma.com/getting-started) — Open-source vector database
 
-- [py-clob-client](https://github.com/Polymarket/py-clob-client): Python client for the Polymarket CLOB
-- [python-order-utils](https://github.com/Polymarket/python-order-utils): Python utilities to generate and sign orders from Polymarket's CLOB
-- [Polymarket CLOB client](https://github.com/Polymarket/clob-client): Typescript client for Polymarket CLOB
-- [Langchain](https://github.com/langchain-ai/langchain): Utility for building context-aware reasoning applications
-- [Chroma](https://docs.trychroma.com/getting-started): Chroma is an AI-native open-source vector database
+## Further Reading (Prediction Markets)
 
-# Prediction markets reading
+- Mikey 0x — *Prediction Markets: Bottlenecks and the Next Major Unlocks*: https://mirror.xyz/1kx.eth/jnQhA56Kx9p3RODKiGzqzHGGEODpbskivUUNdd7hwh0
+- Vitalik Buterin — *The promise and challenges of crypto + AI applications*: https://vitalik.eth.limo/general/2024/01/30/cryptoai.html
+- Schoemaker & Tetlock — *Superforecasting: How to Upgrade Your Company's Judgment*: https://hbr.org/2016/05/superforecasting-how-to-upgrade-your-companys-judgment
 
-- Prediction Markets: Bottlenecks and the Next Major Unlocks, Mikey 0x: https://mirror.xyz/1kx.eth/jnQhA56Kx9p3RODKiGzqzHGGEODpbskivUUNdd7hwh0
-- The promise and challenges of crypto + AI applications, Vitalik Buterin: https://vitalik.eth.limo/general/2024/01/30/cryptoai.html
-- Superforecasting: How to Upgrade Your Company's Judgement, Schoemaker and Tetlock: https://hbr.org/2016/05/superforecasting-how-to-upgrade-your-companys-judgment
+## License
 
-# License
+This project is licensed under the MIT License. See [LICENSE](https://github.com/Polymarket/agents/blob/main/LICENSE.md) for details.
 
-This project is licensed under the MIT License. See the [LICENSE](https://github.com/Polymarket/agents/blob/main/LICENSE.md) file for details.
+## Contact
 
-# Contact
+Questions or inquiries: **liam@polymarket.com** • https://www.greenestreet.xyz
 
-For any questions or inquiries, please contact liam@polymarket.com or reach out at www.greenestreet.xyz
+Enjoy using the CLI! If you encounter any issues, feel free to open one in the repository.
 
-Enjoy using the CLI application! If you encounter any issues, feel free to open an issue on the repository.
+## Terms of Service
 
-# Terms of Service
-
-[Terms of Service](https://polymarket.com/tos) prohibit US persons and persons from certain other jurisdictions from trading on Polymarket (via UI & API and including agents developed by persons in restricted jurisdictions), although data and information is viewable globally.
+[Terms of Service](https://polymarket.com/tos) prohibit U.S. persons and persons from certain other jurisdictions from trading on Polymarket (via UI & API, including agents developed by persons in restricted jurisdictions), although data and information are viewable globally.
 
 
 <!-- LINKS -->
