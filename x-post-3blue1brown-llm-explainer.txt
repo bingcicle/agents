@@ -1,0 +1,100 @@
+VIDEO: 3Blue1Brown - How LLMs actually work (~7 min)
+DATE: 2026-08-22
+
+============================================================
+VARIANT A: Authority + Timestamps map [SHIP THIS]
+Score: 12/12 | ~560 chars
+============================================================
+
+3Blue1Brown: "You don't understand ChatGPT. You just use it."
+
+You type into it every day. You have no idea what happens after you hit enter.
+
+He broke it down in 7 minutes:
+
+0:37 - What's actually happening when you type a prompt
+1:52 - Why everything starts as random noise
+3:33 - The math that would take a human 100 million years
+4:32 - The 2017 breakthrough that made every AI tool possible
+6:28 - Why nobody designed the behavior you rely on
+
+7 minutes. More clarity about AI than 2 years of daily use gave me.
+
+Watch it today, then read the guide below.
+
+
+============================================================
+VARIANT B: Authority + Stack formula map
+Score: 12/12 | ~470 chars
+============================================================
+
+3Blue1Brown: "You use ChatGPT every day. You have no idea how it works."
+
+In 7 minutes, he shows you. Visually. From scratch.
+
+Next-word prediction + transformers + attention + human feedback. That's the full stack behind ChatGPT and Claude.
+
+This 7-minute video replaces every bad AI explainer you've watched.
+
+Most people use AI at work daily and couldn't explain how a single word gets generated.
+
+Watch it today, then read the guide below.
+
+
+============================================================
+VARIANT C: Personal story + Paradigm shift
+Score: 12/12 | ~530 chars
+============================================================
+
+I've used ChatGPT nearly every day for two years. Last night I watched a 7-minute video by 3Blue1Brown and realized I had no idea what it actually does.
+
+You probably don't either.
+
+Every conversation you've had with it is next-word prediction running in a loop. You're not talking to intelligence. You're watching a machine finish your sentences based on probability.
+
+Prediction + training + the 2017 breakthrough that changed everything. That's the whole machine.
+
+That single idea changed how I write every prompt.
+
+Watch it today, then read the guide below.
+
+
+============================================================
+VARIANT D: Personal story + Scarcity signal
+Score: 12/12 | ~540 chars
+============================================================
+
+My friend at Google sent me a 7-minute video last night. One message: watch this before you use ChatGPT again.
+
+3Blue1Brown broke down how ChatGPT and Claude actually work. Visually. From scratch.
+
+You've typed thousands of prompts. You have no idea what happens after you hit send.
+
+He shows you the prediction loop, the training pipeline, the breakthrough that made all of it possible. 7 minutes. No code. No jargon.
+
+Bookmark this. You'll think about it every time you open ChatGPT.
+
+Watch it today, then save the guide below.
+
+
+============================================================
+RECOMMENDATION
+============================================================
+
+Ship: A
+
+The timestamp map creates 5 separate curiosity gaps that cannot be resolved
+without watching the video. Each line ("The math that would take a human
+100 million years", "Why nobody designed the behavior you rely on") is a
+door that must be opened. Combined with 3Blue1Brown's authority and the
+volume anchor contrasting 7 minutes against 2 years of daily use, this
+variant creates the strongest save urge. The reader cannot consume the map
+in-feed and does not want to lose 5 unanswered questions.
+
+
+============================================================
+FIRST REPLY
+============================================================
+
+Session: [VIDEO LINK]
+Guide: [ARTICLE LINK]
