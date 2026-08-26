@@ -1,0 +1,19 @@
+[Unit]
+Description=Hyperliquid Whale Terminal
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/hl_terminal
+# python3 беремо з venv, щоб бачив gspread.
+# Перевірити точний шлях: активуй venv і виконай: which python3
+ExecStart=/home/hl_terminal/venvName/bin/python3 /home/hl_terminal/server.py
+Restart=always
+RestartSec=5
+StandardOutput=append:/home/hl_terminal/terminal.log
+StandardError=append:/home/hl_terminal/terminal.log
+
+[Install]
+WantedBy=multi-user.target
