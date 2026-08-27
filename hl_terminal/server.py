@@ -436,22 +436,24 @@ def add_ws_wallet(addr):
     if not addr or not addr.startswith("0x") or len(addr) != 42: return False
     k = addr.lower()
     with ws_lock:
-        if k in ws_wallets:
-            return False
-        if len(ws_wallets) >= WS_WALLETS_CAP:
-            # FIFO-витіснення: найстаріша адреса поступається новій
-            ws_wallets.pop(next(iter(ws_wallets)), None)
-        ws_wallets[k] = {"addr": addr, "source": "websocket",
-                         "account": 0, "pnl_at": 0, "pnl_day": 0,
-                         "vol_day": 0, "roi_day": 0, "name": "", "pos_count": 0}
-    # Гаманець щойно торгнув: якщо smart-skip списав його як хронічно
-    # порожній, скидаємо лічильник — інакше адресу, яку скан-прунінг
-    # уже викинув, ніколи б не перевірили знову, навіть з позицією.
-    with stats_lock:
-        s = wallet_stats.get(k)
-        if s and s.get("empty_streak", 0) >= SKIP_AFTER:
+        existed = k in ws_wallets
+        if not existed:
+            if len(ws_wallets) >= WS_WALLETS_CAP:
+                # FIFO-витіснення: найстаріша адреса поступається новій
+                ws_wallets.pop(next(iter(ws_wallets)), None)
+            ws_wallets[k] = {"addr": addr, "source": "websocket",
+                             "account": 0, "pnl_at": 0, "pnl_day": 0,
+                             "vol_day": 0, "roi_day": 0, "name": "",
+                             "pos_count": 0}
+    # Гаманець щойно ТОРГНУВ: якщо smart-skip списав його як хронічно
+    # порожній — повертаємо в чергу перевірки. Стосується і ВЖЕ відомих
+    # адрес: раніше return False стояв до скидання, і жива адреса зі
+    # streak 4-5 чекала планової перевірки годинами.
+    s = wallet_stats.get(k)
+    if s and s.get("empty_streak", 0) >= SKIP_AFTER:
+        with stats_lock:
             s["empty_streak"] = 0
-    return True
+    return not existed
 
 def _ws_open_tcp(host, port, timeout=30):
     """TCP до host:port напряму або через HTTP CONNECT проксі (WS_PROXY)."""
@@ -1045,39 +1047,50 @@ def update_watchlist(result, depth_snap, scan_start=0, failed_addrs=None,
                    and _lc not in new_wl.get(_la, {}):
                     new_wl.setdefault(_la, {})[_lc] = dict(_lp)
 
-        # Гаманці, чий запит під час скану впав (мережа/429): стан
-        # НЕВІДОМИЙ, а не "порожній". Раніше вони просто зникали з
-        # watchlist до наступного скану (до ~40 хв без нагляду).
-        # Переносимо старі позиції як є: найближчий sweep сам їх
-        # перевірить і поправить або приберe.
-        carried_fail = 0
-        for _fa in (failed_addrs or ()):
-            if _fa not in new_wl and _fa in watchlist:
-                new_wl[_fa] = {c: dict(p) for c, p in watchlist[_fa].items()}
-                carried_fail += 1
-        # Скан іде хвилини. Якщо realtime ПІД ЧАС ЦЬОГО скану бачив свіже
-        # закриття, лишаємо його розмір. Але тільки з позначкою часу,
-        # свіжішою за старт скану. Старий варіант брав просто менший розмір
-        # і плутав "кит закривався" з "кит доливав": розмір у базі міг
-        # тільки падати, і закриття ставали невидимими.
+        # Гаманці, яких цей скан НЕ зчитав успішно, — і ті, чий запит
+        # впав, і ті, що НЕ потрапили у випадкову вибірку WS_EXTRA_MAX:
+        # їхній стан НЕВІДОМИЙ, а не "порожній". Раніше несканована
+        # WS-адреса мовчки випадала з watchlist разом з активними
+        # позиціями. Переносимо старі записи як є — найближчий sweep
+        # сам їх перевірить і поправить або прибере.
+        carried_unscanned = 0
+        for _wa in list(watchlist.keys()):
+            if _wa in (fetch_times or {}) or _wa in new_wl \
+               or not watchlist[_wa]:
+                continue   # порожні записи не переносимо
+            new_wl[_wa] = {c: dict(p) for c, p in watchlist[_wa].items()}
+            carried_unscanned += 1
+
+        # Merge за ЧАСОМ, а не за розміром (last-write-wins): якщо
+        # realtime торкався пари ПІСЛЯ того, як скан зчитав цей гаманець,
+        # live-запис новіший і виграє повністю. Старий варіант брав live
+        # лише з МЕНШИМ розміром — тому долив 100→200 під час скану
+        # відкочувався знімком до 100, і наступне закриття 200→150
+        # виглядало як долив і губилось.
         for _a, _coins in new_wl.items():
             live_c = watchlist.get(_a, {})
+            _ft = (fetch_times or {}).get(_a, scan_start)
             for _c, _p in _coins.items():
                 lv = live_c.get(_c)
                 if lv is None:
-                    # Нова пара гаманець-монета: старий ключ дедупу скидаємо,
-                    # інакше клоуз нової позиції може бути заблокований назавжди
-                    sent_alerts.discard(f"{_a}:{_c}")
-                if lv and lv.get("upd", 0) >= scan_start > 0 \
-                      and 0 < lv["size"] < _p["size"]:
-                    _p["val"]  = _p["val"] * (lv["size"] / _p["size"])
-                    _p["size"] = lv["size"]
-                    _p["upd"]  = lv["upd"]
+                    # Нова пара гаманець-монета: дедуп скидаємо, а курсор
+                    # філів ставимо на момент ЗНІМКА — все, що сталося до
+                    # нього, вже враховане в базі і не має права
+                    # "підтверджувати" майбутні дельти (фальшиві алерти
+                    # старими філами у свіжих записів)
+                    _k = f"{_a}:{_c}"
+                    sent_alerts.discard(_k)
+                    fill_cursor[_k] = max(fill_cursor.get(_k, 0),
+                                          int(_ft * 1000))
+                    continue
+                if lv.get("upd", 0) >= _ft and lv.get("upd", 0) >= scan_start > 0:
+                    _coins[_c] = dict(lv)
         watchlist.clear()
         watchlist.update(new_wl)
     print(f"  [WATCH] Watchlist updated: {len(new_wl)} wallets, "
           f"{sum(len(v) for v in new_wl.values())} positions with ratio>=2x"
-          + (f" | {carried_fail} carried (scan errors)" if carried_fail else ""))
+          + (f" | {carried_unscanned} carried (не скановані/помилки)"
+             if carried_unscanned else ""))
 
 def check_one_wallet(addr):
     """
@@ -1128,7 +1141,11 @@ def get_recent_market_fills(addr, coin, since_ms, side=None):
     # Пагінація: одна відповідь — максимум 2000 філів. Без ММ-фільтра
     # у watchlist бувають гіперактивні гаманці, і потрібний філ міг
     # не влізти у першу сторінку — тоді закриття тихо губилось.
+    # Наступна сторінка стартує з ОСТАННЬОЇ мілісекунди (перекриття),
+    # а не з +1: інакше філи, що ділять одну мс на межі сторінок,
+    # губились би. Дублі знімає dedup за (time, tid, hash, oid).
     fills = []
+    _seen = set()
     _start = since_ms
     for _page in range(5):
         batch = hl_post({"type": "userFillsByTime",
@@ -1137,10 +1154,22 @@ def get_recent_market_fills(addr, coin, since_ms, side=None):
         if batch and len(batch) > 0 and not isinstance(batch[0], dict):
             raise APIError(f"userFillsByTime unexpected format for {addr[:10]}")
         batch = batch or []
-        fills.extend(batch)
+        fresh = 0
+        for f in batch:
+            _k = (f.get("time"), f.get("tid"), f.get("hash"), f.get("oid"))
+            if _k in _seen:
+                continue
+            _seen.add(_k)
+            fills.append(f)
+            fresh += 1
         if len(batch) < 2000:
             break
-        _start = max(f.get("time", 0) for f in batch) + 1
+        if fresh == 0:
+            # 2000+ філів в одну мілісекунду: далі не просунемось
+            print(f"  [FILLS] {addr[:10]}: 2000+ філів в одну мс, "
+                  f"хвіст вікна недоступний")
+            break
+        _start = max(f.get("time", 0) for f in batch)
 
     # Групуємо по HASH (транзакція)
     txs = {}  # hash -> {sz, cost, ts, oids, dir}
@@ -1197,7 +1226,7 @@ def get_recent_market_fills(addr, coin, since_ms, side=None):
     market_txs.sort(key=lambda x: x["ts"], reverse=True)
     return market_txs
 
-def _insert_flipped(addr, coin, pos, alert_key):
+def _insert_flipped(addr, coin, pos, alert_key, snap_ms=None):
     """Кит розвернувся (LONG↔SHORT): старий бік закритий і зааалертований,
     а НОВИЙ бік одразу повертаємо у watchlist, якщо він тягне на ratio>=2.
     Раніше нова позиція чекала наступного скану — до ~45 хв сліпоти по
@@ -1218,9 +1247,13 @@ def _insert_flipped(addr, coin, pos, alert_key):
             "liq":   pos.get("liq", 0),
             "upd":   time.time(),
         }
-    # нова позиція = нова історія: дедуп і епізод старого боку скидаємо
+    # нова позиція = нова історія: дедуп і епізод старого боку скидаємо,
+    # курсор — на момент ЗНІМКА нової позиції (не "зараз": філ, що
+    # прилетів після знімка, не має опинитись позаду курсора)
     sent_alerts.discard(alert_key)
     close_episodes.pop(alert_key, None)
+    fill_cursor[alert_key] = max(fill_cursor.get(alert_key, 0),
+                                 snap_ms or int(time.time() * 1000))
     print(f"  [WATCH] {coin} {addr[:10]} розворот: новий {pos['side']} "
           f"ratio {ratio:.1f}x одразу під наглядом")
 
@@ -1242,6 +1275,11 @@ def run_realtime_monitor():
             """Перевіряє один гаманець. Викликається паралельно."""
             addr, coins = item
             stats["checks"] += 1
+            # Момент ЗНІМКА позицій: усі синхронізації бази і курсор
+            # філів прив'язуються саме до нього, а не до "зараз" —
+            # цикл по монетах може тривати секунди, і філ, що прилетів
+            # після знімка, не має права опинитись позаду курсора
+            snap_ms = int(time.time() * 1000)
             try:
                 current = check_one_wallet(addr)
             except RateLimited:
@@ -1287,6 +1325,13 @@ def run_realtime_monitor():
                             # відсотки рахувались би від старої, меншої бази
                             # і поріг 5% спрацьовував би зарано
                             close_episodes.pop(alert_key, None)
+                        # Позиція звірена зі знімком — і при доливі, і при
+                        # НУЛЬОВІЙ дельті ("закрив 10 і перевідкрив рівно
+                        # 10"): усе до знімка вже враховане в базі, старий
+                        # агресивний філ не має підтверджувати майбутні
+                        # пасивні дельти
+                        fill_cursor[alert_key] = max(
+                            fill_cursor.get(alert_key, 0), snap_ms)
                         sent_alerts.discard(alert_key)
                         delta_seen.pop(alert_key, None)
                         continue
@@ -1333,6 +1378,10 @@ def run_realtime_monitor():
                     with watchlist_lock:
                         if full_close:
                             watchlist.get(addr, {}).pop(coin, None)
+                            if not watchlist.get(addr):
+                                # порожній гаманець без монет: приберемо,
+                                # інакше sweep вічно палив би на нього запит
+                                watchlist.pop(addr, None)
                         elif addr in watchlist and coin in watchlist[addr]:
                             # Розмір реально змінився, але лімiткою: алерт
                             # не шлемо, а базу оновлюємо, інакше ця дельта
@@ -1346,7 +1395,13 @@ def run_realtime_monitor():
                         scan_tombstones[alert_key] = time.time()
                         close_episodes.pop(alert_key, None)
                         if flipped_pos is not None:
-                            _insert_flipped(addr, coin, flipped_pos, alert_key)
+                            _insert_flipped(addr, coin, flipped_pos,
+                                            alert_key, snap_ms)
+                    else:
+                        # база звірена зі знімком без агресивних філів —
+                        # усе до знімка вже враховане, курсор на знімок
+                        fill_cursor[alert_key] = max(
+                            fill_cursor.get(alert_key, 0), snap_ms)
                     continue
                 stats["fills_confirmed"] += 1
                 delta_seen.pop(alert_key, None)
@@ -1388,13 +1443,21 @@ def run_realtime_monitor():
                 if ep is None or _now - ep["last_ts"] > EPISODE_TTL_S \
                    or ep.get("side") != old.get("side"):
                     ep = {"start_size": old["size"], "acc_sz": 0.0,
-                          "last_ts": _now, "side": old.get("side")}
+                          "start_val": old.get("val", 0),
+                          "fills": [], "last_ts": _now,
+                          "side": old.get("side")}
                     close_episodes[alert_key] = ep
                 ep["acc_sz"] += sum(f["sz"] for f in mfills)
                 ep["last_ts"] = _now
+                # пам'ятаємо ВСІ транзакції епізоду (курсор гарантує, що
+                # дублів немає): алерт покаже весь епізод, а не лише
+                # останній шматочок
+                ep["fills"] = (ep.get("fills") or []) + mfills
+                del ep["fills"][:-60]
 
-                if not full_close and not has_liq:
-                    if ep["acc_sz"] < ep["start_size"] * MIN_CLOSE_PCT:
+                if not full_close:
+                    if not has_liq \
+                       and ep["acc_sz"] < ep["start_size"] * MIN_CLOSE_PCT:
                         # епізод ще не набрав порога: базу рухаємо, чекаємо
                         with watchlist_lock:
                             if addr in watchlist and coin in watchlist[addr]:
@@ -1403,6 +1466,7 @@ def run_realtime_monitor():
                                 watchlist[addr][coin]["upd"]  = time.time()
                         continue
                     # алерт на КУМУЛЯТИВНИЙ обсяг епізоду від його бази
+                    # (і для ліквідацій — щоб відсоток сходився з філами)
                     close_pct = min(ep["acc_sz"] / ep["start_size"], 1.0)
 
                 # Дедуп тільки для часткових: повне закриття шлеться завжди,
@@ -1422,21 +1486,28 @@ def run_realtime_monitor():
                     "addr":      addr,
                     "coin":      coin,
                     "side":      old["side"],
-                    "old_val":   old["val"],
-                    # для часткового епізоду відсоток рахувався від бази
-                    # на початку епізоду — її ж показуємо у повідомленні
-                    "old_size":  old["size"] if full_close else ep["start_size"],
+                    # і відсоток, і розмір, і вартість — від СТАРТУ
+                    # епізоду, і філи — ВСІ його транзакції: інакше
+                    # повідомлення казало "закрив 5%", а показувало один
+                    # останній шматочок на 1% (а повне закриття після
+                    # часткових показувало філів більше, ніж позиції)
+                    "old_val":   ep.get("start_val") or old["val"],
+                    "old_size":  ep["start_size"],
                     "close_pct": close_pct,
                     "ratio":     old["ratio"],
                     "entry":     old["entry"],
                     "full_close": full_close,
-                    "fills":     mfills,
+                    "fills":     list(ep.get("fills") or mfills),
                 }
                 threading.Thread(target=send_close_alert, args=(a,), daemon=True).start()
 
                 with watchlist_lock:
                     if full_close:
                         watchlist.get(addr, {}).pop(coin, None)
+                        if not watchlist.get(addr):
+                            # порожній гаманець: приберемо, інакше sweep
+                            # вічно палив би на нього запит
+                            watchlist.pop(addr, None)
                     else:
                         if addr in watchlist and coin in watchlist[addr]:
                             watchlist[addr][coin]["size"] = new_pos["size"]
@@ -1448,12 +1519,15 @@ def run_realtime_monitor():
                     scan_tombstones[alert_key] = time.time()
                     close_episodes.pop(alert_key, None)
                     if flipped_pos is not None:
-                        _insert_flipped(addr, coin, flipped_pos, alert_key)
+                        _insert_flipped(addr, coin, flipped_pos,
+                                        alert_key, snap_ms)
                 else:
                     # епізод відпрацював: наступні 5% — новий відлік від
                     # решти позиції
                     ep["start_size"] = new_pos["size"]
+                    ep["start_val"]  = new_pos["val"]
                     ep["acc_sz"] = 0.0
+                    ep["fills"] = []
 
     def _safe_worker(item):
         try:
@@ -1498,7 +1572,8 @@ def run_realtime_monitor():
             last_sweep = now
             cycle_rl[0] = 0
             with watchlist_lock:
-                wl_snap = {addr: dict(coins) for addr, coins in watchlist.items()}
+                wl_snap = {addr: dict(coins)
+                           for addr, coins in watchlist.items() if coins}
             if wl_snap:
                 with ThreadPoolExecutor(max_workers=10) as pool:
                     list(pool.map(_safe_worker, wl_snap.items()))
@@ -1714,8 +1789,7 @@ def send_close_alert(a):
         del recent_alerts[50:]
     stats["alerts_sent"] += 1
     tg_result = tg_send(msg)
-    tg_status = "ok" if tg_result else "no_chat_id"
-    print(f"  [ALERT]  tg_sent={tg_status}")
+    print(f"  [ALERT]  tg_sent={'ok' if tg_result else 'FAIL'}")
 
 
 # ═════════════════════════════════════════════════════════
@@ -2654,7 +2728,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", 0))
             body   = json.loads(self.rfile.read(length))
             addr   = (body.get("address") or "").strip()
-            if addr.startswith("0x") and len(addr) == 42:
+            # саме hex, а не будь-які 42 символи: інакше порт 3000 дозволяв
+            # заливати сміттєві "адреси" у чергу сканування
+            if __import__("re").fullmatch(r"0x[0-9a-fA-F]{40}", addr):
                 CUSTOM_WALLETS.append(addr)
                 add_ws_wallet(addr)
                 print(f"  [CUSTOM] Added: {addr}")
