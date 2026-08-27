@@ -89,17 +89,14 @@ try:
 except Exception:
     pass
 MIN_DELTA_PCT = 0.01       # дельта, з якої взагалі перевіряємо fills
-MIN_CLOSE_PCT = 0.05       # поріг АЛЕРТУ: епізод агресивних закриттів
-                           # (паузи < EPISODE_TTL_S) сумарно >= 5% позиції.
-                           # Одна транзакція >= 5% — окремий випадок епізоду.
-                           # Раніше вимагалась саме ОДНА транзакція >= 5%,
-                           # і нарізане закриття (10% як 4+3+3) губилось назавжди.
-EPISODE_TTL_S = 600        # пауза між агресивними закриттями, що обриває епізод
-CLOSE_DEPTH_RATIO = 1.0    # друге крило алерту: епізод, чий доларовий обсяг
-                           # >= 1x глибини атакованої сторони, шлеться навіть
-                           # якщо це < 5% позиції. Відсоток міряє позицію, а
-                           # ціну рухає обсяг проти стакану: кит 30x глибини,
-                           # що скинув "лише" 4%, б'є сильніше за весь стакан
+MIN_CLOSE_PCT = 0.05       # поріг АЛЕРТУ: ОДНА маркет-транзакція >= 5%
+                           # позиції (вимога користувача, 27.08). Кумулятивні
+                           # епізоди і поріг за глибиною для алертів вимкнені:
+                           # нарізка 10 x 1% свідомо не алертиться. Кожна
+                           # достатня транзакція шле ОКРЕМЕ повідомлення
+                           # (дедуп лише за hash транзакції, alerted_txs).
+EPISODE_TTL_S = 600        # (для чистки старих записів close_episodes у стані)
+CLOSE_DEPTH_RATIO = 1.0    # (вимкнено 27.08: більше не впливає на алерти)
 
 # Стеля ws_wallets: WS додає обидві сторони кожного трейда, без
 # капу словник ріс би необмежено. Витіснення LRU: новий трейд
@@ -894,6 +891,8 @@ recent_alerts  = []   # останні 50 алертів для термінал
 alerts_lock    = threading.Lock()
 watchlist_lock = threading.Lock()
 sent_alerts    = set()   # addr:coin, спільний дедуп для realtime і скан-діфа
+alerted_txs    = {}      # tx_hash -> ts: щоб одна транзакція не алертилась
+                         # двічі (realtime + скан-діф); чиститься за годину
 
 # Лічильники з моменту старту. Дивитись: localhost:3000/status або щогодинний рядок у лозі
 stats = {
@@ -1485,96 +1484,69 @@ def run_realtime_monitor():
                 except Exception as _fe:
                     print(f"  [FC] hook err: {_fe}")
 
-                has_liq = any(f.get("liq") for f in mfills)
+                # ПОРІГ (повернено на вимогу користувача): алерт лише
+                # коли ОДНА маркет-транзакція закрила >= MIN_CLOSE_PCT
+                # позиції; ліквідації — завжди. Кумулятивні епізоди та
+                # поріг за глибиною для алертів ВИМКНЕНІ (нарізка
+                # 10 x 1% більше не алертиться — свідомий вибір).
+                # Повне закриття без такої транзакції — теж тиша:
+                # позиція, злита лімітками з маркет-пилом 0.01 токена,
+                # інакше давала алерт "повністю закрив $1.5M".
+                _base = old["size"] or 1e-12
+                big_txs = [f for f in mfills
+                           if f.get("liq") or f["sz"] >= _base * MIN_CLOSE_PCT]
 
-                # ЕПІЗОД: накопичуємо агресивні закриття, поки паузи між
-                # ними < EPISODE_TTL_S. Алерт — коли епізод сумарно набрав
-                # MIN_CLOSE_PCT від позиції на його початку. Так ловиться
-                # і одна транзакція на 5%+, і нарізка 10 x 1% (алгоритмічне
-                # виконання) — раніше нарізане закриття губилось назавжди.
-                _now = time.time()
-                ep = close_episodes.get(alert_key)
-                if ep is None or _now - ep["last_ts"] > EPISODE_TTL_S \
-                   or ep.get("side") != old.get("side"):
-                    ep = {"start_size": old["size"], "acc_sz": 0.0,
-                          "acc_usd": 0.0, "n_tx": 0,
-                          "start_val": old.get("val", 0),
-                          "fills": [], "last_ts": _now,
-                          "side": old.get("side")}
-                    close_episodes[alert_key] = ep
-                ep["acc_sz"] += sum(f["sz"] for f in mfills)
-                ep["acc_usd"] = ep.get("acc_usd", 0.0) + \
-                    sum(f["px"] * f["sz"] for f in mfills)
-                ep["n_tx"] = ep.get("n_tx", 0) + len(mfills)
-                ep["last_ts"] = _now
-                # пам'ятаємо транзакції епізоду (курсор гарантує, що
-                # дублів немає); список обрізаємо до 60, але ПІДСУМКИ
-                # (acc_sz/acc_usd/n_tx) рахуються з усіх — числа в
-                # алерті не залежать від обрізки
-                ep["fills"] = (ep.get("fills") or []) + mfills
-                del ep["fills"][:-60]
-
-                if not full_close:
-                    _passed = has_liq or \
-                        ep["acc_sz"] >= ep["start_size"] * MIN_CLOSE_PCT
-                    if not _passed:
-                        # Друге крило порога: доларовий обсяг епізоду
-                        # проти глибини сторони, яку він б'є. Ловить
-                        # китів 30x, що скидають "лише" 4% позиції —
-                        # більше за місткість усього стакану
-                        with cache_lock:
-                            _dd = (cache["depth"].get(coin)
-                                   or cache.get("depth_prev", {}).get(coin))
-                        _ds = depth_for_side(_dd, old.get("side"))
-                        if _ds and ep.get("acc_usd", 0) >= _ds * CLOSE_DEPTH_RATIO:
-                            _passed = True
-                    if not _passed:
-                        # епізод ще не набрав порога: базу рухаємо, чекаємо
-                        with watchlist_lock:
-                            if addr in watchlist and coin in watchlist[addr]:
-                                watchlist[addr][coin]["size"] = new_pos["size"]
-                                watchlist[addr][coin]["val"]  = new_pos["val"]
-                                watchlist[addr][coin]["upd"]  = time.time()
-                        continue
-                    # алерт на КУМУЛЯТИВНИЙ обсяг епізоду від його бази
-                    # (і для ліквідацій — щоб відсоток сходився з філами)
-                    close_pct = min(ep["acc_sz"] / ep["start_size"], 1.0)
-
-                # Дедуп тільки для часткових: повне закриття шлеться завжди,
-                # навіть якщо перед цим уже був алерт про часткове.
-                # При скипі базу все одно оновлюємо, інакше вона застрягає
-                # і кожен sweep даремно тягне fills по тій самій дельті.
-                if alert_key in sent_alerts and not full_close:
+                if not big_txs:
+                    # агресія є, але кожна транзакція дрібна: без алерту,
+                    # базу рухаємо (курсор уже пересунутий вище)
                     with watchlist_lock:
-                        if addr in watchlist and coin in watchlist[addr]:
+                        if full_close:
+                            watchlist.get(addr, {}).pop(coin, None)
+                            if not watchlist.get(addr):
+                                watchlist.pop(addr, None)
+                        elif addr in watchlist and coin in watchlist[addr]:
                             watchlist[addr][coin]["size"] = new_pos["size"]
                             watchlist[addr][coin]["val"]  = new_pos["val"]
                             watchlist[addr][coin]["upd"]  = time.time()
+                    if full_close:
+                        scan_tombstones[alert_key] = time.time()
+                        close_episodes.pop(alert_key, None)
+                        if flipped_pos is not None:
+                            _insert_flipped(addr, coin, flipped_pos,
+                                            alert_key, snap_ms)
                     continue
-                sent_alerts.add(alert_key)
 
-                a = {
-                    "addr":      addr,
-                    "coin":      coin,
-                    "side":      old["side"],
-                    # і відсоток, і розмір, і вартість — від СТАРТУ
-                    # епізоду, і філи — ВСІ його транзакції: інакше
-                    # повідомлення казало "закрив 5%", а показувало один
-                    # останній шматочок на 1% (а повне закриття після
-                    # часткових показувало філів більше, ніж позиції)
-                    "old_val":   ep.get("start_val") or old["val"],
-                    "old_size":  ep["start_size"],
-                    "close_pct": close_pct,
-                    "ratio":     old["ratio"],
-                    "entry":     old["entry"],
-                    "full_close": full_close,
-                    "fills":     list(ep.get("fills") or mfills),
-                    # агрегати всього епізоду — незалежні від обрізки списку
-                    "ep_sz":     ep.get("acc_sz", 0.0),
-                    "ep_usd":    ep.get("acc_usd", 0.0),
-                    "ep_n":      ep.get("n_tx", 0),
-                }
-                threading.Thread(target=send_close_alert, args=(a,), daemon=True).start()
+                # КОЖНА достатня транзакція = окреме повідомлення
+                # (анти-спам дедуп по парі прибраний на вимогу). Від
+                # дублів між realtime і скан-діфом захищає LRU за hash.
+                if full_close:
+                    # повне закриття: одне повідомлення з усіма новими
+                    # транзакціями батча (маркет-обсяг у ньому чесний)
+                    _batches = [(mfills, 1.0, True)]
+                else:
+                    _batches = [([f], min(f["sz"] / _base, 1.0), False)
+                                for f in big_txs]
+                for _txs, _pct, _fc in _batches:
+                    _new_h = [f.get("hash", "") for f in _txs
+                              if f.get("hash", "") not in alerted_txs]
+                    if not _new_h:
+                        continue   # усе з цього батча вже алертилось
+                    for _h in _new_h:
+                        alerted_txs[_h] = time.time()
+                    a = {
+                        "addr":      addr,
+                        "coin":      coin,
+                        "side":      old["side"],
+                        "old_val":   old["val"],
+                        "old_size":  old["size"],
+                        "close_pct": _pct,
+                        "ratio":     old["ratio"],
+                        "entry":     old["entry"],
+                        "full_close": _fc,
+                        "fills":     list(_txs),
+                    }
+                    threading.Thread(target=send_close_alert, args=(a,),
+                                     daemon=True).start()
 
                 with watchlist_lock:
                     if full_close:
@@ -1596,15 +1568,6 @@ def run_realtime_monitor():
                     if flipped_pos is not None:
                         _insert_flipped(addr, coin, flipped_pos,
                                         alert_key, snap_ms)
-                else:
-                    # епізод відпрацював: наступні 5% — новий відлік від
-                    # решти позиції
-                    ep["start_size"] = new_pos["size"]
-                    ep["start_val"]  = new_pos["val"]
-                    ep["acc_sz"] = 0.0
-                    ep["acc_usd"] = 0.0
-                    ep["n_tx"] = 0
-                    ep["fills"] = []
 
     def _safe_worker(item):
         try:
@@ -1739,33 +1702,34 @@ def check_position_changes(new_result, depth_snap):
                 if ">" in _f.get("dir", "") and _f["sz"] > old["size"]:
                     _f["sz"] = old["size"]
 
-            # Сумарний агресивний обсяг >= MIN_CLOSE_PCT або >= 1x глибини
-            # атакованої сторони (ліквідації — завжди)
-            if not any(f.get("liq") for f in mfills):
-                agg_sz = sum(f["sz"] for f in mfills)
-                if agg_sz < old["size"] * MIN_CLOSE_PCT:
-                    agg_usd = sum(f["px"] * f["sz"] for f in mfills)
-                    _ds = depth_for_side(depth_snap.get(coin), old.get("side"))
-                    if not (_ds and agg_usd >= _ds * CLOSE_DEPTH_RATIO):
-                        continue
-
-            if key_ac in sent_alerts:
-                continue   # realtime вже відправив цей клоуз
-            sent_alerts.add(key_ac)
+            # Той самий поріг, що і в realtime: ОДНА маркет-транзакція
+            # >= MIN_CLOSE_PCT позиції (ліквідації — завжди)
+            _base = old["size"] or 1e-12
+            big_txs = [f for f in mfills
+                       if f.get("liq") or f["sz"] >= _base * MIN_CLOSE_PCT]
+            if not big_txs:
+                continue
             fill_cursor[key_ac] = max(f["ts"] for f in mfills)
 
-            alerts.append({
-                "addr":      addr,
-                "coin":      coin,
-                "side":      old["side"],
-                "old_val":   old["val"],
-                "old_size":  old["size"],
-                "close_pct": close_pct,
-                "ratio":     old["ratio"],
-                "entry":     old["entry"],
-                "full_close": full_close,
-                "fills":     mfills,
-            })
+            # окреме повідомлення на кожну достатню транзакцію;
+            # дублі з realtime знімає LRU за hash транзакції
+            for _f in big_txs:
+                _h = _f.get("hash", "")
+                if _h in alerted_txs:
+                    continue   # realtime вже відправив цю транзакцію
+                alerted_txs[_h] = time.time()
+                alerts.append({
+                    "addr":      addr,
+                    "coin":      coin,
+                    "side":      old["side"],
+                    "old_val":   old["val"],
+                    "old_size":  old["size"],
+                    "close_pct": min(_f["sz"] / _base, 1.0),
+                    "ratio":     old["ratio"],
+                    "entry":     old["entry"],
+                    "full_close": full_close,
+                    "fills":     [_f],
+                })
 
     # Оновлюємо попередні позиції
     with tracking_lock:
@@ -2327,6 +2291,8 @@ def _prune_leaks():
         close_episodes.pop(k, None)
     for k in [k for k, ts in list(scan_tombstones.items()) if ts < now_ - 7200]:
         scan_tombstones.pop(k, None)
+    for k in [k for k, ts in list(alerted_txs.items()) if ts < now_ - 3600]:
+        alerted_txs.pop(k, None)
     cut_ms = (now_ - 3600) * 1000
     with fc_lock:
         for k in list(fc_episodes):
