@@ -95,9 +95,15 @@ MIN_CLOSE_PCT = 0.05       # поріг АЛЕРТУ: епізод агреси�
                            # Раніше вимагалась саме ОДНА транзакція >= 5%,
                            # і нарізане закриття (10% як 4+3+3) губилось назавжди.
 EPISODE_TTL_S = 600        # пауза між агресивними закриттями, що обриває епізод
+CLOSE_DEPTH_RATIO = 1.0    # друге крило алерту: епізод, чий доларовий обсяг
+                           # >= 1x глибини атакованої сторони, шлеться навіть
+                           # якщо це < 5% позиції. Відсоток міряє позицію, а
+                           # ціну рухає обсяг проти стакану: кит 30x глибини,
+                           # що скинув "лише" 4%, б'є сильніше за весь стакан
 
 # Стеля ws_wallets: WS додає обидві сторони кожного трейда, без
-# капу словник ріс би необмежено. Витіснення найстаріших (FIFO).
+# капу словник ріс би необмежено. Витіснення LRU: новий трейд
+# пересуває адресу в кінець, першою випадає найдавніше активна.
 WS_WALLETS_CAP = 30000
 
 tg_chat_lock = threading.Lock()
@@ -437,9 +443,13 @@ def add_ws_wallet(addr):
     k = addr.lower()
     with ws_lock:
         existed = k in ws_wallets
-        if not existed:
+        if existed:
+            # LRU: свіжий трейд пересуває адресу в кінець черги, інакше
+            # давно доданий, але АКТИВНИЙ кит був би першим на витіснення
+            ws_wallets[k] = ws_wallets.pop(k)
+        else:
             if len(ws_wallets) >= WS_WALLETS_CAP:
-                # FIFO-витіснення: найстаріша адреса поступається новій
+                # витісняємо адресу з найдавнішою активністю
                 ws_wallets.pop(next(iter(ws_wallets)), None)
             ws_wallets[k] = {"addr": addr, "source": "websocket",
                              "account": 0, "pnl_at": 0, "pnl_day": 0,
@@ -805,8 +815,11 @@ def run_websocket():
 # ── FETCH ONE WALLET ─────────────────────────────────────
 def fetch_one(addr_str):
     try:
-        # Кит щойно торгнув: пропускаємо fast-перевірку вперед
-        while time.time() < fast_hold[0]:
+        # Кит щойно торгнув: пропускаємо fast-перевірку вперед. Але зі
+        # СТЕЛЕЮ: кожен трейд відсуває hold ще на 3с, і при безперервному
+        # потоці скан чекав би необмежено
+        _hd = time.time() + 10
+        while time.time() < fast_hold[0] and time.time() < _hd:
             time.sleep(0.2)
         time.sleep(DELAY)
         data = hl_post({"type": "clearinghouseState", "user": addr_str})
@@ -1348,6 +1361,16 @@ def run_realtime_monitor():
                             # відсотки рахувались би від старої, меншої
                             # бази і поріг 5% спрацьовував би зарано
                             close_episodes.pop(alert_key, None)
+                        else:
+                            # Розмір той самий, а ціна входу ІНША: позицію
+                            # закрили і перевідкрили тим самим розміром між
+                            # sweep-ами. Старий епізод належить мертвій
+                            # позиції — інакше його 4% приклеїлись би до
+                            # нової і 1% закриття дав би фальшиві "5%"
+                            _eo = old.get("entry", 0)
+                            _en = new_pos.get("entry", 0)
+                            if _eo and _en and abs(_en - _eo) / _eo > 1e-4:
+                                close_episodes.pop(alert_key, None)
                         # Позиція звірена зі знімком — і при доливі, і при
                         # НУЛЬОВІЙ дельті ("закрив 10 і перевідкрив рівно
                         # 10"): усе до знімка вже враховане в базі, старий
@@ -1492,8 +1515,20 @@ def run_realtime_monitor():
                 del ep["fills"][:-60]
 
                 if not full_close:
-                    if not has_liq \
-                       and ep["acc_sz"] < ep["start_size"] * MIN_CLOSE_PCT:
+                    _passed = has_liq or \
+                        ep["acc_sz"] >= ep["start_size"] * MIN_CLOSE_PCT
+                    if not _passed:
+                        # Друге крило порога: доларовий обсяг епізоду
+                        # проти глибини сторони, яку він б'є. Ловить
+                        # китів 30x, що скидають "лише" 4% позиції —
+                        # більше за місткість усього стакану
+                        with cache_lock:
+                            _dd = (cache["depth"].get(coin)
+                                   or cache.get("depth_prev", {}).get(coin))
+                        _ds = depth_for_side(_dd, old.get("side"))
+                        if _ds and ep.get("acc_usd", 0) >= _ds * CLOSE_DEPTH_RATIO:
+                            _passed = True
+                    if not _passed:
                         # епізод ще не набрав порога: базу рухаємо, чекаємо
                         with watchlist_lock:
                             if addr in watchlist and coin in watchlist[addr]:
@@ -1677,7 +1712,11 @@ def check_position_changes(new_result, depth_snap):
                 delta_size = old["size"] - new_pos["size"]
                 if delta_size <= 0: continue
                 close_pct = delta_size / old["size"]
-                if close_pct < MIN_CLOSE_PCT: continue
+                # від 1%: рішення "чи алертити" приймає подвійний фільтр
+                # нижче (>=5% позиції АБО >=1x глибини сторони) — інакше
+                # закриття на 4% позиції, але на весь стакан, губилось би
+                # у цьому резервному шляху
+                if close_pct < MIN_DELTA_PCT: continue
                 full_close = False
 
             # ── ПІДТВЕРДЖЕННЯ через fills (обов'язково) ──
@@ -1700,11 +1739,15 @@ def check_position_changes(new_result, depth_snap):
                 if ">" in _f.get("dir", "") and _f["sz"] > old["size"]:
                     _f["sz"] = old["size"]
 
-            # Сумарний агресивний обсяг >= MIN_CLOSE_PCT (ліквідації — завжди)
+            # Сумарний агресивний обсяг >= MIN_CLOSE_PCT або >= 1x глибини
+            # атакованої сторони (ліквідації — завжди)
             if not any(f.get("liq") for f in mfills):
                 agg_sz = sum(f["sz"] for f in mfills)
                 if agg_sz < old["size"] * MIN_CLOSE_PCT:
-                    continue
+                    agg_usd = sum(f["px"] * f["sz"] for f in mfills)
+                    _ds = depth_for_side(depth_snap.get(coin), old.get("side"))
+                    if not (_ds and agg_usd >= _ds * CLOSE_DEPTH_RATIO):
+                        continue
 
             if key_ac in sent_alerts:
                 continue   # realtime вже відправив цей клоуз
@@ -2271,8 +2314,13 @@ def _prune_leaks():
         fast_last.pop(k, None)
     for k in [k for k, ts in list(delta_seen.items()) if ts < now_ - 3600]:
         delta_seen.pop(k, None)
+    # Курсори АКТИВНИХ пар не чистимо ніколи: після годинного простою
+    # монітора видалення курсора відкочувало б пару на 5-хвилинне вікно
+    # і губило б хвіст історії, який курсор якраз тримає
+    with watchlist_lock:
+        _active = {f"{a}:{c}" for a, cs in watchlist.items() for c in cs}
     for k in [k for k, ts in list(fill_cursor.items())
-              if ts / 1000 < now_ - 3600]:
+              if ts / 1000 < now_ - 3600 and k not in _active]:
         fill_cursor.pop(k, None)
     for k in [k for k, e in list(close_episodes.items())
               if e.get("last_ts", 0) < now_ - 2 * EPISODE_TTL_S]:
@@ -2558,8 +2606,10 @@ def run_scan():
             # тут, а не в t, важливо: інакше при активному fast-path
             # вікно перехлесту розтягувалось на секунди, і вже
             # врахований у базі філ міг роздути епізод.
-            # УВАГА: не t0 — зовнішній t0 це старт усього скану (ETA)
-            while time.time() < fast_hold[0]:
+            # УВАГА: не t0 — зовнішній t0 це старт усього скану (ETA).
+            # Стеля 10с: безперервні трейди не мають морозити скан вічно
+            _hd = time.time() + 10
+            while time.time() < fast_hold[0] and time.time() < _hd:
                 time.sleep(0.2)
             _t_fetch = time.time()
             positions = fetch_one(w["addr"])
