@@ -1054,12 +1054,16 @@ def update_watchlist(result, depth_snap, scan_start=0, failed_addrs=None,
         # позиціями. Переносимо старі записи як є — найближчий sweep
         # сам їх перевірить і поправить або прибере.
         carried_unscanned = 0
-        for _wa in list(watchlist.keys()):
-            if _wa in (fetch_times or {}) or _wa in new_wl \
-               or not watchlist[_wa]:
-                continue   # порожні записи не переносимо
-            new_wl[_wa] = {c: dict(p) for c, p in watchlist[_wa].items()}
-            carried_unscanned += 1
+        for _wa, _wcoins in list(watchlist.items()):
+            if _wa in (fetch_times or {}) or not _wcoins:
+                continue
+            # ПО ПАРАХ адреса+монета, не по адресах: якщо realtime під час
+            # скану оновив одну монету гаманця, адреса вже є у new_wl —
+            # і перенесення "по адресах" губило решту його монет
+            for _wc, _wp in _wcoins.items():
+                if _wc not in new_wl.get(_wa, {}):
+                    new_wl.setdefault(_wa, {})[_wc] = dict(_wp)
+                    carried_unscanned += 1
 
         # Merge за ЧАСОМ, а не за розміром (last-write-wins): якщо
         # realtime торкався пари ПІСЛЯ того, як скан зчитав цей гаманець,
@@ -1077,9 +1081,13 @@ def update_watchlist(result, depth_snap, scan_start=0, failed_addrs=None,
                     # філів ставимо на момент ЗНІМКА — все, що сталося до
                     # нього, вже враховане в базі і не має права
                     # "підтверджувати" майбутні дельти (фальшиві алерти
-                    # старими філами у свіжих записів)
+                    # старими філами у свіжих записів). Старий епізод теж
+                    # геть: недограні 4% зниклої позиції не мають
+                    # приклеюватись до нової з тим самим тикером
                     _k = f"{_a}:{_c}"
                     sent_alerts.discard(_k)
+                    close_episodes.pop(_k, None)
+                    delta_seen.pop(_k, None)
                     fill_cursor[_k] = max(fill_cursor.get(_k, 0),
                                           int(_ft * 1000))
                     continue
@@ -1089,7 +1097,7 @@ def update_watchlist(result, depth_snap, scan_start=0, failed_addrs=None,
         watchlist.update(new_wl)
     print(f"  [WATCH] Watchlist updated: {len(new_wl)} wallets, "
           f"{sum(len(v) for v in new_wl.values())} positions with ratio>=2x"
-          + (f" | {carried_unscanned} carried (не скановані/помилки)"
+          + (f" | {carried_unscanned} пар carried (не скановані/помилки)"
              if carried_unscanned else ""))
 
 def check_one_wallet(addr):
@@ -1312,18 +1320,33 @@ def run_realtime_monitor():
                     new_size = new_pos["size"]
                     delta_size = old_size - new_size
                     if delta_size <= 0:
-                        # Кит ДОЛИВ (або без змін): синхронізуємо базу.
-                        # Інакше після 100→200 закриття до 150 виглядало б
-                        # як "нічого", а до 90 — як 10% замість 55%.
+                        # Кит ДОЛИВ (або без змін): синхронізуємо базу і
+                        # МЕТАДАНІ. Розмір міг не змінитись, а вартість,
+                        # entry, ліквідація і ratio — так; інакше алерт
+                        # показував би ціни тижневої давнини. upd рухаємо
+                        # лише при реальній зміні розміру, щоб merge скану
+                        # й далі міг оновлювати запис свіжою глибиною.
+                        with cache_lock:
+                            _dd = (cache["depth"].get(coin)
+                                   or cache.get("depth_prev", {}).get(coin))
+                        _ds = depth_for_side(_dd, old.get("side"))
+                        with watchlist_lock:
+                            if addr in watchlist and coin in watchlist[addr]:
+                                _w = watchlist[addr][coin]
+                                _w["val"]   = new_pos["val"]
+                                _w["entry"] = new_pos.get("entry",
+                                                          _w.get("entry", 0))
+                                _w["liq"]   = new_pos.get("liq",
+                                                          _w.get("liq", 0))
+                                if _ds:
+                                    _w["ratio"] = new_pos["val"] / _ds
+                                if delta_size < 0:
+                                    _w["size"] = new_size
+                                    _w["upd"]  = time.time()
                         if delta_size < 0:
-                            with watchlist_lock:
-                                if addr in watchlist and coin in watchlist[addr]:
-                                    watchlist[addr][coin]["size"] = new_size
-                                    watchlist[addr][coin]["val"]  = new_pos["val"]
-                                    watchlist[addr][coin]["upd"]  = time.time()
                             # Долив обриває епізод розвантаження: інакше
-                            # відсотки рахувались би від старої, меншої бази
-                            # і поріг 5% спрацьовував би зарано
+                            # відсотки рахувались би від старої, меншої
+                            # бази і поріг 5% спрацьовував би зарано
                             close_episodes.pop(alert_key, None)
                         # Позиція звірена зі знімком — і при доливі, і при
                         # НУЛЬОВІЙ дельті ("закрив 10 і перевідкрив рівно
@@ -1346,11 +1369,19 @@ def run_realtime_monitor():
 
                 # ── Підтвердження через fills ──
                 # Курсор: беремо лише філи, НОВІШІ за останній оброблений.
-                # Інакше стара агресивна транзакція з 5-хвилинного вікна
-                # "підтверджувала" пізнішу пасивну дельту — фальшивий алерт.
+                # Інакше стара агресивна транзакція з вікна "підтверджувала"
+                # пізнішу пасивну дельту — фальшивий алерт. Вікно — ВІД
+                # КУРСОРА (зі стелею година), а не жорсткі -5 хв: якщо
+                # перевірка запізнилась (великий watchlist, збій), закриття
+                # старше 5 хв інакше ставало непідтверджуваним. Звичайний
+                # стан: нульові дельти рухають курсор щоsweep, тож вікно
+                # і так коротке; пагінація з дедуплікацією витягне решту.
                 stats["delta_events"] += 1
-                since_ms = int((time.time() - 300) * 1000)
-                since_ms = max(since_ms, fill_cursor.get(alert_key, 0) + 1)
+                _cur = fill_cursor.get(alert_key, 0)
+                if _cur:
+                    since_ms = max(_cur + 1, int((time.time() - 3600) * 1000))
+                else:
+                    since_ms = int((time.time() - 300) * 1000)
                 try:
                     mfills = get_recent_market_fills(addr, coin, since_ms,
                                                      old.get("side"))
@@ -1443,15 +1474,20 @@ def run_realtime_monitor():
                 if ep is None or _now - ep["last_ts"] > EPISODE_TTL_S \
                    or ep.get("side") != old.get("side"):
                     ep = {"start_size": old["size"], "acc_sz": 0.0,
+                          "acc_usd": 0.0, "n_tx": 0,
                           "start_val": old.get("val", 0),
                           "fills": [], "last_ts": _now,
                           "side": old.get("side")}
                     close_episodes[alert_key] = ep
                 ep["acc_sz"] += sum(f["sz"] for f in mfills)
+                ep["acc_usd"] = ep.get("acc_usd", 0.0) + \
+                    sum(f["px"] * f["sz"] for f in mfills)
+                ep["n_tx"] = ep.get("n_tx", 0) + len(mfills)
                 ep["last_ts"] = _now
-                # пам'ятаємо ВСІ транзакції епізоду (курсор гарантує, що
-                # дублів немає): алерт покаже весь епізод, а не лише
-                # останній шматочок
+                # пам'ятаємо транзакції епізоду (курсор гарантує, що
+                # дублів немає); список обрізаємо до 60, але ПІДСУМКИ
+                # (acc_sz/acc_usd/n_tx) рахуються з усіх — числа в
+                # алерті не залежать від обрізки
                 ep["fills"] = (ep.get("fills") or []) + mfills
                 del ep["fills"][:-60]
 
@@ -1498,6 +1534,10 @@ def run_realtime_monitor():
                     "entry":     old["entry"],
                     "full_close": full_close,
                     "fills":     list(ep.get("fills") or mfills),
+                    # агрегати всього епізоду — незалежні від обрізки списку
+                    "ep_sz":     ep.get("acc_sz", 0.0),
+                    "ep_usd":    ep.get("acc_usd", 0.0),
+                    "ep_n":      ep.get("n_tx", 0),
                 }
                 threading.Thread(target=send_close_alert, args=(a,), daemon=True).start()
 
@@ -1527,6 +1567,8 @@ def run_realtime_monitor():
                     ep["start_size"] = new_pos["size"]
                     ep["start_val"]  = new_pos["val"]
                     ep["acc_sz"] = 0.0
+                    ep["acc_usd"] = 0.0
+                    ep["n_tx"] = 0
                     ep["fills"] = []
 
     def _safe_worker(item):
@@ -1640,8 +1682,11 @@ def check_position_changes(new_result, depth_snap):
 
             # ── ПІДТВЕРДЖЕННЯ через fills (обов'язково) ──
             key_ac = f"{addr}:{coin}"
-            since_ms = int((time.time() - 300) * 1000)
-            since_ms = max(since_ms, fill_cursor.get(key_ac, 0) + 1)
+            _cur = fill_cursor.get(key_ac, 0)
+            if _cur:
+                since_ms = max(_cur + 1, int((time.time() - 3600) * 1000))
+            else:
+                since_ms = int((time.time() - 300) * 1000)
             try:
                 mfills = get_recent_market_fills(addr, coin, since_ms,
                                                  old.get("side"))
@@ -1706,11 +1751,14 @@ def send_close_alert(a):
     addr_short = a["addr"][:6] + "…" + a["addr"][-4:]
     scan_link  = f"https://hypurrscan.io/address/{a['addr']}"
 
-    fills     = a.get("fills", [])   # тепер це список ТРАНЗАКЦІЙ (по hash)
+    fills     = a.get("fills", [])   # список ТРАНЗАКЦІЙ епізоду (по hash)
     fill_info = ""
     if fills:
-        avg_px   = sum(f["px"]*f["sz"] for f in fills) / sum(f["sz"] for f in fills)
-        total_sz = sum(f["sz"] for f in fills)
+        # Підсумки — з агрегатів усього епізоду: список fills може бути
+        # обрізаний до 60, а числа мають описувати ВЕСЬ епізод
+        total_sz   = a.get("ep_sz") or sum(f["sz"] for f in fills)
+        closed_usd = a.get("ep_usd") or sum(f["px"] * f["sz"] for f in fills)
+        avg_px     = closed_usd / total_sz if total_sz else 0
         # Унікальні hash — кожен веде на окрему транзакцію в explorer
         seen_hashes = []
         for f in fills:
@@ -1721,12 +1769,11 @@ def send_close_alert(a):
             f'<a href="https://app.hyperliquid.xyz/explorer/tx/{h}">tx{i+1}</a>'
             for i, h in enumerate(seen_hashes[:5])
         )
-        n_tx = len(seen_hashes)
+        n_tx = a.get("ep_n") or len(seen_hashes)
         tx_word = "маркет транзакція" if n_tx == 1 else "маркет транзакцій"
         fill_info = f"\n💸 <b>Маркет:</b> {n_tx} {tx_word}, avg ${avg_px:,.4f}, {total_sz:.4f} токенів"
         # Ratio вгорі описує ПОЗИЦІЮ; тут — сила самого закриття проти
         # свіжої глибини сторони, яку воно б'є (LONG→bid, SHORT→ask)
-        closed_usd = sum(f["px"] * f["sz"] for f in fills)
         side_depth = 0
         try:
             d_live = fetch_binance_depth(a["coin"], retries=1)
@@ -2505,6 +2552,16 @@ def run_scan():
 
         def process(w):
             k = w["addr"].lower()
+            # Час знімка — ДО запиту, але ПІСЛЯ fast_hold: біржа формує
+            # стан під час обробки, і філ з вікна запит→відповідь не має
+            # опинитись позаду курсора (втрачене закриття). Чекати hold
+            # тут, а не в t, важливо: інакше при активному fast-path
+            # вікно перехлесту розтягувалось на секунди, і вже
+            # врахований у базі філ міг роздути епізод.
+            # УВАГА: не t0 — зовнішній t0 це старт усього скану (ETA)
+            while time.time() < fast_hold[0]:
+                time.sleep(0.2)
+            _t_fetch = time.time()
             positions = fetch_one(w["addr"])
             if positions is None:
                 # Помилка запиту: прогрес рухаємо, статистику не псуємо,
@@ -2513,7 +2570,7 @@ def run_scan():
                     cache["progress"]["done"] += 1
                     failed_addrs.add(k)
                 return
-            fetch_times[k] = time.time()
+            fetch_times[k] = _t_fetch
             update_stats(k, bool(positions), sn)
             with cache_lock:
                 if positions:
