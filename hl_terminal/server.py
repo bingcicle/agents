@@ -4,6 +4,7 @@ import urllib.error
 import json
 import os
 import time
+import random
 import threading
 import socket
 import ssl
@@ -29,6 +30,26 @@ CHECK_EVERY = 5
 # Скільки WS-знайдених гаманців (поза лідербордом) максимум додаємо
 # до одного скану. Запобіжник від сплеску нових адрес у стрімі трейдів.
 WS_EXTRA_MAX = 5000
+
+# Пауза між WS-підписками і стеля backoff реконекту. IP, засвічений
+# штормом реконектів, сервер ріже за будь-яку агресію: підписки шлемо
+# повільно, а між невдалими спробами чекаємо аж до години, щоб
+# бан устиг злетіти (частий ретрай може продовжувати його вічно).
+WS_SUB_DELAY   = 0.25
+WS_BACKOFF_CAP = 3600
+
+# Проксі ТІЛЬКИ для WS (обхід бана IP): env WS_PROXY або файл
+# ws_proxy.txt поруч із server.py. Формат: host:port або
+# user:pass@host:port (HTTP CONNECT). Трафік всередині — TLS до
+# Hyperliquid, проксі його не читає. REST-запити йдуть напряму.
+WS_PROXY = os.environ.get("WS_PROXY", "").strip()
+if not WS_PROXY:
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "ws_proxy.txt")) as _f:
+            WS_PROXY = _f.read().strip()
+    except Exception:
+        pass
 
 CUSTOM_WALLETS = []
 
@@ -372,27 +393,71 @@ def add_ws_wallet(addr):
             s["empty_streak"] = 0
     return True
 
+def _ws_open_tcp(host, port, timeout=30):
+    """TCP до host:port напряму або через HTTP CONNECT проксі (WS_PROXY)."""
+    if not WS_PROXY:
+        return socket.create_connection((host, port), timeout=timeout)
+    creds, _, hp = WS_PROXY.rpartition("@")
+    phost, _, pport = hp.rpartition(":")
+    raw = socket.create_connection((phost, int(pport)), timeout=timeout)
+    try:
+        req = f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n"
+        if creds:
+            b64 = __import__("base64").b64encode(creds.encode()).decode()
+            req += f"Proxy-Authorization: Basic {b64}\r\n"
+        raw.sendall((req + "\r\n").encode())
+        resp = b""
+        while b"\r\n\r\n" not in resp:
+            chunk = raw.recv(4096)
+            if not chunk or len(resp) > 65536:
+                raise ConnectionError("proxy CONNECT: обірвана відповідь")
+            resp += chunk
+        status = resp.split(b"\r\n", 1)[0]
+        if b" 200" not in status:
+            raise ConnectionError(f"proxy відмовив: {status[:60]!r}")
+        return raw
+    except Exception:
+        try: raw.close()
+        except Exception: pass
+        raise
+
 def ws_handshake(sock, host, path):
+    """Повертає (ok, leftover). leftover — байти ПІСЛЯ заголовків:
+    це вже початок першого фрейма, їх треба віддати в читання,
+    інакше потік розсинхронізується."""
     key = __import__("base64").b64encode(os.urandom(16)).decode()
+    # User-Agent і Origin як у браузера: WAF перед api може різати
+    # "голі" апгрейди без них, особливо з IP із поганою історією
     sock.sendall((f"GET {path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\n"
                   f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"
-                  f"Sec-WebSocket-Version: 13\r\n\r\n").encode())
+                  f"Sec-WebSocket-Version: 13\r\n"
+                  f"User-Agent: Mozilla/5.0\r\n"
+                  f"Origin: https://app.hyperliquid.xyz\r\n\r\n").encode())
     resp = b""
     while b"\r\n\r\n" not in resp:
         chunk = sock.recv(4096)
         if not chunk or len(resp) > 65536:
             # сервер закрив сокет: recv віддає b"" миттєво, без цієї
             # перевірки цикл крутився б вічно впустую
-            return False
+            return False, b""
         resp += chunk
-    return b"101" in resp
+    head, _, leftover = resp.partition(b"\r\n\r\n")
+    # Саме статусна стрічка, а не "101 десь у тілі 403-ї сторінки"
+    ok = head.split(b"\r\n", 1)[0].startswith((b"HTTP/1.1 101", b"HTTP/1.0 101"))
+    return ok, leftover
 
-def ws_recv(sock, send_lock=None):
-    """Читає один фрейм. None: з'єднання закрите або помилка. b"": службовий.
+def ws_recv(sock, send_lock=None, rbuf=None):
+    """Читає одне ПОВНЕ повідомлення, збираючи фрагменти (FIN=0 +
+    continuation-фрейми) — раніше фрагментований JSON тихо губився.
+    None: з'єднання закрите або помилка. b"": службовий фрейм.
+    rbuf: bytearray із хвостом, що прийшов разом із handshake.
     На ping сервера відповідаємо pong, інакше сервер рве з'єднання."""
     try:
         def read_exact(n):
             buf = b""
+            if rbuf:
+                take = bytes(rbuf[:n]); del rbuf[:n]
+                buf += take
             while len(buf) < n:
                 chunk = sock.recv(min(65536, n - len(buf)))
                 if not chunk:
@@ -401,23 +466,50 @@ def ws_recv(sock, send_lock=None):
                     raise ConnectionError("closed")
                 buf += chunk
             return buf
-        h = read_exact(2)
-        opcode = h[0] & 0x0F
-        length = h[1] & 0x7F
-        if length == 126:
-            length = struct.unpack(">H", read_exact(2))[0]
-        elif length == 127:
-            length = struct.unpack(">Q", read_exact(8))[0]
-        payload = read_exact(length) if length else b""
-        if opcode == 8: return None
-        if opcode == 9:   # ping → pong з тим самим payload
-            if send_lock is not None:
-                with send_lock:
+        message = b""
+        in_msg  = False
+        while True:
+            h = read_exact(2)
+            fin    = bool(h[0] & 0x80)
+            opcode = h[0] & 0x0F
+            length = h[1] & 0x7F
+            if length == 126:
+                length = struct.unpack(">H", read_exact(2))[0]
+            elif length == 127:
+                length = struct.unpack(">Q", read_exact(8))[0]
+            if length + len(message) > 16 * 1024 * 1024:
+                # сміттєва довжина = розсинхрон парсера; краще реконект,
+                # ніж спроба зачитати "мультигігабайтний фрейм" до OOM
+                raise ConnectionError(f"frame too large: {length}")
+            payload = read_exact(length) if length else b""
+            if opcode == 8:
+                return None
+            if opcode == 9:
+                # ping → pong; керуючі фрейми можуть прилітати
+                # і МІЖ фрагментами одного повідомлення
+                if send_lock is not None:
+                    with send_lock:
+                        ws_send_frame(sock, 0xA, payload)
+                else:
                     ws_send_frame(sock, 0xA, payload)
+                if not in_msg:
+                    return b""
+                continue
+            if opcode == 10:          # pong на наш ping
+                if not in_msg:
+                    return b""
+                continue
+            if opcode in (1, 2):
+                in_msg  = True
+                message = payload
+            elif opcode == 0 and in_msg:
+                message += payload    # continuation-фрагмент
             else:
-                ws_send_frame(sock, 0xA, payload)
-            return b""
-        return payload if opcode in (1, 2) else b""
+                if not in_msg:
+                    return b""
+                continue
+            if fin:
+                return message
     except Exception:
         return None
 
@@ -435,15 +527,20 @@ def ws_send_frame(sock, opcode, payload=b""):
 def ws_send(sock, msg):
     ws_send_frame(sock, 0x1, msg.encode())
 
-def _ws_conn(coins, label):
+def _ws_conn(coins, label, initial_delay=0):
     """
     Одна WS-сесія на свою половину монет. Реконект вічний.
     Hyperliquid рве з'єднання, якщо клієнт ~60с нічого не шле,
     тому окремий потік шле {"method":"ping"} кожні 30с.
-    Реконект з експоненційним backoff: шторм реконектів раз на 5с,
-    кожен зі своєю пачкою підписок, виглядав для сервера як флуд
-    і тримав з'єднання мертвим тижнями (193k реконектів у лозі).
+    Підписки шле окремий потік ПОВІЛЬНО, а читання стартує одразу:
+    якщо слати всі підряд і не читати, вхідний буфер забивається
+    трейдами вже підписаних монет, сервер бачить повільного клієнта
+    і рве з'єднання — Broken pipe посеред підписки.
+    Реконект з експоненційним backoff аж до години: шторм раз на 5с
+    (193k реконектів у старому лозі) тримав IP забаненим тижнями.
     """
+    if initial_delay:
+        time.sleep(initial_delay)
     backoff = 5
     while True:
         sock = None
@@ -451,25 +548,46 @@ def _ws_conn(coins, label):
         connected_at = 0.0
         try:
             ctx = ssl.create_default_context()
-            raw = socket.create_connection(("api.hyperliquid.xyz", 443), timeout=30)
+            raw = _ws_open_tcp("api.hyperliquid.xyz", 443)
             sock = ctx.wrap_socket(raw, server_hostname="api.hyperliquid.xyz")
             sock.settimeout(60)
-            if not ws_handshake(sock, "api.hyperliquid.xyz", "/ws"):
+            hs_ok, leftover = ws_handshake(sock, "api.hyperliquid.xyz", "/ws")
+            if not hs_ok:
                 raise ConnectionError("handshake failed")
+            rbuf = bytearray(leftover)
             send_lock = threading.Lock()
-            def _send_json(obj):
-                with send_lock:
+            # sock/send_lock/alive фіксуємо через дефолтні аргументи:
+            # інакше замикання після реконекту бачили б уже НОВІ об'єкти,
+            # старі потоки не помирали б і накопичувались.
+            def _send_json(obj, sock=sock, lock=send_lock):
+                with lock:
                     ws_send(sock, json.dumps(obj))
-            for coin in coins:
-                _send_json({"method": "subscribe",
-                            "subscription": {"type": "trades", "coin": coin}})
-                time.sleep(0.05)
+            def _kill(sock=sock):
+                # Збій відправки: фрейм міг піти наполовину, стан потоку
+                # невідомий. Тихо жити далі не можна — інакше частина
+                # підписок губиться назавжди. Саме shutdown, НЕ close:
+                # close з чужого потоку не будить reader, що вже висить
+                # у recv (чекав би 60с таймауту), і звільняє fd, який
+                # може перевикористати паралельний REST-запит. shutdown
+                # будить recv одразу (EOF) → звичайний реконект.
+                try: sock.shutdown(socket.SHUT_RDWR)
+                except Exception: pass
             connected_at = time.time()
             alive.set()
-            # alive/_send_json фіксуємо через дефолтні аргументи: інакше
-            # замикання після реконекту бачило б уже НОВІ alive і сокет,
-            # старий пінгер не помирав би, і потоки накопичувались.
-            def _pinger(alive=alive, send=_send_json):
+            stats[f"ws_subs_{label}"] = 0
+            stats[f"ws_expected_{label}"] = len(coins)
+            def _subscriber(alive=alive, send=_send_json, kill=_kill):
+                for coin in coins:
+                    if not alive.is_set():
+                        return
+                    try:
+                        send({"method": "subscribe",
+                              "subscription": {"type": "trades", "coin": coin}})
+                    except Exception:
+                        kill()
+                        return
+                    time.sleep(WS_SUB_DELAY)
+            def _pinger(alive=alive, send=_send_json, kill=_kill):
                 while alive.is_set():
                     time.sleep(30)
                     if not alive.is_set():
@@ -477,15 +595,22 @@ def _ws_conn(coins, label):
                     try:
                         send({"method": "ping"})
                     except Exception:
+                        kill()
                         break
+            threading.Thread(target=_subscriber, daemon=True).start()
             threading.Thread(target=_pinger, daemon=True).start()
-            print(f"  [WS-{label}] connected, {len(coins)} підписок відправлено")
+            # Лічильники з суфіксом label: кожен пише лише свій потік,
+            # інакше A, вдало перепідключившись, обнуляв би стрік B
+            stats[f"ws_connects_{label}"] = stats.get(f"ws_connects_{label}", 0) + 1
+            stats[f"ws_up_{label}"] = connected_at
+            print(f"  [WS-{label}] connected, шлю {len(coins)} підписок "
+                  f"по {WS_SUB_DELAY}s"
+                  + (f" через проксі" if WS_PROXY else ""))
             subs_ok = 0
             while True:
-                frame = ws_recv(sock, send_lock)
+                frame = ws_recv(sock, send_lock, rbuf)
                 if frame is None: break
                 if not frame: continue
-                stats["ws_last_ms"] = time.time() * 1000
                 try:
                     obj = json.loads(frame.decode("utf-8", errors="ignore"))
                 except Exception:
@@ -493,14 +618,23 @@ def _ws_conn(coins, label):
                 ch = obj.get("channel", "")
                 if ch == "subscriptionResponse":
                     # Раніше ці відповіді ігнорувались: якщо сервер ріже
-                    # підписки, монети глухнуть мовчки. Тепер рахуємо.
+                    # підписки, монети глухнуть мовчки. Тепер рахуємо
+                    # і віддаємо у /status як ws_subs_A/B.
                     subs_ok += 1
+                    stats[f"ws_subs_{label}"] = subs_ok
                     if subs_ok == len(coins):
                         print(f"  [WS-{label}] всі {subs_ok} підписок підтверджені")
+                    continue
+                if ch == "pong":
                     continue
                 if ch == "error":
                     print(f"  [WS-{label}] server error: {str(obj)[:160]}")
                     continue
+                # Сюди доходять лише реальні дані (трейди). Тільки вони
+                # оновлюють ws_last_ms: якщо рахувати й pong-и, з'єднання
+                # з порізаними підписками виглядало б "живим" вічно.
+                stats["ws_last_ms"] = time.time() * 1000
+                stats[f"ws_last_{label}"] = stats["ws_last_ms"]
                 data = obj.get("data", [])
                 if not isinstance(data, list): data = [data]
                 for t in data:
@@ -518,13 +652,23 @@ def _ws_conn(coins, label):
             if sock: sock.close()
         except: pass
         # Пожило довше 2 хв — проблема була разова, стартуємо швидко.
-        # Інакше подвоюємо паузу до 5 хв, щоб не потрапити під бан за флуд.
+        # Інакше подвоюємо паузу аж до WS_BACKOFF_CAP: якщо бан
+        # продовжується від кожної спроби, тільки довга пауза дає
+        # йому шанс злетіти. Джитер ВНИЗ: розносить A і B у часі,
+        # не перевищуючи стелю. Стрік — свій на кожне з'єднання.
+        fs_key = f"ws_fails_{label}"
+        stats[f"ws_subs_{label}"] = 0   # мертве з'єднання = 0 підписок,
+                                        # інакше /status бреше "57/57"
         if connected_at and time.time() - connected_at > 120:
             backoff = 5
+            stats[fs_key] = 0
         else:
-            backoff = min(backoff * 2, 300)
-        print(f"  [WS-{label}] reconnect in {backoff}s")
-        time.sleep(backoff)
+            stats[fs_key] = stats.get(fs_key, 0) + 1
+            backoff = min(backoff * 2, WS_BACKOFF_CAP)
+        pause = backoff - random.uniform(0, backoff / 4)
+        print(f"  [WS-{label}] reconnect in {pause:.0f}s "
+              f"(fail streak {stats[fs_key]})")
+        time.sleep(pause)
 
 def run_websocket():
     """
@@ -541,10 +685,16 @@ def run_websocket():
                  "INJ","TIA","ATOM","NEAR","HYPE","WIF","PEPE","JUP"]
     half = (len(coins) + 1) // 2
     a, b = coins[:half], coins[half:]
-    print(f"  [WS] {len(coins)} coins → A:{len(a)} + B:{len(b)} (два з'єднання)")
+    proxy_note = ""
+    if WS_PROXY:
+        proxy_note = f" | проксі: {WS_PROXY.rpartition('@')[2]}"  # без кредів
+    print(f"  [WS] {len(coins)} coins → A:{len(a)} + B:{len(b)} (два з'єднання)"
+          + proxy_note)
     threading.Thread(target=_ws_conn, args=(a, "A"), daemon=True).start()
     if b:
-        threading.Thread(target=_ws_conn, args=(b, "B"), daemon=True).start()
+        # B стартує пізніше: два одночасні конекти з одного IP
+        # виглядають агресивніше для тротлінгу
+        threading.Thread(target=_ws_conn, args=(b, "B", 15), daemon=True).start()
 
 # ── FETCH ONE WALLET ─────────────────────────────────────
 def fetch_one(addr_str):
@@ -637,7 +787,45 @@ stats = {
     "fills_empty":    0,   # дельта є, а маркет-філів немає (лімітки або пасив)
     "alerts_sent":    0,
     "rate_limited":   0,
+    # Далі динамічні ключі з суфіксом з'єднання (A/B), кожен пише
+    # лише свій потік: ws_connects_X, ws_fails_X (невдалі спроби
+    # поспіль, 0 = ок), ws_subs_X / ws_expected_X (підтверджені
+    # підписки), ws_last_X (останній ТРЕЙД, не pong).
 }
+
+def _ws_age_s():
+    """Скільки секунд від останнього трейда з WS. Якщо трейдів не було
+    ВЗАГАЛІ — вік дорівнює аптайму, але мінімум 61с: інакше сервер, що
+    так і не підключився, вічно виглядав би 'ще не стартував' (алерт не
+    приходив ніколи — саме так було на проді), а перші 60с після
+    рестарту /status брехав би 'ws_alive: true'."""
+    if stats["ws_last_ms"]:
+        return (time.time() * 1000 - stats["ws_last_ms"]) / 1000
+    return max(time.time() - stats["started"], 61.0)
+
+def _ws_dead_labels():
+    """Список з'єднань (A/B), що виглядають мертвими: серія невдалих
+    реконектів або давно без жодного трейда, хоча колись трейди йшли.
+    Глобальний _ws_age_s() цього не бачить: поки A живий, трейди
+    оновлюють спільний ws_last_ms, і мертвий B ховається за ним."""
+    dead = []
+    now_ms = time.time() * 1000
+    for lb in ("A", "B"):
+        if f"ws_connects_{lb}" not in stats and f"ws_fails_{lb}" not in stats:
+            continue   # це з'єднання ніколи не запускалось
+        if stats.get(f"ws_fails_{lb}", 0) >= 6:
+            dead.append(lb)
+            continue
+        last = stats.get(f"ws_last_{lb}", 0)
+        if last:
+            if (now_ms - last) / 1000 > 300:
+                dead.append(lb)
+        else:
+            # підключений, але жодного трейда за 5 хв: підписки порізані
+            up = stats.get(f"ws_up_{lb}", 0)
+            if up and time.time() - up > 300:
+                dead.append(lb)
+    return dead
 delta_seen     = {}      # addr:coin -> коли вперше побачили дельту (анти-рейс)
 WATCH_INTERVAL = 20   # резервний обхід. Першу лінію тримає WS,
                       # 20с звільняє ~5 запитів/с постійного навантаження
@@ -1728,27 +1916,37 @@ def run_state_saver():
             _prune_leaks()
         except Exception as e:
             print(f"  [STATE] prune err: {e}")
-        ws_age = (time.time()*1000 - stats["ws_last_ms"])/1000 if stats["ws_last_ms"] else -1
+        ws_age = _ws_age_s()
         if ws_age > 90 and time.time() - last_ws_warn >= 600:
             # раз на 10 хв, а не щохвилини: 52k таких рядків у старому лозі
             last_ws_warn = time.time()
-            print(f"  [WS] тиша {ws_age:.0f}s: жодного повідомлення з обох з'єднань")
-        # WS мовчить 5+ хв — одне повідомлення в TG; ожив — теж одне.
-        # Мертвий детектор не має право мовчати місяць, як минулого разу.
-        if ws_age > 300 and not stats.get("ws_dead_notified"):
+            print(f"  [WS] тиша {ws_age:.0f}s: жодного трейда з обох з'єднань")
+        # WS-проблема 5+ хв — одне повідомлення в TG; ожив — теж одне.
+        # Мертвий детектор не має права мовчати місяць, як минулого разу.
+        # _ws_age_s() рахує вік і для "не підключився жодного разу";
+        # _ws_dead_labels() ловить смерть ОДНОГО з двох з'єднань, яку
+        # глобальний вік не бачить, поки друге живе.
+        dead_lbs = _ws_dead_labels()
+        if (ws_age > 300 or dead_lbs) and not stats.get("ws_dead_notified"):
             stats["ws_dead_notified"] = True
-            tg_send("⚠️ <b>WS мовчить понад 5 хв</b> — детект живе лише "
-                    "на резервному обході. Перевір лог.")
-        elif 0 <= ws_age < 60 and stats.get("ws_dead_notified"):
+            if ws_age > 300:
+                tg_send("⚠️ <b>WS без трейдів понад 5 хв</b> — детект живе лише "
+                        "на резервному обході (алерти працюють, але повільніше). "
+                        "Дивись /status і лог.")
+            else:
+                tg_send(f"⚠️ <b>WS-{'/'.join(dead_lbs)} мертве понад 5 хв</b> — "
+                        f"половина монет без миттєвого детекту "
+                        f"(резервний обхід прикриває). Дивись /status.")
+        elif ws_age < 60 and not dead_lbs and stats.get("ws_dead_notified"):
             stats["ws_dead_notified"] = False
-            tg_send("✅ <b>WS знову живий</b> — трейди йдуть.")
+            tg_send("✅ <b>WS знову живий</b> — трейди йдуть по обох з'єднаннях.")
         if time.time() - last_hb >= 3600:
             last_hb = time.time()
-            ws_age = (time.time()*1000 - stats["ws_last_ms"])/1000 if stats["ws_last_ms"] else -1
+            ws_age = _ws_age_s()
             with watchlist_lock:
                 wl_n = len(watchlist)
             print(f"  [HEARTBEAT] up {(time.time()-stats['started'])/3600:.1f}h | "
-                  f"ws {'OK' if 0 <= ws_age < 60 else 'МЕРТВИЙ ' + str(round(ws_age)) + 's'} | "
+                  f"ws {'OK' if ws_age < 60 else 'МЕРТВИЙ ' + str(round(ws_age)) + 's'} | "
                   f"watchlist {wl_n} | ws_matched {stats['ws_matched']} | "
                   f"checks {stats['checks']} | deltas {stats['delta_events']} | "
                   f"confirmed {stats['fills_confirmed']} | empty {stats['fills_empty']} | "
@@ -2138,11 +2336,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
             with watchlist_lock:
                 wl_n = len(watchlist)
                 wl_pos = sum(len(c) for c in watchlist.values())
-            ws_age = (time.time()*1000 - stats["ws_last_ms"])/1000 if stats["ws_last_ms"] else -1
+            ws_age = _ws_age_s()
+            now_ms = time.time() * 1000
+            per_conn = {}
+            for lb in ("A", "B"):
+                last = stats.get(f"ws_last_{lb}", 0)
+                per_conn[f"ws_{lb}_trade_sec_ago"] = round((now_ms - last)/1000, 1) if last else -1
+                per_conn[f"ws_{lb}_subs"] = (f"{stats.get(f'ws_subs_{lb}', 0)}"
+                                             f"/{stats.get(f'ws_expected_{lb}', 0)}")
+                per_conn[f"ws_{lb}_fails"] = stats.get(f"ws_fails_{lb}", 0)
+                per_conn[f"ws_{lb}_connects"] = stats.get(f"ws_connects_{lb}", 0)
             self.send_json({
                 "uptime_min":     round((time.time() - stats["started"]) / 60, 1),
-                "ws_alive":       0 <= ws_age < 60,
-                "ws_last_sec_ago": round(ws_age, 1),
+                "ws_alive":       ws_age < 60,   # свіжий ТРЕЙД, не pong
+                "ws_trade_sec_ago": round(ws_age, 1),
+                "ws_proxy":       bool(WS_PROXY),
+                **per_conn,
                 "watchlist_wallets": wl_n,
                 "watchlist_positions": wl_pos,
                 "ws_matched":     stats["ws_matched"],

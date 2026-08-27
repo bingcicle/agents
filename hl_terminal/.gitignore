@@ -4,5 +4,6 @@ terminal.log
 state.json
 tg_chat.json
 tg_token.txt
+ws_proxy.txt
 creds.json
 *.csv
