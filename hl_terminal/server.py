@@ -88,35 +88,60 @@ try:
         print(f"  [TG] chat_id відновлено з файлу: {TG_CHAT_ID}")
 except Exception:
     pass
-MIN_CLOSE_PCT = 0.05       # мінімум 5% від позиції щоб вважати закриттям
-                           # (і хоча б одна маркет-транзакція такого розміру)
+MIN_DELTA_PCT = 0.01       # дельта, з якої взагалі перевіряємо fills
+MIN_CLOSE_PCT = 0.05       # поріг АЛЕРТУ: епізод агресивних закриттів
+                           # (паузи < EPISODE_TTL_S) сумарно >= 5% позиції.
+                           # Одна транзакція >= 5% — окремий випадок епізоду.
+                           # Раніше вимагалась саме ОДНА транзакція >= 5%,
+                           # і нарізане закриття (10% як 4+3+3) губилось назавжди.
+EPISODE_TTL_S = 600        # пауза між агресивними закриттями, що обриває епізод
+
+# Стеля ws_wallets: WS додає обидві сторони кожного трейда, без
+# капу словник ріс би необмежено. Витіснення найстаріших (FIFO).
+WS_WALLETS_CAP = 30000
 
 tg_chat_lock = threading.Lock()
 
 def tg_send(text):
+    """3 спроби з паузами: алерт — це продукт системи, разовий збій
+    мережі чи Telegram не має право його з'їсти назавжди."""
     if not TG_TOKEN:
         return False
     with tg_chat_lock:
         chat_id = TG_CHAT_ID
     if not chat_id:
         print(f"  [TG] No chat_id yet. Message: {text[:60]}")
-        return
-    try:
-        data = json.dumps({"chat_id": chat_id, "text": text,
-                           "parse_mode": "HTML", "disable_web_page_preview": True}).encode()
-        req  = urllib.request.Request(
-            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            data=data, headers={"Content-Type": "application/json"}, method="POST"
-        )
-        with urllib.request.urlopen(req, timeout=10) as r:
-            resp = json.loads(r.read())
-            if not resp.get("ok"):
-                print(f"  [TG] Error: {resp}")
-                return False
-            return True
-    except Exception as e:
-        print(f"  [TG] Send error: {e}")
         return False
+    data = json.dumps({"chat_id": chat_id, "text": text,
+                       "parse_mode": "HTML", "disable_web_page_preview": True}).encode()
+    for attempt in range(3):
+        try:
+            req = urllib.request.Request(
+                f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                data=data, headers={"Content-Type": "application/json"}, method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=10) as r:
+                resp = json.loads(r.read())
+            if resp.get("ok"):
+                return True
+            print(f"  [TG] Error: {resp}")
+        except urllib.error.HTTPError as e:
+            # Telegram віддає помилки саме HTTP-статусом (400 битий HTML,
+            # 403 бот заблокований) — urlopen кидає HTTPError ще до
+            # читання тіла, тож ловимо окремо
+            _body = ""
+            try:
+                _body = e.read()[:200].decode("utf-8", "ignore")
+            except Exception:
+                pass
+            print(f"  [TG] HTTP {e.code} (спроба {attempt+1}/3): {_body}")
+            if e.code in (400, 403):
+                break   # постійна помилка — ретрай не допоможе
+        except Exception as e:
+            print(f"  [TG] Send error (спроба {attempt+1}/3): {e}")
+        if attempt < 2:
+            time.sleep(2 * (attempt + 1))
+    stats["tg_errors"] = stats.get("tg_errors", 0) + 1
     return False
 
 def tg_poll_updates():
@@ -139,6 +164,14 @@ def tg_poll_updates():
                 text = msg.get("text", "")
                 cid  = msg.get("chat", {}).get("id")
                 if cid and text.startswith("/start"):
+                    with tg_chat_lock:
+                        current = TG_CHAT_ID
+                    if current and cid != current:
+                        # чужий /start НЕ перехоплює алерти: інакше будь-хто,
+                        # знайшовши бота, забирав би сигнали собі назавжди.
+                        # Свідома зміна чату: видали tg_chat.json і перезапусти.
+                        print(f"  [TG] /start від стороннього чату {cid} — ігнорую")
+                        continue
                     with tg_chat_lock:
                         TG_CHAT_ID = cid
                     _tg_save_chat(cid)
@@ -405,6 +438,9 @@ def add_ws_wallet(addr):
     with ws_lock:
         if k in ws_wallets:
             return False
+        if len(ws_wallets) >= WS_WALLETS_CAP:
+            # FIFO-витіснення: найстаріша адреса поступається новій
+            ws_wallets.pop(next(iter(ws_wallets)), None)
         ws_wallets[k] = {"addr": addr, "source": "websocket",
                          "account": 0, "pnl_at": 0, "pnl_day": 0,
                          "vol_day": 0, "roi_day": 0, "name": "", "pos_count": 0}
@@ -621,8 +657,46 @@ def _ws_conn(coins, label, initial_delay=0):
                     except Exception:
                         kill()
                         break
+            confirmed = set()   # монети з підтвердженою підпискою
+            def _sub_checker(alive=alive, send=_send_json, kill=_kill,
+                             confirmed=confirmed):
+                """Раніше часткове підтвердження (100 із 115) мовчало
+                вічно: монети без підписки глухли, а статус був зелений.
+                Тепер: дочекатись дедлайну, доподписати мовчазні; якщо
+                провалилась третина+ — реконект, кілька штук — гучний лог
+                (sweep їх прикриває)."""
+                time.sleep(len(coins) * WS_SUB_DELAY + 60)
+                if not alive.is_set():
+                    return
+                missing = [c for c in coins if c not in confirmed]
+                if not missing:
+                    return
+                print(f"  [WS-{label}] без підтвердження {len(missing)} "
+                      f"підписок — повторюю")
+                for c in missing:
+                    if not alive.is_set():
+                        return
+                    try:
+                        send({"method": "subscribe",
+                              "subscription": {"type": "trades", "coin": c}})
+                    except Exception:
+                        kill()
+                        return
+                    time.sleep(WS_SUB_DELAY)
+                time.sleep(30)
+                if not alive.is_set():
+                    return
+                missing = [c for c in coins if c not in confirmed]
+                if len(missing) >= max(3, len(coins) // 3):
+                    print(f"  [WS-{label}] досі мовчать {len(missing)} — реконект")
+                    kill()
+                elif missing:
+                    print(f"  [WS-{label}] монети без підписки: "
+                          f"{', '.join(missing[:10])}"
+                          f"{'...' if len(missing) > 10 else ''} (sweep прикриє)")
             threading.Thread(target=_subscriber, daemon=True).start()
             threading.Thread(target=_pinger, daemon=True).start()
+            threading.Thread(target=_sub_checker, daemon=True).start()
             # Лічильники з суфіксом label: кожен пише лише свій потік,
             # інакше A, вдало перепідключившись, обнуляв би стрік B
             stats[f"ws_connects_{label}"] = stats.get(f"ws_connects_{label}", 0) + 1
@@ -630,7 +704,6 @@ def _ws_conn(coins, label, initial_delay=0):
             print(f"  [WS-{label}] connected, шлю {len(coins)} підписок "
                   f"по {WS_SUB_DELAY}s"
                   + (f" через проксі" if WS_PROXY else ""))
-            subs_ok = 0
             while True:
                 frame = ws_recv(sock, send_lock, rbuf)
                 if frame is None: break
@@ -641,13 +714,15 @@ def _ws_conn(coins, label, initial_delay=0):
                     continue
                 ch = obj.get("channel", "")
                 if ch == "subscriptionResponse":
-                    # Раніше ці відповіді ігнорувались: якщо сервер ріже
-                    # підписки, монети глухнуть мовчки. Тепер рахуємо
-                    # і віддаємо у /status як ws_subs_A/B.
-                    subs_ok += 1
-                    stats[f"ws_subs_{label}"] = subs_ok
-                    if subs_ok == len(coins):
-                        print(f"  [WS-{label}] всі {subs_ok} підписок підтверджені")
+                    # Пам'ятаємо, ЯКІ саме монети підтверджені: чекер
+                    # доподпише мовчазні, /status покаже ws_subs_A/B
+                    try:
+                        confirmed.add(obj["data"]["subscription"]["coin"])
+                    except Exception:
+                        confirmed.add(f"?{len(confirmed)}")
+                    stats[f"ws_subs_{label}"] = len(confirmed)
+                    if len(confirmed) == len(coins):
+                        print(f"  [WS-{label}] всі {len(confirmed)} підписок підтверджені")
                     continue
                 if ch == "pong":
                     continue
@@ -659,6 +734,11 @@ def _ws_conn(coins, label, initial_delay=0):
                 # з порізаними підписками виглядало б "живим" вічно.
                 stats["ws_last_ms"] = time.time() * 1000
                 stats[f"ws_last_{label}"] = stats["ws_last_ms"]
+                if stats.get(f"ws_fails_{label}"):
+                    # трейди йдуть = з'єднання здорове. Раніше стрік
+                    # скидався лише при НАСТУПНОМУ розриві, і /status
+                    # годинами брехав "мертве" про живе з'єднання
+                    stats[f"ws_fails_{label}"] = 0
                 data = obj.get("data", [])
                 if not isinstance(data, list): data = [data]
                 for t in data:
@@ -851,6 +931,14 @@ def _ws_dead_labels():
                 dead.append(lb)
     return dead
 delta_seen     = {}      # addr:coin -> коли вперше побачили дельту (анти-рейс)
+fill_cursor    = {}      # addr:coin -> ts(ms) останнього ОБРОБЛЕНОГО філа.
+                         # Без нього стара агресивна транзакція з 5-хвилинного
+                         # вікна "підтверджувала" нову, не пов'язану дельту
+                         # (пасивне закриття) — і йшов фальшивий алерт.
+close_episodes = {}      # addr:coin -> {start_size, acc_sz, last_ts, side}:
+                         # накопичення нарізаного закриття до порога 5%
+scan_tombstones = {}     # addr:coin -> ts повного закриття; захист від
+                         # "воскресіння" позиції застарілим снапшотом скану
 WATCH_INTERVAL = 20   # резервний обхід. Першу лінію тримає WS,
                       # 20с звільняє ~5 запитів/с постійного навантаження
 
@@ -904,8 +992,10 @@ def ws_trade_fastpath(t):
     except Exception:
         pass
 
-def update_watchlist(result, depth_snap, scan_start=0, failed_addrs=None):
-    """Оновлює watchlist після повного скану."""
+def update_watchlist(result, depth_snap, scan_start=0, failed_addrs=None,
+                     fetch_times=None):
+    """Оновлює watchlist після повного скану. fetch_times: addr -> коли
+    скан реально зчитав цей гаманець (для звірки з tombstone-ами)."""
     new_wl = {}
     for coin, positions in result.items():
         if coin.upper() in COIN_BLACKLIST:
@@ -928,6 +1018,33 @@ def update_watchlist(result, depth_snap, scan_start=0, failed_addrs=None):
             }
 
     with watchlist_lock:
+        # Tombstone-и: позиції, які realtime ПОВНІСТЮ закрив (і, можливо,
+        # заалертив) уже ПІСЛЯ старту цього скану. Снапшот скану їх ще
+        # містить — без цієї перевірки закрита позиція "воскресала" і
+        # могла дати повторний алерт про те саме закриття.
+        for _k, _ts in list(scan_tombstones.items()):
+            if _ts >= scan_start > 0:
+                _ta, _, _tc = _k.partition(":")
+                # Гасимо лише ЗАСТАРІЛИЙ знімок: якщо скан зчитав цей
+                # гаманець уже ПІСЛЯ закриття, у знімку свіжий стан
+                # (наприклад, кит перевідкрився) — його не чіпаємо
+                if (fetch_times or {}).get(_ta, scan_start) <= _ts \
+                   and _ta in new_wl and _tc in new_wl[_ta]:
+                    del new_wl[_ta][_tc]
+                    if not new_wl[_ta]:
+                        del new_wl[_ta]
+            elif scan_start > 0:
+                scan_tombstones.pop(_k, None)   # старіші за скан — зайві
+
+        # Записи, які realtime ДОДАВ під час скану (новий бік після
+        # розвороту), а снапшот скану їх ще не бачив: переносимо,
+        # інакше вони губились би при повній заміні watchlist.
+        for _la, _lcoins in watchlist.items():
+            for _lc, _lp in _lcoins.items():
+                if _lp.get("upd", 0) >= scan_start > 0 \
+                   and _lc not in new_wl.get(_la, {}):
+                    new_wl.setdefault(_la, {})[_lc] = dict(_lp)
+
         # Гаманці, чий запит під час скану впав (мережа/429): стан
         # НЕВІДОМИЙ, а не "порожній". Раніше вони просто зникали з
         # watchlist до наступного скану (до ~40 хв без нагляду).
@@ -1008,11 +1125,22 @@ def get_recent_market_fills(addr, coin, since_ms, side=None):
 
     Кидає RateLimited / APIError при помилці — щоб не плутати з "немає fills".
     """
-    fills = hl_post({"type": "userFillsByTime",
-                     "user": addr,
-                     "startTime": since_ms})
-    if fills and len(fills) > 0 and not isinstance(fills[0], dict):
-        raise APIError(f"userFillsByTime unexpected format for {addr[:10]}")
+    # Пагінація: одна відповідь — максимум 2000 філів. Без ММ-фільтра
+    # у watchlist бувають гіперактивні гаманці, і потрібний філ міг
+    # не влізти у першу сторінку — тоді закриття тихо губилось.
+    fills = []
+    _start = since_ms
+    for _page in range(5):
+        batch = hl_post({"type": "userFillsByTime",
+                         "user": addr,
+                         "startTime": _start})
+        if batch and len(batch) > 0 and not isinstance(batch[0], dict):
+            raise APIError(f"userFillsByTime unexpected format for {addr[:10]}")
+        batch = batch or []
+        fills.extend(batch)
+        if len(batch) < 2000:
+            break
+        _start = max(f.get("time", 0) for f in batch) + 1
 
     # Групуємо по HASH (транзакція)
     txs = {}  # hash -> {sz, cost, ts, oids, dir}
@@ -1069,6 +1197,33 @@ def get_recent_market_fills(addr, coin, since_ms, side=None):
     market_txs.sort(key=lambda x: x["ts"], reverse=True)
     return market_txs
 
+def _insert_flipped(addr, coin, pos, alert_key):
+    """Кит розвернувся (LONG↔SHORT): старий бік закритий і зааалертований,
+    а НОВИЙ бік одразу повертаємо у watchlist, якщо він тягне на ratio>=2.
+    Раніше нова позиція чекала наступного скану — до ~45 хв сліпоти по
+    щойно розвернутому киту."""
+    with cache_lock:
+        d = cache["depth"].get(coin) or cache.get("depth_prev", {}).get(coin)
+    ds = depth_for_side(d, pos.get("side"))
+    ratio = pos["val"] / ds if ds else 0
+    if ratio < 2.0:
+        return
+    with watchlist_lock:
+        watchlist.setdefault(addr, {})[coin] = {
+            "size":  pos["size"],
+            "val":   pos["val"],
+            "side":  pos["side"],
+            "ratio": ratio,
+            "entry": pos.get("entry", 0),
+            "liq":   pos.get("liq", 0),
+            "upd":   time.time(),
+        }
+    # нова позиція = нова історія: дедуп і епізод старого боку скидаємо
+    sent_alerts.discard(alert_key)
+    close_episodes.pop(alert_key, None)
+    print(f"  [WATCH] {coin} {addr[:10]} розворот: новий {pos['side']} "
+          f"ratio {ratio:.1f}x одразу під наглядом")
+
 def run_realtime_monitor():
     """Моніторить watchlist кожні WATCH_INTERVAL секунд."""
     # Чекаємо поки перший скан заповнить watchlist
@@ -1102,10 +1257,12 @@ def run_realtime_monitor():
                 alert_key = f"{addr}:{coin}"
 
                 # Розворот LONG↔SHORT: стара позиція закрита ПОВНІСТЮ,
-                # а решта — вже нова позиція в інший бік. Раніше
-                # порівнювались голі розміри, і фліп 100 LONG → 100 SHORT
-                # виглядав як "нічого не сталось".
+                # а решта — вже нова позиція в інший бік. Зберігаємо її:
+                # після алерту про закриття новий бік одразу піде у
+                # watchlist через _insert_flipped.
+                flipped_pos = None
                 if new_pos is not None and new_pos.get("side") != old.get("side"):
+                    flipped_pos = new_pos
                     new_pos = None
 
                 if new_pos is None:
@@ -1126,12 +1283,15 @@ def run_realtime_monitor():
                                     watchlist[addr][coin]["size"] = new_size
                                     watchlist[addr][coin]["val"]  = new_pos["val"]
                                     watchlist[addr][coin]["upd"]  = time.time()
+                            # Долив обриває епізод розвантаження: інакше
+                            # відсотки рахувались би від старої, меншої бази
+                            # і поріг 5% спрацьовував би зарано
+                            close_episodes.pop(alert_key, None)
                         sent_alerts.discard(alert_key)
                         delta_seen.pop(alert_key, None)
                         continue
-                    if delta_size < old_size * MIN_CLOSE_PCT:
-                        # дрібне закриття: базу НЕ рухаємо, хай
-                        # накопичується до порога 5%
+                    if delta_size < old_size * MIN_DELTA_PCT:
+                        # < 1%: шум, fills не тягнемо, базу не рухаємо
                         sent_alerts.discard(alert_key)
                         delta_seen.pop(alert_key, None)
                         continue
@@ -1140,8 +1300,12 @@ def run_realtime_monitor():
                     delta_seen.setdefault(alert_key, time.time())
 
                 # ── Підтвердження через fills ──
+                # Курсор: беремо лише філи, НОВІШІ за останній оброблений.
+                # Інакше стара агресивна транзакція з 5-хвилинного вікна
+                # "підтверджувала" пізнішу пасивну дельту — фальшивий алерт.
                 stats["delta_events"] += 1
                 since_ms = int((time.time() - 300) * 1000)
+                since_ms = max(since_ms, fill_cursor.get(alert_key, 0) + 1)
                 try:
                     mfills = get_recent_market_fills(addr, coin, since_ms,
                                                      old.get("side"))
@@ -1176,9 +1340,17 @@ def run_realtime_monitor():
                             watchlist[addr][coin]["size"] = new_pos["size"]
                             watchlist[addr][coin]["val"]  = new_pos["val"]
                             watchlist[addr][coin]["upd"]  = time.time()
+                    if full_close:
+                        # тихе повне закриття (лімітками): tombstone проти
+                        # воскресіння снапшотом скану + новий бік фліпа
+                        scan_tombstones[alert_key] = time.time()
+                        close_episodes.pop(alert_key, None)
+                        if flipped_pos is not None:
+                            _insert_flipped(addr, coin, flipped_pos, alert_key)
                     continue
                 stats["fills_confirmed"] += 1
                 delta_seen.pop(alert_key, None)
+                fill_cursor[alert_key] = max(f["ts"] for f in mfills)
 
                 # Фліп-транзакція ("Long > Short") містить і закриття, і
                 # відкриття нового боку одним філом: закритого в ній не
@@ -1206,18 +1378,32 @@ def run_realtime_monitor():
 
                 has_liq = any(f.get("liq") for f in mfills)
 
-                # Часткове закриття мусить мати хоча б ОДНУ маркет-транзакцію
-                # розміром >= MIN_CLOSE_PCT від позиції. Сума дрібних шматків,
-                # що назбирала 5%, сигналом не вважається. Ліквідації — завжди.
+                # ЕПІЗОД: накопичуємо агресивні закриття, поки паузи між
+                # ними < EPISODE_TTL_S. Алерт — коли епізод сумарно набрав
+                # MIN_CLOSE_PCT від позиції на його початку. Так ловиться
+                # і одна транзакція на 5%+, і нарізка 10 x 1% (алгоритмічне
+                # виконання) — раніше нарізане закриття губилось назавжди.
+                _now = time.time()
+                ep = close_episodes.get(alert_key)
+                if ep is None or _now - ep["last_ts"] > EPISODE_TTL_S \
+                   or ep.get("side") != old.get("side"):
+                    ep = {"start_size": old["size"], "acc_sz": 0.0,
+                          "last_ts": _now, "side": old.get("side")}
+                    close_episodes[alert_key] = ep
+                ep["acc_sz"] += sum(f["sz"] for f in mfills)
+                ep["last_ts"] = _now
+
                 if not full_close and not has_liq:
-                    biggest_tx = max((f["sz"] for f in mfills), default=0.0)
-                    if biggest_tx < old["size"] * MIN_CLOSE_PCT:
+                    if ep["acc_sz"] < ep["start_size"] * MIN_CLOSE_PCT:
+                        # епізод ще не набрав порога: базу рухаємо, чекаємо
                         with watchlist_lock:
                             if addr in watchlist and coin in watchlist[addr]:
                                 watchlist[addr][coin]["size"] = new_pos["size"]
                                 watchlist[addr][coin]["val"]  = new_pos["val"]
                                 watchlist[addr][coin]["upd"]  = time.time()
                         continue
+                    # алерт на КУМУЛЯТИВНИЙ обсяг епізоду від його бази
+                    close_pct = min(ep["acc_sz"] / ep["start_size"], 1.0)
 
                 # Дедуп тільки для часткових: повне закриття шлеться завжди,
                 # навіть якщо перед цим уже був алерт про часткове.
@@ -1237,7 +1423,9 @@ def run_realtime_monitor():
                     "coin":      coin,
                     "side":      old["side"],
                     "old_val":   old["val"],
-                    "old_size":  old["size"],
+                    # для часткового епізоду відсоток рахувався від бази
+                    # на початку епізоду — її ж показуємо у повідомленні
+                    "old_size":  old["size"] if full_close else ep["start_size"],
                     "close_pct": close_pct,
                     "ratio":     old["ratio"],
                     "entry":     old["entry"],
@@ -1254,6 +1442,18 @@ def run_realtime_monitor():
                             watchlist[addr][coin]["size"] = new_pos["size"]
                             watchlist[addr][coin]["val"]  = new_pos["val"]
                             watchlist[addr][coin]["upd"]  = time.time()
+                if full_close:
+                    # tombstone: скан, що почався до закриття, не воскресить
+                    # позицію своїм застарілим снапшотом (повторний алерт)
+                    scan_tombstones[alert_key] = time.time()
+                    close_episodes.pop(alert_key, None)
+                    if flipped_pos is not None:
+                        _insert_flipped(addr, coin, flipped_pos, alert_key)
+                else:
+                    # епізод відпрацював: наступні 5% — новий відлік від
+                    # решти позиції
+                    ep["start_size"] = new_pos["size"]
+                    ep["acc_sz"] = 0.0
 
     def _safe_worker(item):
         try:
@@ -1364,7 +1564,9 @@ def check_position_changes(new_result, depth_snap):
                 full_close = False
 
             # ── ПІДТВЕРДЖЕННЯ через fills (обов'язково) ──
+            key_ac = f"{addr}:{coin}"
             since_ms = int((time.time() - 300) * 1000)
+            since_ms = max(since_ms, fill_cursor.get(key_ac, 0) + 1)
             try:
                 mfills = get_recent_market_fills(addr, coin, since_ms,
                                                  old.get("side"))
@@ -1378,16 +1580,16 @@ def check_position_changes(new_result, depth_snap):
                 if ">" in _f.get("dir", "") and _f["sz"] > old["size"]:
                     _f["sz"] = old["size"]
 
-            # Хоча б одна транзакція >= MIN_CLOSE_PCT (ліквідації — завжди)
+            # Сумарний агресивний обсяг >= MIN_CLOSE_PCT (ліквідації — завжди)
             if not any(f.get("liq") for f in mfills):
-                biggest_tx = max((f["sz"] for f in mfills), default=0.0)
-                if biggest_tx < old["size"] * MIN_CLOSE_PCT:
+                agg_sz = sum(f["sz"] for f in mfills)
+                if agg_sz < old["size"] * MIN_CLOSE_PCT:
                     continue
 
-            key_ac = f"{addr}:{coin}"
             if key_ac in sent_alerts:
                 continue   # realtime вже відправив цей клоуз
             sent_alerts.add(key_ac)
+            fill_cursor[key_ac] = max(f["ts"] for f in mfills)
 
             alerts.append({
                 "addr":      addr,
@@ -1447,6 +1649,24 @@ def send_close_alert(a):
         n_tx = len(seen_hashes)
         tx_word = "маркет транзакція" if n_tx == 1 else "маркет транзакцій"
         fill_info = f"\n💸 <b>Маркет:</b> {n_tx} {tx_word}, avg ${avg_px:,.4f}, {total_sz:.4f} токенів"
+        # Ratio вгорі описує ПОЗИЦІЮ; тут — сила самого закриття проти
+        # свіжої глибини сторони, яку воно б'є (LONG→bid, SHORT→ask)
+        closed_usd = sum(f["px"] * f["sz"] for f in fills)
+        side_depth = 0
+        try:
+            d_live = fetch_binance_depth(a["coin"], retries=1)
+            side_depth = depth_for_side(d_live, a["side"]) if d_live else 0
+        except Exception:
+            pass
+        if not side_depth:
+            with cache_lock:
+                d_c = (cache["depth"].get(a["coin"])
+                       or cache.get("depth_prev", {}).get(a["coin"]))
+            side_depth = depth_for_side(d_c, a["side"])
+        if side_depth:
+            _bside = "bid" if a["side"] == "LONG" else "ask"
+            fill_info += (f"\n💥 <b>Закрито:</b> {fmt(closed_usd)} = "
+                          f"{closed_usd/side_depth:.2f}× глибини {_bside}")
         if tx_links:
             fill_info += f"\n🔗 {tx_links}"
     liq_txs = [f for f in fills if f.get("liq")]
@@ -1876,6 +2096,8 @@ def save_state():
             "sim_closed":    closed,
             "recent_alerts": ra,
             "sent_alerts":   list(sent_alerts),
+            "fill_cursor":   dict(fill_cursor),
+            "close_episodes": {k: dict(v) for k, v in close_episodes.items()},
             "fc_positions":  [[k[0], k[1], dict(p)] for k, p in fc_positions.items()],
         }
         tmp = STATE_FILE + ".tmp"
@@ -1911,6 +2133,8 @@ def load_state():
         with alerts_lock:
             recent_alerts.extend(snap.get("recent_alerts", [])[:50])
         sent_alerts.update(snap.get("sent_alerts", []))
+        fill_cursor.update(snap.get("fill_cursor", {}))
+        close_episodes.update(snap.get("close_episodes", {}))
         with fc_lock:
             for a, c, p in snap.get("fc_positions", []):
                 fc_positions[(a, c)] = p
@@ -1926,6 +2150,14 @@ def _prune_leaks():
         fast_last.pop(k, None)
     for k in [k for k, ts in list(delta_seen.items()) if ts < now_ - 3600]:
         delta_seen.pop(k, None)
+    for k in [k for k, ts in list(fill_cursor.items())
+              if ts / 1000 < now_ - 3600]:
+        fill_cursor.pop(k, None)
+    for k in [k for k, e in list(close_episodes.items())
+              if e.get("last_ts", 0) < now_ - 2 * EPISODE_TTL_S]:
+        close_episodes.pop(k, None)
+    for k in [k for k, ts in list(scan_tombstones.items()) if ts < now_ - 7200]:
+        scan_tombstones.pop(k, None)
     cut_ms = (now_ - 3600) * 1000
     with fc_lock:
         for k in list(fc_episodes):
@@ -2195,6 +2427,7 @@ def run_scan():
 
         all_pos = {}
         failed_addrs = set()   # запит впав: стан невідомий, не "порожній"
+        fetch_times  = {}      # addr -> коли скан реально зчитав гаманець
 
         def process(w):
             k = w["addr"].lower()
@@ -2206,6 +2439,7 @@ def run_scan():
                     cache["progress"]["done"] += 1
                     failed_addrs.add(k)
                 return
+            fetch_times[k] = time.time()
             update_stats(k, bool(positions), sn)
             with cache_lock:
                 if positions:
@@ -2247,7 +2481,8 @@ def run_scan():
                     pos["ratio"]     = 0
 
         # Оновлюємо real-time watchlist
-        update_watchlist(result, depth_snap, scan_start, failed_addrs)
+        update_watchlist(result, depth_snap, scan_start, failed_addrs,
+                         fetch_times)
 
         # Детекція закриття позицій (між сканами)
         alerts = check_position_changes(result, depth_snap)
@@ -2390,6 +2625,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "fills_confirmed": stats["fills_confirmed"],
                 "fills_empty":    stats["fills_empty"],
                 "alerts_sent":    stats["alerts_sent"],
+                "tg_errors":      stats.get("tg_errors", 0),
                 "rate_limited":   stats["rate_limited"],
             })
         elif self.path == "/sim":
