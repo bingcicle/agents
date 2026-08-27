@@ -182,8 +182,24 @@ def fetch_binance_depth(coin, retries=3):
                 time.sleep(1)
     return None
 
+def depth_for_side(d, side):
+    """Глибина тієї сторони стакану, яку атакує закриття позиції:
+    LONG закривається продажем у bid, SHORT — купівлею з ask.
+    Старий max(ask, bid) застосовував більшу сторону і применшував
+    тиск: позиція у 2.4x від "своєї" сторони могла виглядати як 0.6x
+    і не потрапляти у watchlist. max лишається запасним варіантом."""
+    if not d:
+        return 0
+    v = d.get("bid" if side == "LONG" else "ask", 0)
+    return v or d.get("max", 0)
+
 def fetch_hl_coins_list():
-    """Всі perp монети з Hyperliquid."""
+    """Всі perp монети з Hyperliquid — ТОЧНІ назви, як їх віддає API.
+    Раніше тут стояло .upper(), і воно тихо ламало всі mixed-case
+    монети (kPEPE, kBONK...): позиції приходили як "kPEPE", а глибина
+    лежала під ключем "KPEPE" → ratio завжди 0, у watchlist такі
+    монети не потрапляли ніколи (за місяць у лозі жодної), і
+    WS-підписка на "KPEPE" теж була битою."""
     req = urllib.request.Request(
         "https://api.hyperliquid.xyz/info",
         data=json.dumps({"type":"metaAndAssetCtxs"}).encode(),
@@ -192,7 +208,7 @@ def fetch_hl_coins_list():
     )
     with urllib.request.urlopen(req, timeout=15) as r:
         data = json.loads(r.read())
-    return [u["name"].upper() for u in data[0]["universe"]
+    return [u["name"] for u in data[0]["universe"]
             if "/" not in u.get("name","")]
 
 def fetch_binance_symbols_set():
@@ -271,10 +287,18 @@ def run_depth_loop():
         depth = fetch_all_depth()
         with cache_lock:
             if depth:
-                # Новий depth прийшов нормально: старий йде у fallback
+                # Зливаємо ПО-МОНЕТНО: монета, що цього разу не
+                # завантажилась (разова помилка Binance), тримає стару
+                # глибину, а не випадає з watchlist на цілий цикл.
+                # Ціна питання: делістнута монета висить зі старою
+                # глибиною — нешкідливо, позицій у ній вже не буде.
                 cache["depth_prev"] = dict(cache.get("depth", {}))
-                cache["depth"] = depth
-                print(f"  [DEPTH] Cache updated: {len(depth)} coins")
+                merged = dict(cache.get("depth", {}))
+                merged.update(depth)
+                cache["depth"] = merged
+                carried = len(merged) - len(depth)
+                print(f"  [DEPTH] Cache updated: {len(depth)} fresh"
+                      + (f", {carried} carried over" if carried > 0 else ""))
             else:
                 # Binance не відповів: НЕ затираємо робочі дані порожнім
                 print(f"  [DEPTH] Fetch returned empty, keeping old data "
@@ -880,17 +904,17 @@ def ws_trade_fastpath(t):
     except Exception:
         pass
 
-def update_watchlist(result, depth_snap, scan_start=0):
+def update_watchlist(result, depth_snap, scan_start=0, failed_addrs=None):
     """Оновлює watchlist після повного скану."""
     new_wl = {}
     for coin, positions in result.items():
         if coin.upper() in COIN_BLACKLIST:
             continue
         d = depth_snap.get(coin)
-        depth_max = d["max"] if d and d.get("max") else 0
         for pos in positions:
             if not pos.get("size"): continue
-            ratio = pos["val"] / depth_max if depth_max else 0
+            ds = depth_for_side(d, pos["side"])
+            ratio = pos["val"] / ds if ds else 0
             if ratio < 2.0: continue  # watchlist тільки ratio >= 2
             addr = pos["addr"].lower()
             if addr not in new_wl: new_wl[addr] = {}
@@ -904,6 +928,16 @@ def update_watchlist(result, depth_snap, scan_start=0):
             }
 
     with watchlist_lock:
+        # Гаманці, чий запит під час скану впав (мережа/429): стан
+        # НЕВІДОМИЙ, а не "порожній". Раніше вони просто зникали з
+        # watchlist до наступного скану (до ~40 хв без нагляду).
+        # Переносимо старі позиції як є: найближчий sweep сам їх
+        # перевірить і поправить або приберe.
+        carried_fail = 0
+        for _fa in (failed_addrs or ()):
+            if _fa not in new_wl and _fa in watchlist:
+                new_wl[_fa] = {c: dict(p) for c, p in watchlist[_fa].items()}
+                carried_fail += 1
         # Скан іде хвилини. Якщо realtime ПІД ЧАС ЦЬОГО скану бачив свіже
         # закриття, лишаємо його розмір. Але тільки з позначкою часу,
         # свіжішою за старт скану. Старий варіант брав просто менший розмір
@@ -925,7 +959,8 @@ def update_watchlist(result, depth_snap, scan_start=0):
         watchlist.clear()
         watchlist.update(new_wl)
     print(f"  [WATCH] Watchlist updated: {len(new_wl)} wallets, "
-          f"{sum(len(v) for v in new_wl.values())} positions with ratio>=2x")
+          f"{sum(len(v) for v in new_wl.values())} positions with ratio>=2x"
+          + (f" | {carried_fail} carried (scan errors)" if carried_fail else ""))
 
 def check_one_wallet(addr):
     """
@@ -952,59 +987,24 @@ def check_one_wallet(addr):
         }
     return result
 
-_ot_cache = {}   # addr -> (ts, dict). Кеш на 3с: кит закриває 3 монети
-                 # разом, а historicalOrders один на гаманець
-
-def get_order_types(addr):
+def get_recent_market_fills(addr, coin, since_ms, side=None):
     """
-    Тип кожного ордера через historicalOrders.
-    Повертає dict {oid: (orderType, tif)}.
-    Важливо: кнопка "маркет" у веб-інтерфейсі Hyperliquid технічно
-    записується як лімітка з tif="FrontendMarket", а не orderType="Market".
-    Кидає RateLimited / APIError при помилці.
-    """
-    _c = _ot_cache.get(addr)
-    if _c and time.time() - _c[0] < 3:
-        return _c[1]
-    data = hl_post({"type": "historicalOrders", "user": addr})
-    result = {}
-    for item in (data or []):
-        if not isinstance(item, dict): continue
-        order = item.get("order", {})
-        if not isinstance(order, dict): continue
-        oid = order.get("oid")
-        if oid is not None:
-            result[oid] = (str(order.get("orderType", "")),
-                           str(order.get("tif", "")))
-    _ot_cache[addr] = (time.time(), result)
-    return result
-
-# Що вважаємо маркетом: справжній Market, кнопка маркет у UI (FrontendMarket)
-# і агресивний API-маркет (Ioc). Пасивні лімітки в стакані (Gtc, Alo) відкидаємо.
-MARKET_TIFS = {"FrontendMarket", "Ioc"}
-
-def _is_market_order(info):
-    """info = (orderType, tif) або None якщо ордер не знайшовся в історії."""
-    if info is None:
-        # Ордер старіший за вікно historicalOrders: тейкер+клоуз уже
-        # відфільтровані, тому не викидаємо
-        return True
-    otype, tif = info
-    if otype == "Market": return True
-    if tif in MARKET_TIFS: return True
-    return False
-
-def get_recent_market_fills(addr, coin, since_ms):
-    """
-    Повертає МАРКЕТ-закриття для addr/coin після since_ms, згруповані по ТРАНЗАКЦІЯХ (hash).
+    Повертає АГРЕСИВНІ закриття для addr/coin після since_ms,
+    згруповані по ТРАНЗАКЦІЯХ (hash). side — бік позиції, яку
+    відстежуємо: для LONG закриттям є "Close Long" і "Long > Short",
+    а "Short > Long" — це ВІДКРИТТЯ лонга, його приймати не можна,
+    інакше філ, що відкрив позицію, підтверджував би її "закриття".
 
     Логіка:
     - Один блок Hyperliquid = один hash = одна транзакція в explorer.
-    - Всередині блоку може бути багато fills та ордерів (oid), всі з одним hash.
-    - Ми групуємо по hash щоб показувати РЕАЛЬНІ транзакції як в explorer.
-    - Тип перевіряємо через historicalOrders: приймаємо Market,
-      FrontendMarket (кнопка маркет в UI) і Ioc (маркет через API).
-      Пасивні лімітки зі стакану (Gtc, Alo) відкидаємо.
+    - Всередині блоку може бути багато fills та ордерів, всі з одним hash.
+    - Агресивне закриття = crossed=true (тейкер: угода перетнула спред
+      і рухала ціну) + напрямок закриття + не TWAP. Розворот
+      ("Long > Short") — це теж повне закриття старої позиції.
+    - Тип ордера НЕ перевіряємо: маркетабельна Gtc-лімітка, поставлена
+      в ціну, б'є по стакану так само, як кнопка "маркет". Стара
+      перевірка через historicalOrders викидала такі закриття
+      (реальні тейкер-закриття губились) і коштувала зайвого запиту.
 
     Кидає RateLimited / APIError при помилці — щоб не плутати з "немає fills".
     """
@@ -1014,48 +1014,23 @@ def get_recent_market_fills(addr, coin, since_ms):
     if fills and len(fills) > 0 and not isinstance(fills[0], dict):
         raise APIError(f"userFillsByTime unexpected format for {addr[:10]}")
 
-    # Спершу збираємо кандидатів (close + taker + не TWAP)
-    candidates = []
-    oids_needed = set()
+    # Групуємо по HASH (транзакція)
+    txs = {}  # hash -> {sz, cost, ts, oids, dir}
     for f in (fills or []):
         if f.get("coin") != coin: continue
         is_taker = f.get("crossed", False)
         d = f.get("dir", "")
         f_liq = bool(f.get("liquidation")) or ("Liquidat" in d)
-        is_close = ("Close" in d) or f_liq
+        if side == "LONG":
+            is_close = d.startswith("Close Long") or d.startswith("Long >") or f_liq
+        elif side == "SHORT":
+            is_close = d.startswith("Close Short") or d.startswith("Short >") or f_liq
+        else:
+            is_close = ("Close" in d) or (">" in d) or f_liq
         is_twap  = (f.get("twapId") is not None)
         if not ((is_taker or f_liq) and is_close and not is_twap):
             continue
-        candidates.append(f)
-        oids_needed.add(f.get("oid"))
-
-    if not candidates:
-        return []
-
-    # Отримуємо типи ордерів (Market vs Limit) — один запит.
-    # Якщо rate limit — order_types буде None, і ми fallback на crossed=True (taker),
-    # бо не можемо підтвердити точний тип, але taker вже рухає ціну.
-    try:
-        order_types = get_order_types(addr)
-    except RateLimited:
-        order_types = None   # fallback режим
-    except APIError:
-        order_types = None
-
-    # Групуємо по HASH (транзакція)
-    txs = {}  # hash -> {sz, cost, ts, oids, dir}
-    rejected = {}
-    for f in candidates:
         oid = f.get("oid")
-        f_liq = bool(f.get("liquidation")) or ("Liquidat" in f.get("dir", ""))
-        if (not f_liq) and order_types is not None:
-            info = order_types.get(oid)
-            if not _is_market_order(info):
-                # Пасивна лімітка: рахуємо для логу і пропускаємо
-                k = info[1] or info[0] or "?"
-                rejected[k] = rejected.get(k, 0) + 1
-                continue
-        # else: fallback — order_types недоступні, кандидати вже taker+close, лишаємо як є
         h  = f.get("hash", "")
         px = float(f.get("px", 0))
         sz = float(f.get("sz", 0))
@@ -1092,10 +1067,6 @@ def get_recent_market_fills(addr, coin, since_ms):
             "liq_method": t["liq_method"],
         })
     market_txs.sort(key=lambda x: x["ts"], reverse=True)
-    if rejected:
-        rj = ", ".join(f"{k}:{v}" for k, v in rejected.items())
-        print(f"  [FILLS] {coin} {addr[:10]}: {len(market_txs)} маркет, "
-              f"відкинуто пасивних лімiток {sum(rejected.values())} ({rj})")
     return market_txs
 
 def run_realtime_monitor():
@@ -1130,6 +1101,13 @@ def run_realtime_monitor():
                 new_pos = current.get(coin)
                 alert_key = f"{addr}:{coin}"
 
+                # Розворот LONG↔SHORT: стара позиція закрита ПОВНІСТЮ,
+                # а решта — вже нова позиція в інший бік. Раніше
+                # порівнювались голі розміри, і фліп 100 LONG → 100 SHORT
+                # виглядав як "нічого не сталось".
+                if new_pos is not None and new_pos.get("side") != old.get("side"):
+                    new_pos = None
+
                 if new_pos is None:
                     close_pct = 1.0
                     full_close = True
@@ -1138,7 +1116,22 @@ def run_realtime_monitor():
                     old_size = old["size"]
                     new_size = new_pos["size"]
                     delta_size = old_size - new_size
+                    if delta_size <= 0:
+                        # Кит ДОЛИВ (або без змін): синхронізуємо базу.
+                        # Інакше після 100→200 закриття до 150 виглядало б
+                        # як "нічого", а до 90 — як 10% замість 55%.
+                        if delta_size < 0:
+                            with watchlist_lock:
+                                if addr in watchlist and coin in watchlist[addr]:
+                                    watchlist[addr][coin]["size"] = new_size
+                                    watchlist[addr][coin]["val"]  = new_pos["val"]
+                                    watchlist[addr][coin]["upd"]  = time.time()
+                        sent_alerts.discard(alert_key)
+                        delta_seen.pop(alert_key, None)
+                        continue
                     if delta_size < old_size * MIN_CLOSE_PCT:
+                        # дрібне закриття: базу НЕ рухаємо, хай
+                        # накопичується до порога 5%
                         sent_alerts.discard(alert_key)
                         delta_seen.pop(alert_key, None)
                         continue
@@ -1150,7 +1143,8 @@ def run_realtime_monitor():
                 stats["delta_events"] += 1
                 since_ms = int((time.time() - 300) * 1000)
                 try:
-                    mfills = get_recent_market_fills(addr, coin, since_ms)
+                    mfills = get_recent_market_fills(addr, coin, since_ms,
+                                                     old.get("side"))
                 except RateLimited:
                     stats["rate_limited"] += 1
                     with cycle_rl_lock:
@@ -1185,6 +1179,14 @@ def run_realtime_monitor():
                     continue
                 stats["fills_confirmed"] += 1
                 delta_seen.pop(alert_key, None)
+
+                # Фліп-транзакція ("Long > Short") містить і закриття, і
+                # відкриття нового боку одним філом: закритого в ній не
+                # більше, ніж було в позиції — ріжемо, щоб алерт і
+                # симулятор не завищували обсяг
+                for _f in mfills:
+                    if ">" in _f.get("dir", "") and _f["sz"] > old["size"]:
+                        _f["sz"] = old["size"]
 
                 # ── Симулятор: кожна підтверджена маркет-транзакція ──
                 try:
@@ -1321,9 +1323,11 @@ def check_position_changes(new_result, depth_snap):
     for coin, positions in new_result.items():
         if coin.upper() in COIN_BLACKLIST: continue
         d = depth_snap.get(coin)
-        if not d or not d.get("max"): continue
+        if not d: continue
         for pos in positions:
-            ratio = pos["val"] / d["max"]
+            ds = depth_for_side(d, pos["side"])
+            if not ds: continue
+            ratio = pos["val"] / ds
             if ratio < 2.0: continue
             if not pos.get("size"): continue
             addr = pos["addr"].lower()
@@ -1350,6 +1354,9 @@ def check_position_changes(new_result, depth_snap):
                 # 5 хв назад. Повні закриття ловить real-time монітор (~20с).
                 continue
             else:
+                if new_pos.get("side") != old.get("side"):
+                    # розворот: повне закриття, його ловить realtime
+                    continue
                 delta_size = old["size"] - new_pos["size"]
                 if delta_size <= 0: continue
                 close_pct = delta_size / old["size"]
@@ -1359,13 +1366,17 @@ def check_position_changes(new_result, depth_snap):
             # ── ПІДТВЕРДЖЕННЯ через fills (обов'язково) ──
             since_ms = int((time.time() - 300) * 1000)
             try:
-                mfills = get_recent_market_fills(addr, coin, since_ms)
+                mfills = get_recent_market_fills(addr, coin, since_ms,
+                                                 old.get("side"))
             except (RateLimited, APIError, Exception):
                 # Не можемо підтвердити — пропускаємо без алерту
                 continue
             if not mfills:
                 # Немає маркет fills — не шлемо алерт
                 continue
+            for _f in mfills:   # фліп: закритого не більше за позицію
+                if ">" in _f.get("dir", "") and _f["sz"] > old["size"]:
+                    _f["sz"] = old["size"]
 
             # Хоча б одна транзакція >= MIN_CLOSE_PCT (ліквідації — завжди)
             if not any(f.get("liq") for f in mfills):
@@ -1530,9 +1541,14 @@ def sim_all_mids():
     except Exception:
         return None
 
-def _sim_depth(coin):
+def _sim_depth(coin, side=None):
+    """Глибина монети; із side — по стороні, яку атакує закриття кита,
+    щоб вихід 'whale_exhausted' рахувався в тій самій шкалі, що і
+    side-aware ratio у watchlist."""
     with cache_lock:
         d = cache["depth"].get(coin) or cache.get("depth_prev", {}).get(coin)
+    if side:
+        return depth_for_side(d, side)
     return d["max"] if d and d.get("max") else 0
 
 def _sim_slip(depth):
@@ -1607,6 +1623,12 @@ def sim_on_market_txs(addr, coin, old, mfills, remaining_size, full_close):
 
     with sim_lock:
         tr = sim_trackers.get(key)
+        # Позиція розвернулась (LONG↔SHORT): стара серія належить уже
+        # мертвому боку — з нею симулятор входив би в протилежний бік
+        if tr is not None and key not in sim_positions \
+           and tr.get("whale_side") != old.get("side", tr.get("whale_side")):
+            sim_trackers.pop(key, None)
+            tr = None
         if tr is None:
             tr = {
                 "txs": [], "seen": set(),
@@ -1623,13 +1645,19 @@ def sim_on_market_txs(addr, coin, old, mfills, remaining_size, full_close):
             tr["remaining"] = remaining_size
             return
 
-        # Стара серія видихлась: нова транзакція починає нову серію
+        # Стара серія видихлась: нова транзакція починає нову серію.
+        # Оновлюємо ВСІ поля кита, не лише розмір: entry/liq/ratio теж
+        # могли змінитись, інакше вхід рахувався б від мертвих даних
         if tr["txs"] and tr["last_tx_ms"] > 0 and new_txs and \
            (new_txs[0]["ts"] - tr["last_tx_ms"]) / 1000 > SIM_TRACKER_TTL_S and \
            key not in sim_positions:
             tr["txs"] = []
-            tr["start_size"] = old.get("size", tr["start_size"])
-            tr["start_val"]  = old.get("val",  tr["start_val"])
+            tr["start_size"]  = old.get("size", tr["start_size"])
+            tr["start_val"]   = old.get("val",  tr["start_val"])
+            tr["whale_side"]  = old.get("side", tr["whale_side"])
+            tr["whale_ratio"] = old.get("ratio", tr["whale_ratio"])
+            tr["whale_entry"] = old.get("entry", tr["whale_entry"])
+            tr["whale_liq"]   = old.get("liq", tr["whale_liq"])
 
         for t in new_txs:
             tr["seen"].add(t.get("hash"))
@@ -1664,7 +1692,7 @@ def _sim_enter(key):
         start_val = tr["start_val"]
         last_tx_ms = tr["last_tx_ms"]
 
-    depth = _sim_depth(coin)
+    depth = _sim_depth(coin, w_side)
     if depth <= 0:
         print(f"  [SIM] {coin}: немає depth, вхід пропущено")
         return
@@ -1898,8 +1926,6 @@ def _prune_leaks():
         fast_last.pop(k, None)
     for k in [k for k, ts in list(delta_seen.items()) if ts < now_ - 3600]:
         delta_seen.pop(k, None)
-    for k in [k for k, v in list(_ot_cache.items()) if v[0] < now_ - 60]:
-        _ot_cache.pop(k, None)
     cut_ms = (now_ - 3600) * 1000
     with fc_lock:
         for k in list(fc_episodes):
@@ -2036,7 +2062,7 @@ def fc_on_full_close(addr, coin, old):
            "open_ts": time.time(), "entry_mid": mid,
            "sum_usd": ep["sum_usd"], "duration_s": dur,
            "ratio": ep["ratio"], "move_pct": move,
-           "depth": _sim_depth(coin), "samples": [], "peak": -999.0}
+           "depth": _sim_depth(coin, side), "samples": [], "peak": -999.0}
     with fc_lock:
         fc_positions[key] = pos
     # TODO: реальний ордер на Binance піде звідси, коли додамо API-ключі
@@ -2137,9 +2163,11 @@ def run_scan():
                     del ws_wallets[k]
             extra = [w for k, w in ws_wallets.items() if k not in lb_addrs]
         if len(extra) > WS_EXTRA_MAX:
+            # випадкова вибірка, а не "перші N": інакше новачки в кінці
+            # черги могли б довго чекати за старими адресами
             print(f"  [SCAN] WS extra {len(extra)} > {WS_EXTRA_MAX}, "
-                  f"беремо перші {WS_EXTRA_MAX}")
-            extra = extra[:WS_EXTRA_MAX]
+                  f"беремо випадкові {WS_EXTRA_MAX}")
+            extra = random.sample(extra, WS_EXTRA_MAX)
         all_wallets = lb_wallets + extra
 
         # Розділяємо: хто скипається, хто ні
@@ -2166,14 +2194,17 @@ def run_scan():
             cache["scan_number"] = sn
 
         all_pos = {}
+        failed_addrs = set()   # запит впав: стан невідомий, не "порожній"
 
         def process(w):
             k = w["addr"].lower()
             positions = fetch_one(w["addr"])
             if positions is None:
-                # Помилка запиту: прогрес рухаємо, статистику не псуємо
+                # Помилка запиту: прогрес рухаємо, статистику не псуємо,
+                # а адресу запам'ятовуємо — watchlist її не викине
                 with cache_lock:
                     cache["progress"]["done"] += 1
+                    failed_addrs.add(k)
                 return
             update_stats(k, bool(positions), sn)
             with cache_lock:
@@ -2207,17 +2238,16 @@ def run_scan():
         for coin, positions in result.items():
             d = depth_snap.get(coin)
             for pos in positions:
-                if d and d["max"] > 0:
-                    pos["depth_max"] = d["max"]
-                    pos["ratio"]     = pos["val"] / d["max"]
+                ds = depth_for_side(d, pos["side"])
+                if ds > 0:
+                    pos["depth_max"] = ds
+                    pos["ratio"]     = pos["val"] / ds
                 else:
                     pos["depth_max"] = 0
                     pos["ratio"]     = 0
 
-
-
         # Оновлюємо real-time watchlist
-        update_watchlist(result, depth_snap, scan_start)
+        update_watchlist(result, depth_snap, scan_start, failed_addrs)
 
         # Детекція закриття позицій (між сканами)
         alerts = check_position_changes(result, depth_snap)
@@ -2382,18 +2412,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_response(404); self.end_headers()
 
     def do_POST(self):
-        if self.path == "/tg-update":
-            # Telegram webhook (альтернатива polling)
-            length = int(self.headers.get("Content-Length", 0))
-            upd    = json.loads(self.rfile.read(length))
-            msg    = upd.get("message", {})
-            if msg.get("text","").startswith("/start"):
-                global TG_CHAT_ID
-                TG_CHAT_ID = msg["chat"]["id"]
-                _tg_save_chat(TG_CHAT_ID)
-                tg_send("✅ Алерти активовані!")
-            self.send_json({"ok": True})
-        elif self.path == "/add-wallet":
+        # /tg-update (webhook) видалено: він дублював polling і дозволяв
+        # будь-кому, хто дістався порту, перенаправити алерти на свій chat_id
+        if self.path == "/add-wallet":
             length = int(self.headers.get("Content-Length", 0))
             body   = json.loads(self.rfile.read(length))
             addr   = (body.get("address") or "").strip()

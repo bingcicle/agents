@@ -283,11 +283,12 @@ function setLive(t,cls){
   document.getElementById('liveTxt').textContent=t;
 }
 function coinRatio(coin){
-  const d=depthMap[coin];
-  if(!d||!d.max) return 0;
   const ps=allPos[coin]||[];
   if(!ps.length) return 0;
-  return Math.max(...ps.map(p=>p.val))/d.max;
+  const d=depthMap[coin];
+  // p.ratio рахує сервер по стороні закриття (LONG→bid, SHORT→ask);
+  // ділення на d.max — лише запасний варіант для старих відповідей
+  return Math.max(...ps.map(p=>p.ratio!=null?p.ratio:(d&&d.max?p.val/d.max:0)));
 }
 
 /* ── MAIN POLL ── */
@@ -463,7 +464,7 @@ function renderTable(){
 
   let rows='';
   ps.forEach((p,i)=>{
-    const r=dmax?p.val/dmax:0;
+    const r=p.ratio!=null?p.ratio:(dmax?p.val/dmax:0);
     const rHtml=dmax
       ?(r>=2
         ?`<span class="rbadge">${r.toFixed(2)}x</span>`
