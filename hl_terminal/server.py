@@ -9,6 +9,7 @@ import threading
 import socket
 import ssl
 import struct
+import queue
 from concurrent.futures import ThreadPoolExecutor
 
 PORT      = 3000
@@ -893,6 +894,17 @@ watchlist_lock = threading.Lock()
 sent_alerts    = set()   # addr:coin, спільний дедуп для realtime і скан-діфа
 alerted_txs    = {}      # tx_hash -> ts: щоб одна транзакція не алертилась
                          # двічі (realtime + скан-діф); чиститься за годину
+alert_queue    = queue.Queue()   # алерти шле ОДИН потік по черзі: інакше
+                                 # потік-на-алерт міняв повідомлення місцями
+                                 # (29% -> 71% -> 41% замість 29 -> 41 -> 71)
+
+def run_alert_sender():
+    while True:
+        a = alert_queue.get()
+        try:
+            send_close_alert(a)
+        except Exception as e:
+            print(f"  [ALERT] sender err: {e}")
 
 # Лічильники з моменту старту. Дивитись: localhost:3000/status або щогодинний рядок у лозі
 stats = {
@@ -1493,8 +1505,18 @@ def run_realtime_monitor():
                 # позиція, злита лімітками з маркет-пилом 0.01 токена,
                 # інакше давала алерт "повністю закрив $1.5M".
                 _base = old["size"] or 1e-12
+                # Ліквідації БЕЗ винятку: часткова ліквідація на 0.01%
+                # позиції ($273 пилу) — не сигнал, поріг один для всіх
                 big_txs = [f for f in mfills
-                           if f.get("liq") or f["sz"] >= _base * MIN_CLOSE_PCT]
+                           if f["sz"] >= _base * MIN_CLOSE_PCT]
+
+                # Пара могла пережити у watchlist падіння ratio нижче 2
+                # (carry живої серії з оновленими метаданими): закриття
+                # записуємо (SIM/FC вже отримали, база оновиться), але
+                # алерт не шлемо — сигнал це позиція, ВЕЛИКА відносно
+                # ліквідності, а ratio 1.09 нею не є
+                if big_txs and (old.get("ratio") or 0) < 2.0:
+                    big_txs = []
 
                 if not big_txs:
                     # агресія є, але кожна транзакція дрібна: без алерту,
@@ -1545,8 +1567,7 @@ def run_realtime_monitor():
                         "full_close": _fc,
                         "fills":     list(_txs),
                     }
-                    threading.Thread(target=send_close_alert, args=(a,),
-                                     daemon=True).start()
+                    alert_queue.put(a)
 
                 with watchlist_lock:
                     if full_close:
@@ -1703,11 +1724,12 @@ def check_position_changes(new_result, depth_snap):
                     _f["sz"] = old["size"]
 
             # Той самий поріг, що і в realtime: ОДНА маркет-транзакція
-            # >= MIN_CLOSE_PCT позиції (ліквідації — завжди)
+            # >= MIN_CLOSE_PCT позиції (ліквідації без винятку) і
+            # ratio пари не нижче 2
             _base = old["size"] or 1e-12
             big_txs = [f for f in mfills
-                       if f.get("liq") or f["sz"] >= _base * MIN_CLOSE_PCT]
-            if not big_txs:
+                       if f["sz"] >= _base * MIN_CLOSE_PCT]
+            if not big_txs or (old.get("ratio") or 0) < 2.0:
                 continue
             fill_cursor[key_ac] = max(f["ts"] for f in mfills)
 
@@ -2634,7 +2656,7 @@ def run_scan():
         # Детекція закриття позицій (між сканами)
         alerts = check_position_changes(result, depth_snap)
         for a in alerts:
-            threading.Thread(target=send_close_alert, args=(a,), daemon=True).start()
+            alert_queue.put(a)
         if alerts:
             print(f"  [SCAN #{sn}] {len(alerts)} close alerts sent")
 
@@ -2821,6 +2843,7 @@ print(f"  Skip logic: {SKIP_AFTER} empty scans → check every {CHECK_EVERY} sca
 
 # Depth — запускаємо ПЕРШИМ, паралельно зі скануванням
 load_state()   # відновлюємо watchlist і сим-позиції з минулого запуску
+threading.Thread(target=run_alert_sender, daemon=True).start()
 threading.Thread(target=run_state_saver,  daemon=True).start()
 threading.Thread(target=run_depth_loop,   daemon=True).start()
 threading.Thread(target=run_scan,         daemon=True).start()
