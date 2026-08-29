@@ -2280,6 +2280,13 @@ STATE_SAVE_S = 60
 STATE_MAX_AGE_S = 3600   # старіший за годину стан не відновлюємо
 
 def save_state():
+    # під _state_save_lock ЦІЛКОМ (знімок + запис + replace): без нього
+    # старіший знімок міг завершити os.replace після новішого і відкотити
+    # стан на диску (аудит v2.2 п.3)
+    with _state_save_lock:
+        _save_state_locked()
+
+def _save_state_locked():
     try:
         with watchlist_lock:
             wl = {a: {c: dict(p) for c, p in coins.items()}
@@ -2647,11 +2654,16 @@ F4_MIN_NOTIONAL  = 100_000.0
 F4_MAX_UNLOAD_S  = 300.0
 F4_CHUNK_PCT     = 0.05
 F4_CLAMP         = (60.0, 300.0)
-PROFILE_ALGO_V   = 2      # версія алгоритму профілів: старі записи без
-                          # цієї позначки перераховуються (аудит v2.1 п.3:
-                          # кеш v2.0 носив у собі виправлені баги)
-DATA_ALGO_V      = "2.2"  # версія логіки у кожному рядку CSV; при зміні
+PROFILE_ALGO_V   = 3      # версія алгоритму профілів: старі записи без
+                          # цієї позначки перераховуються (аудит v2.1 п.3;
+                          # v3: boundary-safe пагінація, аудит v2.2 п.2)
+DATA_ALGO_V      = "2.3"  # версія логіки збору: трекер отримує її при
+                          # СТВОРЕННІ і несе у рядок; API рахує лише
+                          # поточну версію (аудит v2.2: рестарт підписував
+                          # старі трекери новою версією). При зміні
                           # заголовків старий файл ротується в .legacy
+WFAIL_CAP        = 200    # ретраї запису рядка (3с/тик = ~10 хв диска);
+                          # рядок заморожений, тому ретраї безкоштовні
 PX_AGO_TOL_S     = 90.0   # історична ціна не далі 90с від цілі: інакше
                           # "рух за 3 хв" міг бути рухом за 15 хв (п.5)
 REV_OUT_MIN_MAG  = 0.5    # outcome-стрічка пише події вже від 0.5%, щоб
@@ -2706,6 +2718,18 @@ follow_last_close = {}   # addr:coin -> ts(сек) останнього закр
 wallet_profiles   = {}   # addr(lower) -> профіль розвантажень (F4)
 profiles_fetching = set()
 vault_cache       = {}   # addr -> bool
+# Серіалізація персисту: унікальні tmp прибрали колізію файлів, але два
+# конкурентні знімки могли завершити os.replace у зворотному порядку і
+# СТАРІШИЙ перетирав новіший (аудит v2.2 п.3). Знімок і replace тепер
+# атомарні під одним локом на файл — переможець завжди найновіший.
+_state_save_lock  = threading.Lock()
+_prof_save_lock   = threading.Lock()
+# Outbox сигнальних рядків: запис REV_SIG_CSV, що впав, не губиться, а
+# чекає ретраю в run_strat2_loop (аудит v2.2: трекери створені, а
+# signal-рядок з фільтрами й контекстом зник — paired-аналіз ламався).
+# Межа чесності: черга в пам'яті, смерть процесу її втрачає.
+_sig_retry_lock   = threading.Lock()
+_sig_retry_q      = []   # [path, headers, row, fails]
 
 try:
     with open(PROFILES_FILE) as _pf:
@@ -2878,6 +2902,10 @@ def rev_on_close(addr, coin, old, mfills, full_close):
                 "usd_s": usd_s, "ratio": ratio, "shtanga": shtanga,
                 "vault": int(vault), "hour": hour,
                 "btc_move": btc_move, "depth": depth,
+                # версія — В МОМЕНТ створення: трекер, відновлений зі
+                # старого state.json без версії, пишеться як legacy (""),
+                # а не підписується поточною (аудит v2.2)
+                "algo_v": DATA_ALGO_V,
                 "samples": [], "peak": -999.0, "trough": 999.0}
     opened = []
     with strat2_lock:
@@ -2913,12 +2941,17 @@ def rev_on_close(addr, coin, old, mfills, full_close):
                     pos["entry_px"] = px_now
                 rev_open[f"{sig_id}|{st}"] = pos
                 opened.append(st)
-    _strat_csv_append(REV_SIG_CSV, REV_SIG_HEADERS,
-        [sig_id, _dt(now), coin, side, addr, src, round(px_now, 8),
-         round(mag, 3), round(dur, 1), round(sum_usd, 0), round(usd_s, 0),
-         round(ratio, 2), shtanga, int(vault), hour,
-         (round(btc_move, 3) if btc_move is not None else ""),
-         int(btc_ok), round(depth or 0, 0), "+".join(opened), DATA_ALGO_V])
+    _sig_row = [sig_id, _dt(now), coin, side, addr, src, round(px_now, 8),
+                round(mag, 3), round(dur, 1), round(sum_usd, 0),
+                round(usd_s, 0), round(ratio, 2), shtanga, int(vault), hour,
+                (round(btc_move, 3) if btc_move is not None else ""),
+                int(btc_ok), round(depth or 0, 0), "+".join(opened),
+                DATA_ALGO_V]
+    if not _strat_csv_append(REV_SIG_CSV, REV_SIG_HEADERS, _sig_row):
+        # сигнал — вісь paired-порівнянь: без нього outcome/угоди висять
+        # у повітрі. Невдалий запис іде в outbox (ретрай у циклі)
+        with _sig_retry_lock:
+            _sig_retry_q.append([REV_SIG_CSV, REV_SIG_HEADERS, _sig_row, 0])
     _btc_txt = f"{btc_move:+.2f}%" if btc_move is not None else "н/д"
     print(f"  [REV] сигнал {coin} fade={side} {mag:+.2f}%/3хв src={src} "
           f"btc={_btc_txt}{'' if btc_ok else ' VETO'} -> "
@@ -2947,7 +2980,7 @@ def _rev_row(p, entered):
              round(costs, 4),
              (round(p["peak"], 4) if entered and p["peak"] > -999 else ""),
              (round(p["trough"], 4) if entered and p["trough"] < 999 else ""),
-             DATA_ALGO_V]
+             p.get("algo_v", "")]
             + _rev_samples(p, entered))
 
 def _rev_out_row(p):
@@ -2964,7 +2997,7 @@ def _rev_out_row(p):
              round(p.get("depth") or 0, 0), round(costs, 4),
              (round(p["peak"], 4) if p["peak"] > -999 else ""),
              (round(p["trough"], 4) if p["trough"] < 999 else ""),
-             DATA_ALGO_V]
+             p.get("algo_v", "")]
             + _rev_samples(p, 1))
 
 # ── ВХІД У БІК ТИСКУ ────────────────────────────────────
@@ -2999,7 +3032,8 @@ def follow_on_txs(addr, coin, old, mfills, full_close):
             "ratio": old.get("ratio", 0) or 0,
             "pos_usd": old.get("val", 0) or 0,
             "vault": int(vault), "hour": hour, "btc_move": btc_move,
-            "depth": depth, "force_exit": None, "profile_gap": 0.0}
+            "depth": depth, "force_exit": None, "profile_gap": 0.0,
+            "algo_v": DATA_ALGO_V}   # версія в момент створення
     prof = wallet_profiles.get(addr.lower())
     # профіль треба (пере)тягнути, якщо його немає, він зі старої версії
     # алгоритму (аудит v2.1 п.3: кеш v2.0 носив виправлені баги) або
@@ -3008,6 +3042,10 @@ def follow_on_txs(addr, coin, old, mfills, full_close):
                   and prof.get("v") == PROFILE_ALGO_V
                   and not prof.get("err"))
     need_profile = not prof_valid
+    # обрізана історія (8 сторінок вичерпано або >2000 філів в одній мс)
+    # НЕ дає права на F4: "поведінковий профіль" з огризка — не профіль
+    # (аудит v2.2 п.2). Рефетч не потрібен: обрізка детермінована
+    f4_ok = prof_valid and prof.get("ok") and not prof.get("truncated")
     with strat2_lock:
         busy = {(p["strategy"], p["coin"]) for p in follow_open.values()
                 if not p.get("done")}
@@ -3015,7 +3053,7 @@ def follow_on_txs(addr, coin, old, mfills, full_close):
             if (st, coin) in busy: continue
             it = dict(base); it["strategy"] = st; it["timer"] = float(timer)
             follow_open[f"{key}|{st}|{int(now)}"] = it
-        if (F4_NAME, coin) not in busy and prof_valid and prof.get("ok"):
+        if (F4_NAME, coin) not in busy and f4_ok:
             gap2 = 2.0 * float(prof.get("avg_gap_s", 0) or 0)
             timer4 = min(max(gap2, F4_CLAMP[0]), F4_CLAMP[1])
             it = dict(base); it["strategy"] = F4_NAME
@@ -3116,10 +3154,18 @@ def _build_profile(fills):
     avg = (sum(gaps) / len(gaps)) if gaps else 30.0   # одним пострілом = мін. кламп
     return {"ok": ok, "n_ep": n_ok, "avg_gap_s": round(avg, 1)}
 
+def _fill_key(f):
+    """Ідентичність філа для дедуплікації між сторінками: tid унікальний
+    у Hyperliquid; фолбек — повний кортеж полів."""
+    tid = f.get("tid")
+    if tid is not None: return ("tid", tid)
+    return (f.get("hash"), f.get("time"), str(f.get("px")),
+            str(f.get("sz")), str(f.get("startPosition")), f.get("dir"))
+
 def _fetch_profile(addr):
     try:
         cursor = int((time.time() - 14 * 86400) * 1000)
-        fills = []
+        fills, seen = [], set()
         truncated = 0
         for i in range(8):
             batch = hl_post({"type": "userFillsByTime", "user": addr,
@@ -3131,10 +3177,21 @@ def _fetch_profile(addr):
                 # інакше кешувався назавжди (рев'ю v2.2)
                 raise ValueError(f"bad history payload: {type(batch).__name__}")
             if not batch: break
-            fills.extend(batch)
+            new = 0
+            for f in batch:
+                k = _fill_key(f)
+                if k in seen: continue
+                seen.add(k); fills.append(f); new += 1
             if len(batch) < 2000: break
-            if i == 7: truncated = 1   # 8 сторінок вичерпано, хвіст обрізаний
-            cursor = max(f.get("time", 0) for f in batch) + 1
+            mx = max(f.get("time", 0) for f in batch)
+            # курсор ВКЛЮЧНО (без +1): філи тієї ж мс за зрізом сторінки
+            # губилися назавжди — 2001-й філ мілісекунди не потрапляв у
+            # наступний запит (аудит v2.2 п.2); перекриття знімає дедуп
+            if mx <= cursor and new == 0:
+                truncated = 1   # >2000 філів в одній мс: далі не пройти
+                break
+            cursor = mx
+            if i == 7: truncated = 1   # 8 сторінок вичерпано
         prof = _build_profile(fills)
         if truncated: prof["truncated"] = 1
     except Exception as e:
@@ -3148,12 +3205,15 @@ def _fetch_profile(addr):
         wallet_profiles[addr] = prof
         profiles_fetching.discard(addr)
     try:
-        with strat2_lock:
-            snapshot = dict(wallet_profiles)
-        tmp = f"{PROFILES_FILE}.tmp{threading.get_ident()}"
-        with open(tmp, "w") as f:
-            json.dump(snapshot, f)
-        os.replace(tmp, PROFILES_FILE)
+        # знімок + запис + replace під одним локом: інакше старіший
+        # знімок міг перетерти новіший (аудит v2.2 п.3)
+        with _prof_save_lock:
+            with strat2_lock:
+                snapshot = dict(wallet_profiles)
+            tmp = f"{PROFILES_FILE}.tmp{threading.get_ident()}"
+            with open(tmp, "w") as f:
+                json.dump(snapshot, f)
+            os.replace(tmp, PROFILES_FILE)
     except Exception:
         pass
     print(f"  [F4] профіль {addr[:10]}…: ok={prof['ok']} "
@@ -3164,27 +3224,61 @@ def run_strat2_loop():
     while True:
         time.sleep(3)
         if not STRAT2_ENABLED: continue
+        # outbox сигнальних рядків — ретраїться незалежно від трекерів
+        with _sig_retry_lock:
+            _pending = _sig_retry_q[:]
+            del _sig_retry_q[:]
+        if _pending:
+            _still = []
+            for _it in _pending:
+                if _strat_csv_append(_it[0], _it[1], _it[2]): continue
+                _it[3] += 1
+                if _it[3] > WFAIL_CAP:
+                    print(f"  [STRAT] DROP сигнальний рядок після "
+                          f"{WFAIL_CAP} спроб (диск?)")
+                else:
+                    _still.append(_it)
+            if _still:
+                with _sig_retry_lock:
+                    _sig_retry_q.extend(_still)
         with strat2_lock:
             active = bool(rev_open) or bool(follow_open)
         if not active: continue
         now = time.time()
         # Рядки збираємо БЕЗ видалення трекера: видаляємо після успішного
-        # запису CSV (аудит v2.1 п.7). Завершений-але-незаписаний трекер
-        # помічається done=1: він (а) не блокує busy для нових сигналів,
-        # (б) ретраїться з капом WFAIL_CAP, після чого скидається з одним
-        # логом — інакше збій диска тихо зупиняв збір даних (рев'ю v2.2).
+        # запису CSV (аудит v2.1 п.7). Завершений трекер отримує done=1 і
+        # ЗАМОРОЖЕНИЙ final_row: ретрай пише ті самі байти, а не
+        # перераховує результат новішою ціною — інакше тимчасовий збій
+        # диска міняв exit/net завершеної угоди (аудит v2.2 п.1).
+        # done не блокує busy; після WFAIL_CAP ретраїв — дроп із логом.
         # Дублі після краху знімає дедуп по sig_id/trade_id у strat2_api.
-        WFAIL_CAP = 20
         rev_rows, fol_rows = [], []
         with strat2_lock:
             for pid, p in list(rev_open.items()):
+                if p.get("done"):
+                    if p.get("final_row") is not None:
+                        rev_rows.append((pid, p.get("row_kind", "rev"),
+                                         p["final_row"]))
+                    else:
+                        # done без final_row: рядок можна відтворити з
+                        # заморожених семплів (вони в трекері)
+                        p["row_kind"] = ("out" if p["strategy"] == "_OUTCOME"
+                                         else "rev")
+                        p["final_row"] = (_rev_out_row(p)
+                                          if p["row_kind"] == "out"
+                                          else _rev_row(p, 1 if p.get("entry_px")
+                                                        else 0))
+                        rev_rows.append((pid, p["row_kind"], p["final_row"]))
+                    continue
                 px = _px_now(p["coin"], max_age=30.0)
                 if p["state"] == "armed":
                     # СПОЧАТКУ дедлайн (аудит п.3: пізній тик після
                     # закінчення вікна відкривав позицію заднім числом)
                     if now >= p["deadline"]:
                         p["done"] = 1
-                        rev_rows.append((pid, "rev", _rev_row(p, 0)))
+                        p["row_kind"] = "rev"
+                        p["final_row"] = _rev_row(p, 0)
+                        rev_rows.append((pid, "rev", p["final_row"]))
                         continue
                     if not px: continue
                     trig = p["trigger_px"]
@@ -3218,10 +3312,24 @@ def run_strat2_loop():
                 if len(p["samples"]) >= REV_TRACK_MIN:
                     p["done"] = 1
                     if p["strategy"] == "_OUTCOME":
-                        rev_rows.append((pid, "out", _rev_out_row(p)))
+                        p["row_kind"] = "out"
+                        p["final_row"] = _rev_out_row(p)
                     else:
-                        rev_rows.append((pid, "rev", _rev_row(p, 1)))
+                        p["row_kind"] = "rev"
+                        p["final_row"] = _rev_row(p, 1)
+                    rev_rows.append((pid, p["row_kind"], p["final_row"]))
             for fid, p in list(follow_open.items()):
+                if p.get("done"):
+                    if p.get("final_row") is not None:
+                        fol_rows.append((fid, p["final_row"]))
+                    else:
+                        # done без замороженого рядка (відновлений зі
+                        # старого state.json): вихідну ціну чесно
+                        # відтворити неможливо — дроп із логом
+                        follow_open.pop(fid, None)
+                        print(f"  [STRAT] DROP {fid}: done без final_row "
+                              f"(старий state)")
+                    continue
                 px = _px_now(p["coin"], max_age=30.0)
                 if not px: continue
                 g = (px / p["entry_px"] - 1.0) * 100.0
@@ -3238,7 +3346,9 @@ def run_strat2_loop():
                     slip = _sim_slip(p.get("depth") or 0)
                     costs = (2 * SIM_COMMISSION + 2 * slip) * 100.0
                     _bm = p.get("btc_move")
-                    fol_rows.append((fid, [_dt(p["open_ts"]), _dt(now),
+                    # заморожений фінальний рядок: exit/hold/net зафіксовані
+                    # У МОМЕНТ виходу, ретраї запису їх не перерахують
+                    p["final_row"] = [_dt(p["open_ts"]), _dt(now),
                         p["strategy"], p["coin"], p["our_side"], p["addr"],
                         round(p["entry_px"], 8), round(px, 8), reason,
                         round(now - p["open_ts"], 1), round(g, 4),
@@ -3248,7 +3358,8 @@ def run_strat2_loop():
                         round(p["ratio"], 2), round(p["pos_usd"], 0),
                         p["vault"], p["hour"],
                         (round(_bm, 3) if _bm is not None else ""),
-                        round(p["profile_gap"], 1), DATA_ALGO_V, fid]))
+                        round(p["profile_gap"], 1), p.get("algo_v", ""), fid]
+                    fol_rows.append((fid, p["final_row"]))
         written_rev, written_fol = [], []
         failed_rev, failed_fol = [], []
         for pid, kind, r in rev_rows:
@@ -3319,7 +3430,18 @@ def strat2_api():
                 lambda r: (r.get("sig_id"), r.get("strategy")))
     sigs = dedup(read(REV_SIG_CSV), lambda r: r.get("sig_id"))
     fol = dedup(read(FOLLOW_CSV), lambda r: r.get("trade_id"))
-    out = {"updated": now, "strategies": {}, "desc": STRAT2_DESC}
+    outs_all = dedup(read(REV_OUT_CSV), lambda r: r.get("sig_id"))
+    # статистика рахується ЛИШЕ по рядках поточної версії логіки:
+    # зміна алгоритму не має тихо змішувати старі й нові вимірювання в
+    # одну вибірку (аудит v2.2). Виключене рахуємо у legacy_rows —
+    # видно, скільки історії лишилося за бортом (файли не чіпаються)
+    def curv(rows):
+        return [r for r in rows if (r.get("algo_v") or "") == DATA_ALGO_V]
+    n_before = len(rev) + len(sigs) + len(fol) + len(outs_all)
+    rev, sigs, fol, outs = curv(rev), curv(sigs), curv(fol), curv(outs_all)
+    legacy_rows = n_before - (len(rev) + len(sigs) + len(fol) + len(outs))
+    out = {"updated": now, "strategies": {}, "desc": STRAT2_DESC,
+           "legacy_rows": legacy_rows}
 
     for st in ("R1_загальний", "R2_breakout", "R3_великі", "R4_великий",
                "R5_дуже", "R6_волт"):
@@ -3438,7 +3560,35 @@ def strat2_api():
     out["signals_sub"] = len(sigs) - len(full_sigs)
     out["btc_veto"] = sum(1 for s2 in full_sigs
                           if fnum(s2.get("btc_ok"), 1) == 0)
-    out["outcomes_total"] = len(read(REV_OUT_CSV))
+    out["outcomes_total"] = len(outs)   # дедуп + поточна версія
+    # ── Перші common-cohort порівняння на СПІЛЬНІЙ outcome-стрічці ──
+    # (аудит v2.2: дані збирались, але саме порівняння ніхто не рахував).
+    # Всі когорти — з ОДНОГО набору подій (m30 gross - costs), тому
+    # "BTC ok vs veto" чи "штанга vs ні" порівнюються чесно. Це ще НЕ
+    # тест гіпотез (без CI, min-n, holdout) — лише жива зведена таблиця.
+    def _net30(r):
+        v = fnum(r.get("m30"))
+        c = fnum(r.get("costs_pct"), 0.15) or 0.15
+        return (v - c) if v is not None else None
+    def _cohort(rows2):
+        vals = [x for x in (_net30(r) for r in rows2) if x is not None]
+        return {"n": len(vals), "median": _median(vals)}
+    def _mag(r):
+        return fnum(r.get("move_3m_pct")) or 0
+    full_out = [r for r in outs if _mag(r) >= 1.0]
+    out["research"] = {
+        "btc_on":   _cohort([r for r in full_out
+                             if fnum(r.get("btc_ok")) == 1]),
+        "btc_off":  _cohort([r for r in full_out
+                             if fnum(r.get("btc_ok")) == 0]),
+        "mag_05_1": _cohort([r for r in outs if 0.5 <= _mag(r) < 1.0]),
+        "mag_1_2":  _cohort([r for r in outs if 1.0 <= _mag(r) < 2.0]),
+        "mag_2p":   _cohort([r for r in outs if _mag(r) >= 2.0]),
+        "shtanga_1": _cohort([r for r in full_out
+                              if fnum(r.get("shtanga"), 0) == 1]),
+        "shtanga_0": _cohort([r for r in full_out
+                              if fnum(r.get("shtanga"), 0) != 1]),
+    }
     _strat2_cache["data"] = out
     _strat2_cache["ts"] = now
     return out
