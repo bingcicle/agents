@@ -166,6 +166,65 @@ footer{display:flex;align-items:center;gap:20px;padding:0 20px;
 footer b{color:var(--ink2);font-weight:500}
 footer .fr{margin-left:auto;display:flex;gap:20px}
 
+/* ═══ TABS ═══ */
+.tabs{display:flex;gap:2px;margin-left:6px}
+.tabbtn{font-family:var(--sans);font-size:11px;font-weight:600;letter-spacing:.06em;
+  text-transform:uppercase;color:var(--ink3);background:transparent;
+  border:1px solid var(--line2);padding:6px 14px;cursor:pointer;
+  border-radius:4px;transition:all .12s}
+.tabbtn:hover{color:var(--ink)}
+.tabbtn.on{color:var(--signal);border-color:var(--signal);
+  background:var(--signal-dim)}
+
+/* ═══ STRAT VIEW ═══ */
+.stratmain{display:flex;flex-direction:column;overflow-y:auto;background:var(--bg);
+  padding:16px 20px 40px}
+.stratmain::-webkit-scrollbar{width:5px}
+.stratmain::-webkit-scrollbar-thumb{background:var(--line2)}
+.stov{display:flex;gap:26px;padding:10px 16px;background:var(--surface);
+  border:1px solid var(--line);border-radius:6px;margin-bottom:14px;flex-wrap:wrap}
+.stov .hstat b{font-size:15px}
+.stov .note{margin-left:auto;font-size:10px;color:var(--ink3);align-self:center}
+.scards{display:grid;grid-template-columns:repeat(auto-fill,minmax(290px,1fr));
+  gap:10px}
+.scard{background:var(--surface);border:1px solid var(--line);border-radius:6px;
+  padding:12px 14px;cursor:pointer;transition:border-color .12s}
+.scard:hover{border-color:var(--line2)}
+.scard.on{border-color:var(--signal)}
+.scard-r1{display:flex;align-items:baseline;gap:8px}
+.scard-name{font-family:var(--sans);font-size:13px;font-weight:700;color:var(--ink)}
+.scard-n{font-size:10px;color:var(--ink3);margin-left:auto}
+.scard-desc{font-size:10px;color:var(--ink3);margin-top:2px;line-height:1.4;
+  min-height:26px}
+.scard-nums{display:flex;gap:14px;margin-top:8px}
+.snum{display:flex;flex-direction:column;gap:1px}
+.snum i{font-style:normal;font-size:9px;color:var(--ink3);letter-spacing:.08em;
+  text-transform:uppercase}
+.snum b{font-size:13px;font-weight:600;color:var(--ink)}
+.scard-spark{margin-top:8px;height:34px}
+.scard-halves{margin-top:6px;font-size:9px;color:var(--ink3)}
+.scard-halves b{font-weight:600}
+.sdetail{margin-top:16px;background:var(--surface);border:1px solid var(--line);
+  border-radius:6px;padding:16px}
+.sdetail h3{font-family:var(--sans);font-size:15px;font-weight:700;color:var(--ink)}
+.sdetail .sub{font-size:10px;color:var(--ink3);margin-top:2px}
+.sd-stats{display:flex;gap:22px;margin:12px 0;flex-wrap:wrap}
+.sd-chart{margin:10px 0 4px;position:relative}
+.sd-chart h4,.sd-tbl h4{font-family:var(--sans);font-size:10px;font-weight:600;
+  color:var(--ink2);letter-spacing:.08em;text-transform:uppercase;margin-bottom:6px}
+.ctip{position:absolute;pointer-events:none;background:var(--raised);
+  border:1px solid var(--line2);border-radius:4px;padding:4px 8px;font-size:10px;
+  color:var(--ink);display:none;z-index:5;white-space:nowrap}
+.sfilters{display:flex;gap:8px;margin:12px 0 8px;flex-wrap:wrap}
+.fbtn{font-size:10px;color:var(--ink3);background:transparent;
+  border:1px solid var(--line2);padding:3px 10px;cursor:pointer;border-radius:3px;
+  font-family:var(--mono)}
+.fbtn.on{color:var(--signal);border-color:var(--signal)}
+.sd-tbl{overflow-x:auto}
+.sd-tbl table{min-width:760px}
+.pos-badge{font-size:9px;color:var(--amber);border:1px solid var(--line2);
+  padding:1px 6px;border-radius:3px;margin-left:6px}
+
 /* ═══ LOADING ═══ */
 .loadbox{display:flex;flex-direction:column;align-items:center;justify-content:center;
   height:100%;gap:14px}
@@ -182,6 +241,10 @@ footer .fr{margin-left:auto;display:flex;gap:20px}
 
 <header>
   <div class="brand"><h1>WHALE DESK</h1><span>HYPERLIQUID</span></div>
+  <div class="tabs">
+    <button class="tabbtn on" id="tabTerm" onclick="switchView('term')">Термінал</button>
+    <button class="tabbtn" id="tabStrat" onclick="switchView('strat')">Стратегії</button>
+  </div>
   <div class="live" id="live"><b></b><span id="liveTxt">CONNECTING</span></div>
   <div class="hstats">
     <div class="hstat"><i>Coins</i><b id="hCoins">—</b></div>
@@ -192,7 +255,7 @@ footer .fr{margin-left:auto;display:flex;gap:20px}
   <div class="clock" id="clock">--:--:--</div>
 </header>
 
-<main>
+<main id="termView">
   <!-- LEFT -->
   <aside class="coins">
     <div class="coins-head">
@@ -238,6 +301,20 @@ footer .fr{margin-left:auto;display:flex;gap:20px}
       </div>
     </div>
   </aside>
+</main>
+
+<main class="stratmain" id="stratView" style="display:none">
+  <div class="stov">
+    <div class="hstat"><i>Сигналів</i><b id="svSig">—</b></div>
+    <div class="hstat"><i>BTC-вето</i><b id="svVeto">—</b></div>
+    <div class="hstat"><i>Відкрито зараз</i><b class="sig" id="svOpen">—</b></div>
+    <div class="hstat"><i>Профілів F4</i><b id="svProf">—</b></div>
+    <div class="note">paper trading · $1000/угода · net після витрат · клік по картці — деталі</div>
+  </div>
+  <div class="scards" id="sCards">
+    <div class="empty-note">Чекаю перших сигналів…<br>Сигнал = повний злив (волт: транзакція ≥5%) + рух ≥1% за 3 хв</div>
+  </div>
+  <div class="sdetail" id="sDetail" style="display:none"></div>
 </main>
 
 <footer>
@@ -492,6 +569,172 @@ function renderTable(){
       </tr></thead>
       <tbody>${rows}</tbody>
     </table>`;
+}
+
+/* ═══ ВКЛАДКА СТРАТЕГІЙ ═══ */
+let view='term', sData=null, sSel=null, sT=null, fSht='all', fVault='all';
+const S_ORDER=['R1_загальний','R2_breakout','R3_великі','R4_великий','R5_дуже',
+               'R6_волт','F1_1хв','F2_2хв','F3_3хв','F4_розумний'];
+
+function switchView(v){
+  view=v;
+  document.getElementById('termView').style.display=v==='term'?'grid':'none';
+  document.getElementById('stratView').style.display=v==='strat'?'flex':'none';
+  document.getElementById('tabTerm').className='tabbtn'+(v==='term'?' on':'');
+  document.getElementById('tabStrat').className='tabbtn'+(v==='strat'?' on':'');
+  if(v==='strat') pollStrat();
+}
+function pctCls(v){return v==null?'dim':(v>=0?'pnl-p':'pnl-n');}
+function pctTxt(v,d=2){return v==null?'—':(v>=0?'+':'')+v.toFixed(d)+'%';}
+
+async function pollStrat(){
+  if(sT) clearTimeout(sT);
+  try{
+    const r=await fetch('/strat2'); if(!r.ok) throw 0;
+    sData=await r.json();
+    renderStrat();
+  }catch(e){}
+  if(view==='strat') sT=setTimeout(pollStrat,15000);
+}
+
+function sparkSvg(cum,w=260,h=32){
+  if(!cum||cum.length<2) return '<svg width="'+w+'" height="'+h+'"></svg>';
+  const mn=Math.min(0,...cum), mx=Math.max(0,...cum), rng=(mx-mn)||1;
+  const X=i=>i/(cum.length-1)*(w-4)+2;
+  const Y=v=>h-3-(v-mn)/rng*(h-6);
+  const pts=cum.map((v,i)=>X(i).toFixed(1)+','+Y(v).toFixed(1)).join(' ');
+  const col=cum[cum.length-1]>=0?'var(--long)':'var(--short)';
+  return `<svg width="${w}" height="${h}" style="max-width:100%">
+    <line x1="2" y1="${Y(0)}" x2="${w-2}" y2="${Y(0)}" stroke="var(--line2)" stroke-width="1" stroke-dasharray="3,3"/>
+    <polyline points="${pts}" fill="none" stroke="${col}" stroke-width="2" stroke-linejoin="round"/>
+  </svg>`;
+}
+
+function curveSvg(curve,w=680,h=180){
+  const vals=curve.map((v,i)=>[i+1,v]).filter(p=>p[1]!=null);
+  if(!vals.length) return '<div class="empty-note">Ще немає завершених угод</div>';
+  const ys=vals.map(p=>p[1]);
+  const mn=Math.min(0,...ys), mx=Math.max(0,...ys), rng=(mx-mn)||1;
+  const L=34,R=8,T=10,B=18;
+  const X=m=>L+(m-1)/59*(w-L-R);
+  const Y=v=>T+(mx-v)/rng*(h-T-B);
+  let best=vals[0]; for(const p of vals) if(p[1]>best[1]) best=p;
+  const pts=vals.map(p=>X(p[0]).toFixed(1)+','+Y(p[1]).toFixed(1)).join(' ');
+  let grid='';
+  for(const m of [10,20,30,40,50,60])
+    grid+=`<line x1="${X(m)}" y1="${T}" x2="${X(m)}" y2="${h-B}" stroke="var(--line)" stroke-width="1"/>
+           <text x="${X(m)}" y="${h-5}" fill="var(--ink3)" font-size="9" text-anchor="middle">${m}хв</text>`;
+  return `<svg id="curveSvg" width="${w}" height="${h}" style="max-width:100%"
+      onmousemove="curveTip(event,${w},${L},${R})" onmouseleave="hideTip()">
+    ${grid}
+    <line x1="${L}" y1="${Y(0)}" x2="${w-R}" y2="${Y(0)}" stroke="var(--line2)" stroke-width="1" stroke-dasharray="4,3"/>
+    <text x="${L-4}" y="${Y(0)+3}" fill="var(--ink3)" font-size="9" text-anchor="end">0%</text>
+    <text x="${L-4}" y="${Y(mx)+3}" fill="var(--ink3)" font-size="9" text-anchor="end">${pctTxt(mx,1)}</text>
+    ${mn<0?`<text x="${L-4}" y="${Y(mn)+3}" fill="var(--ink3)" font-size="9" text-anchor="end">${pctTxt(mn,1)}</text>`:''}
+    <polyline points="${pts}" fill="none" stroke="var(--signal)" stroke-width="2" stroke-linejoin="round"/>
+    <circle cx="${X(best[0])}" cy="${Y(best[1])}" r="3.5" fill="var(--signal)" stroke="var(--bg)" stroke-width="1.5"/>
+    <text x="${best[0]>52?X(best[0])-6:X(best[0])}" y="${Math.max(Y(best[1])-8,11)}" fill="var(--ink)" font-size="10" font-weight="600" text-anchor="${best[0]>52?'end':(best[0]<5?'start':'middle')}">m${best[0]} ${pctTxt(best[1])}</text>
+  </svg>`;
+}
+function curveTip(ev,w,L,R){
+  const st=sData&&sData.strategies[sSel]; if(!st||!st.curve) return;
+  const box=ev.currentTarget.getBoundingClientRect();
+  const x=(ev.clientX-box.left)*(w/box.width);
+  let m=Math.round((x-L)/(w-L-R)*59)+1; m=Math.max(1,Math.min(60,m));
+  const v=st.curve[m-1];
+  const tip=document.getElementById('cTip'); if(!tip) return;
+  if(v==null){tip.style.display='none';return;}
+  tip.style.display='block';
+  tip.style.left=(ev.clientX-box.left+12)+'px';
+  tip.style.top=(ev.clientY-box.top-24)+'px';
+  tip.textContent='вихід m'+m+' · медіана '+pctTxt(v);
+}
+function hideTip(){const t=document.getElementById('cTip');if(t)t.style.display='none';}
+
+function renderStrat(){
+  if(!sData||!sData.strategies) return;
+  document.getElementById('svSig').textContent=sData.signals_total??'—';
+  document.getElementById('svVeto').textContent=sData.btc_veto??'—';
+  document.getElementById('svOpen').textContent=(sData.open||[]).length;
+  const pr=sData.profiles||{};
+  document.getElementById('svProf').textContent=(pr.ok??0)+'/'+(pr.total??0);
+  const openBy={};
+  (sData.open||[]).forEach(o=>{openBy[o.strategy]=(openBy[o.strategy]||0)+1;});
+  let html='';
+  for(const name of S_ORDER){
+    const s=sData.strategies[name]; if(!s) continue;
+    const skipped=s.signals-s.entered;
+    html+=`<div class="scard${name===sSel?' on':''}" onclick="selStrat('${name}')">
+      <div class="scard-r1"><span class="scard-name">${name.replace(/_/g,' ')}</span>
+        ${openBy[name]?`<span class="pos-badge">у ринку: ${openBy[name]}</span>`:''}
+        <span class="scard-n">${s.n} угод${skipped>0?' · '+skipped+' проп.':''}</span></div>
+      <div class="scard-desc">${(sData.desc||{})[name]||''}</div>
+      <div class="scard-nums">
+        <div class="snum"><i>Медіана</i><b class="${pctCls(s.median)}">${pctTxt(s.median)}</b></div>
+        <div class="snum"><i>Середнє</i><b class="${pctCls(s.mean)}">${pctTxt(s.mean)}</b></div>
+        <div class="snum"><i>Win</i><b>${s.win==null?'—':s.win.toFixed(0)+'%'}</b></div>
+        <div class="snum"><i>PnL</i><b class="${pctCls(s.pnl_usd)}">${s.pnl_usd>=0?'+':''}$${Math.abs(s.pnl_usd).toFixed(0)}</b></div>
+      </div>
+      <div class="scard-spark">${sparkSvg(s.cum)}</div>
+      <div class="scard-halves">половини: <b class="${pctCls(s.half1)}">${pctTxt(s.half1)}</b> / <b class="${pctCls(s.half2)}">${pctTxt(s.half2)}</b>${s.kind==='rev'?' · метрика: вихід m30':''}</div>
+    </div>`;
+  }
+  document.getElementById('sCards').innerHTML=html||'<div class="empty-note">Немає даних</div>';
+  renderSDetail();
+}
+function selStrat(n){sSel=(sSel===n?null:n);renderStrat();}
+function setF(k,v){if(k==='sht')fSht=v;else fVault=v;renderSDetail();}
+
+function renderSDetail(){
+  const box=document.getElementById('sDetail');
+  if(!sSel||!sData.strategies[sSel]){box.style.display='none';return;}
+  const s=sData.strategies[sSel];
+  let trades=(s.trades||[]).slice().reverse();
+  if(fSht!=='all') trades=trades.filter(t=>(t.shtanga??null)===(fSht==='y'?1:0));
+  if(fVault!=='all') trades=trades.filter(t=>(t.vault??0)===(fVault==='y'?1:0));
+  const fb=(k,v,lbl)=>`<button class="fbtn${(k==='sht'?fSht:fVault)===v?' on':''}" onclick="setF('${k}','${v}')">${lbl}</button>`;
+  const isRev=s.kind==='rev';
+  let rows='';
+  for(const t of trades.slice(0,150)){
+    rows+=`<tr>
+      <td>${t.date||''}</td>
+      <td style="text-align:center"><span class="side ${t.side==='LONG'?'L':'S'}">${t.side||''}</span> ${t.coin||''}${t.vault?' 🏦':''}</td>
+      <td class="${pctCls(t.net30)}">${t.entered===0?'<span class="dim">пропуск</span>':pctTxt(t.net30)}</td>
+      <td class="dim">${t.peak!=null?pctTxt(t.peak):'—'}</td>
+      <td class="dim">${t.trough!=null?pctTxt(t.trough):'—'}</td>
+      <td class="dim">${isRev?(t.move!=null?t.move.toFixed(2)+'%':'—'):(t.tx_pct!=null?t.tx_pct.toFixed(1)+'%':'—')}</td>
+      <td class="dim">${isRev?(t.dur!=null?t.dur.toFixed(0)+'с':'—'):(t.hold!=null?t.hold.toFixed(0)+'с':'—')}</td>
+      <td class="dim">${t.shtanga!=null?(t.shtanga?'штанга':'серед.'):(t.reason||'—')}</td>
+      <td class="dim">${t.hour!=null?String(t.hour).padStart(2,'0')+':00':'—'}</td>
+      <td class="dim">${t.btc!=null?pctTxt(t.btc):'—'}</td>
+    </tr>`;
+  }
+  box.style.display='block';
+  box.innerHTML=`
+    <h3>${sSel.replace(/_/g,' ')}</h3>
+    <div class="sub">${(sData.desc||{})[sSel]||''} · показано ${Math.min(trades.length,150)} з ${trades.length}</div>
+    <div class="sd-stats">
+      <div class="snum"><i>Угод</i><b>${s.n}</b></div>
+      <div class="snum"><i>Сигналів</i><b>${s.signals}</b></div>
+      <div class="snum"><i>Медіана</i><b class="${pctCls(s.median)}">${pctTxt(s.median)}</b></div>
+      <div class="snum"><i>Середнє</i><b class="${pctCls(s.mean)}">${pctTxt(s.mean)}</b></div>
+      <div class="snum"><i>Win</i><b>${s.win==null?'—':s.win.toFixed(0)+'%'}</b></div>
+      <div class="snum"><i>PnL ($1k/угода)</i><b class="${pctCls(s.pnl_usd)}">${s.pnl_usd>=0?'+':''}$${Math.abs(s.pnl_usd).toFixed(0)}</b></div>
+      <div class="snum"><i>Половини</i><b><span class="${pctCls(s.half1)}">${pctTxt(s.half1)}</span> / <span class="${pctCls(s.half2)}">${pctTxt(s.half2)}</span></b></div>
+    </div>
+    ${isRev?`<div class="sd-chart"><h4>Медіана net за хвилиною виходу (1–60)</h4>${curveSvg(s.curve||[])}<div class="ctip" id="cTip"></div></div>`:''}
+    <div class="sfilters">
+      ${fb('sht','all','всі')}${fb('sht','y','штанга')}${fb('sht','n','середина')}
+      <span style="width:10px"></span>
+      ${fb('vault','all','всі')}${fb('vault','y','волти')}${fb('vault','n','без волтів')}
+    </div>
+    <div class="sd-tbl"><h4>Угоди</h4>
+    <table><thead><tr>
+      <th>Дата</th><th class="rt">Монета</th><th>Net${isRev?' m30':''}</th>
+      <th>Peak</th><th>Trough</th><th>${isRev?'Рух 3хв':'Шматок'}</th>
+      <th>${isRev?'Злив, с':'Холд, с'}</th><th>${isRev?'Тип':'Вихід'}</th>
+      <th>Год</th><th>BTC 3хв</th>
+    </tr></thead><tbody>${rows||'<tr><td colspan="10" class="dim">порожньо</td></tr>'}</tbody></table></div>`;
 }
 
 poll();
