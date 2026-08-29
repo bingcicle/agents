@@ -673,13 +673,22 @@ function renderStrat(){
   if(rEl){
     const c=x=>(x&&x.n&&x.median!=null)?pctTxt(x.median)+' (n='+x.n+')':'—';
     const any=rs&&Object.values(rs).some(x=>x&&x.n);
+    const legacy=sData.legacy_rows||0;
+    // legacy показуємо і БЕЗ когорт: одразу після зміни версії логіки
+    // вся статистика чесно обнуляється — без цього рядка це виглядає
+    // як втрата даних, а не як фільтр (рев'ю v2.3)
     if(any){
       rEl.style.display='';
       rEl.textContent='Спільна стрічка, медіана m30 net: BTC ok '+c(rs.btc_on)
         +' vs вето '+c(rs.btc_off)+' · рух 0.5–1% '+c(rs.mag_05_1)
         +' · 1–2% '+c(rs.mag_1_2)+' · ≥2% '+c(rs.mag_2p)
         +' · штанга '+c(rs.shtanga_1)+' vs ні '+c(rs.shtanga_0)
-        +(sData.legacy_rows?' · поза поточною версією: '+sData.legacy_rows:'');
+        +(legacy?' · поза поточною версією: '+legacy:'');
+    } else if(legacy){
+      rEl.style.display='';
+      rEl.textContent='Статистика рахується з нуля для нової версії логіки. '
+        +'Рядків попередніх версій приховано: '+legacy
+        +' (файли не чіпались, дані на місці)';
     } else rEl.style.display='none';
   }
   const pr=sData.profiles||{};

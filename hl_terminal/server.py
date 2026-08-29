@@ -3044,7 +3044,12 @@ def follow_on_txs(addr, coin, old, mfills, full_close):
     need_profile = not prof_valid
     # обрізана історія (8 сторінок вичерпано або >2000 філів в одній мс)
     # НЕ дає права на F4: "поведінковий профіль" з огризка — не профіль
-    # (аудит v2.2 п.2). Рефетч не потрібен: обрізка детермінована
+    # (аудит v2.2 п.2). Але truncated — стан ТИМЧАСОВИЙ: 14-денне вікно
+    # ковзає, тому після TTL профіль перетягується (need_profile=True;
+    # шторм гасить TTL-гейт у _profile_request) — інакше найактивніші
+    # кити випадали з F4 назавжди (рев'ю v2.3)
+    if prof_valid and prof.get("truncated"):
+        need_profile = True
     f4_ok = prof_valid and prof.get("ok") and not prof.get("truncated")
     with strat2_lock:
         busy = {(p["strategy"], p["coin"]) for p in follow_open.values()
@@ -3076,8 +3081,10 @@ def _profile_request(addr):
         prof = wallet_profiles.get(a)
         if prof is not None:
             stale_version = prof.get("v") != PROFILE_ALGO_V
-            if not stale_version and not prof.get("err"): return
-            # збійний профіль ("невідомо") — ретрай лише після TTL;
+            soft = prof.get("err") or prof.get("truncated")
+            if not stale_version and not soft: return
+            # збійний ("невідомо") чи обрізаний профіль — ретрай лише
+            # після TTL (вікно історії ковзає, обрізаність минає);
             # застаріла версія алгоритму перераховується одразу
             if not stale_version and \
                time.time() - prof.get("fetched", 0) < PROFILE_ERR_TTL_S:
@@ -3550,9 +3557,12 @@ def strat2_api():
         out["shadow_open"] = sum(1 for p in rev_open.values()
                                  if p["strategy"] == "_OUTCOME"
                                  and not p.get("done"))
+        # ok = справді придатні для F4: обрізаний профіль не рахується
+        # (інакше розбіжність "ok у хедері, а F4 мовчить" невидима)
         out["profiles"] = {"total": len(wallet_profiles),
                            "ok": sum(1 for v in wallet_profiles.values()
-                                     if isinstance(v, dict) and v.get("ok"))}
+                                     if isinstance(v, dict) and v.get("ok")
+                                     and not v.get("truncated"))}
     # лічильники сигналів — лише події >=1% (ті, що можуть відкривати
     # стратегії); суб-порогові 0.5-1% рахуємо окремо (рев'ю v2.2)
     full_sigs = [s2 for s2 in sigs if (fnum(s2.get("move_3m_pct")) or 0) >= 1.0]
