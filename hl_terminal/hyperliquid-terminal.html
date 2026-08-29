@@ -709,11 +709,22 @@ function renderSDetail(){
       <td class="dim">${t.btc!=null?pctTxt(t.btc):'—'}</td>
     </tr>`;
   }
+  // Метрики зрізу рахуємо з ВІДФІЛЬТРОВАНИХ угод — інакше таблиця
+  // показує підгрупу, а числа лишаються від усієї вибірки (аудит п.11).
+  // Зріз обмежений переданими останніми угодами (до 120) — так і підписуємо.
+  const fNets=trades.filter(t=>t.entered!==0&&t.net30!=null).map(t=>t.net30);
+  const fSorted=[...fNets].sort((a,b)=>a-b);
+  const fMed=fNets.length?(fSorted.length%2?fSorted[(fSorted.length-1)/2]:(fSorted[fSorted.length/2-1]+fSorted[fSorted.length/2])/2):null;
+  const fMean=fNets.length?fNets.reduce((a,b)=>a+b,0)/fNets.length:null;
+  const fWin=fNets.length?100*fNets.filter(v=>v>0).length/fNets.length:null;
+  const fPnl=fNets.length?fNets.reduce((a,b)=>a+b,0)*10:null;
+  const filtersOn=fSht!=='all'||fVault!=='all';
   box.style.display='block';
   box.innerHTML=`
     <h3>${sSel.replace(/_/g,' ')}</h3>
     <div class="sub">${(sData.desc||{})[sSel]||''} · показано ${Math.min(trades.length,150)} з ${trades.length}</div>
     <div class="sd-stats">
+      <div class="snum"><i>Вибірка</i><b>вся</b></div>
       <div class="snum"><i>Угод</i><b>${s.n}</b></div>
       <div class="snum"><i>Сигналів</i><b>${s.signals}</b></div>
       <div class="snum"><i>Медіана</i><b class="${pctCls(s.median)}">${pctTxt(s.median)}</b></div>
@@ -722,7 +733,15 @@ function renderSDetail(){
       <div class="snum"><i>PnL ($1k/угода)</i><b class="${pctCls(s.pnl_usd)}">${s.pnl_usd>=0?'+':''}$${Math.abs(s.pnl_usd).toFixed(0)}</b></div>
       <div class="snum"><i>Половини</i><b><span class="${pctCls(s.half1)}">${pctTxt(s.half1)}</span> / <span class="${pctCls(s.half2)}">${pctTxt(s.half2)}</span></b></div>
     </div>
-    ${isRev?`<div class="sd-chart"><h4>Медіана net за хвилиною виходу (1–60)</h4>${curveSvg(s.curve||[])}<div class="ctip" id="cTip"></div></div>`:''}
+    ${filtersOn?`<div class="sd-stats" style="border-top:1px solid var(--line);padding-top:10px">
+      <div class="snum"><i>Вибірка</i><b style="color:var(--amber)">зріз (по показаних)</b></div>
+      <div class="snum"><i>Угод</i><b>${fNets.length}</b></div>
+      <div class="snum"><i>Медіана</i><b class="${pctCls(fMed)}">${pctTxt(fMed)}</b></div>
+      <div class="snum"><i>Середнє</i><b class="${pctCls(fMean)}">${pctTxt(fMean)}</b></div>
+      <div class="snum"><i>Win</i><b>${fWin==null?'—':fWin.toFixed(0)+'%'}</b></div>
+      <div class="snum"><i>PnL</i><b class="${pctCls(fPnl)}">${fPnl==null?'—':(fPnl>=0?'+':'')+'$'+Math.abs(fPnl).toFixed(0)}</b></div>
+    </div>`:''}
+    ${isRev?`<div class="sd-chart"><h4>Медіана net за хвилиною виходу (1–60) · вся вибірка</h4>${curveSvg(s.curve||[])}<div class="ctip" id="cTip"></div></div>`:''}
     <div class="sfilters">
       ${fb('sht','all','всі')}${fb('sht','y','штанга')}${fb('sht','n','середина')}
       <span style="width:10px"></span>
