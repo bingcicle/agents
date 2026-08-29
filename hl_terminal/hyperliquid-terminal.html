@@ -308,6 +308,7 @@ footer .fr{margin-left:auto;display:flex;gap:20px}
     <div class="hstat"><i>Сигналів</i><b id="svSig">—</b></div>
     <div class="hstat"><i>BTC-вето</i><b id="svVeto">—</b></div>
     <div class="hstat"><i>Відкрито зараз</i><b class="sig" id="svOpen">—</b></div>
+    <div class="hstat"><i>Тіней (outcome)</i><b id="svShadow">—</b></div>
     <div class="hstat"><i>Профілів F4</i><b id="svProf">—</b></div>
     <div class="note">paper trading · $1000/угода · net після витрат · клік по картці — деталі</div>
   </div>
@@ -642,12 +643,14 @@ function curveTip(ev,w,L,R){
   const x=(ev.clientX-box.left)*(w/box.width);
   let m=Math.round((x-L)/(w-L-R)*59)+1; m=Math.max(1,Math.min(60,m));
   const v=st.curve[m-1];
+  const n=(st.curve_n||[])[m-1];
   const tip=document.getElementById('cTip'); if(!tip) return;
   if(v==null){tip.style.display='none';return;}
   tip.style.display='block';
   tip.style.left=(ev.clientX-box.left+12)+'px';
   tip.style.top=(ev.clientY-box.top-24)+'px';
-  tip.textContent='вихід m'+m+' · медіана '+pctTxt(v);
+  // n обов'язково: після чесних пропусків хвилини мають різне покриття
+  tip.textContent='вихід m'+m+' · медіана '+pctTxt(v)+(n!=null?' · n='+n:'');
 }
 function hideTip(){const t=document.getElementById('cTip');if(t)t.style.display='none';}
 
@@ -656,6 +659,7 @@ function renderStrat(){
   document.getElementById('svSig').textContent=sData.signals_total??'—';
   document.getElementById('svVeto').textContent=sData.btc_veto??'—';
   document.getElementById('svOpen').textContent=(sData.open||[]).length;
+  document.getElementById('svShadow').textContent=sData.shadow_open??'—';
   const pr=sData.profiles||{};
   document.getElementById('svProf').textContent=(pr.ok??0)+'/'+(pr.total??0);
   const openBy={};
