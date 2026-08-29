@@ -2310,7 +2310,9 @@ def save_state():
             snap["follow_open"] = {k: dict(v) for k, v in follow_open.items()}
             snap["follow_last_close"] = dict(follow_last_close)
             snap["vault_cache"] = dict(vault_cache)
-        tmp = STATE_FILE + ".tmp"
+        # tmp унікальний на виклик: конкурентні save_state писали в один
+        # файл і os.replace інсталював перемішаний JSON (рев'ю v2.2)
+        tmp = f"{STATE_FILE}.tmp{threading.get_ident()}"
         with open(tmp, "w") as f:
             json.dump(snap, f)
         os.replace(tmp, STATE_FILE)   # атомарно: або старий файл, або новий
@@ -2683,7 +2685,8 @@ FOLLOW_HEADERS = ["date_open", "date_close", "strategy", "coin", "our_side",
                   "whale_addr", "entry_px", "exit_px", "exit_reason", "hold_s",
                   "gross_pct", "costs_pct", "net_pct", "peak_pct", "trough_pct",
                   "tx_pct_of_pos", "tx_usd", "ratio", "pos_usd", "vault",
-                  "hour", "btc_move_pct", "profile_gap_s", "algo_v"]
+                  "hour", "btc_move_pct", "profile_gap_s", "algo_v",
+                  "trade_id"]
 # OUTCOME-стрічка: шлях ціни КОЖНОГО сигналу від детекту, незалежно від
 # BTC-вето/зайнятості/breakout — спільна база для чесного порівняння
 # фільтрів на одних і тих самих подіях (аудит 29.08, п.7)
@@ -2722,32 +2725,39 @@ def is_vault(addr):
     vault_cache[addr] = res
     return res
 
-_csv_hdr_ok = {}   # path -> заголовок звірений цим процесом
+_csv_lock = threading.Lock()   # ОДИН запис за раз: ротація і append
+                               # атомарні між усіма потоками (рев'ю v2.2)
 
 def _strat_csv_append(path, headers, row):
     """Append із звіркою формату. Повертає True лише після успішного
-    запису — викликач НЕ видаляє трекер, поки рядок не збережено
-    (аудит v2.1 п.7). Файл зі старим заголовком ротується у .legacy,
-    щоб дані різних версій логіки не змішувались (п.3)."""
+    запису — викликач НЕ видаляє трекер, поки рядок не збережено.
+    Під локом і з перечитуванням заголовка щоразу (записи рідкі):
+    - файл з ІНШИМ заголовком ротується у .legacy; збій ротації =
+      відмова від запису, а не сліпий append під чужий формат;
+    - порожній (0-байт) файл після минулого збою отримує заголовок;
+    - заголовок+рядок пишуться одним f.write, щоб мінімізувати
+      вікно "обірваного рядка" при ENOSPC."""
     try:
-        import csv as _csv
-        if path not in _csv_hdr_ok and os.path.exists(path):
-            try:
+        import csv as _csv, io
+        with _csv_lock:
+            need_header = True
+            if os.path.exists(path):
                 with open(path, newline="", encoding="utf-8") as f:
                     first = f.readline().strip("\r\n")
-                if first and first != ",".join(headers):
+                if first == ",".join(headers):
+                    need_header = False
+                elif first:
                     legacy = f"{path}.legacy-{int(time.time())}.csv"
                     os.replace(path, legacy)
                     print(f"  [STRAT] {os.path.basename(path)}: старий формат "
                           f"-> {os.path.basename(legacy)}")
-            except Exception as _he:
-                print(f"  [STRAT] header check {os.path.basename(path)}: {_he}")
-        _csv_hdr_ok[path] = True
-        newf = not os.path.exists(path)
-        with open(path, "a", newline="", encoding="utf-8") as f:
-            w = _csv.writer(f)
-            if newf: w.writerow(headers)
+                # first == "": порожній файл — допишемо заголовок
+            buf = io.StringIO()
+            w = _csv.writer(buf)
+            if need_header: w.writerow(headers)
             w.writerow(row)
+            with open(path, "a", newline="", encoding="utf-8") as f:
+                f.write(buf.getvalue())
         return True
     except Exception as e:
         print(f"  [STRAT] csv err ({os.path.basename(path)}): {e}")
@@ -2886,7 +2896,7 @@ def rev_on_close(addr, coin, old, mfills, full_close):
         rev_open[f"{sig_id}|_OUTCOME"] = pos
         if btc_ok:
             busy = {(p["strategy"], p["coin"]) for p in rev_open.values()
-                    if p["strategy"] != "_OUTCOME"}
+                    if p["strategy"] != "_OUTCOME" and not p.get("done")}
             for st in strats:
                 if (st, coin) in busy: continue
                 pos = dict(base_pos); pos["strategy"] = st
@@ -2999,7 +3009,8 @@ def follow_on_txs(addr, coin, old, mfills, full_close):
                   and not prof.get("err"))
     need_profile = not prof_valid
     with strat2_lock:
-        busy = {(p["strategy"], p["coin"]) for p in follow_open.values()}
+        busy = {(p["strategy"], p["coin"]) for p in follow_open.values()
+                if not p.get("done")}
         for st, timer in FOLLOW_TIMERS.items():
             if (st, coin) in busy: continue
             it = dict(base); it["strategy"] = st; it["timer"] = float(timer)
@@ -3085,7 +3096,7 @@ def _build_profile(fills):
         closes.setdefault(coin, []).append((t, cost / sz, sz_close, sp))
     n_ok, gaps = 0, []
     for coin, lst in closes.items():
-        lst.sort()
+        lst.sort(key=lambda r: (r[0], -r[3]))
         ep = []
         for row in lst:
             if ep:
@@ -3114,12 +3125,11 @@ def _fetch_profile(addr):
             batch = hl_post({"type": "userFillsByTime", "user": addr,
                              "startTime": cursor}, retries=2)
             if not isinstance(batch, list):
-                # відповідь не історія (напр. {"error": ...}): це збій,
-                # а не "порожня історія" — err, не вирок (аудит v2.1 п.8)
-                if not fills:
-                    raise ValueError(f"bad history payload: {type(batch).__name__}")
-                truncated = 1
-                break
+                # відповідь не історія (напр. {"error": ...}): збій, а не
+                # "порожня історія". І на початку, і ПОСЕРЕД пагінації це
+                # err -> ретрай після TTL: профіль із огризка історії
+                # інакше кешувався назавжди (рев'ю v2.2)
+                raise ValueError(f"bad history payload: {type(batch).__name__}")
             if not batch: break
             fills.extend(batch)
             if len(batch) < 2000: break
@@ -3140,7 +3150,7 @@ def _fetch_profile(addr):
     try:
         with strat2_lock:
             snapshot = dict(wallet_profiles)
-        tmp = PROFILES_FILE + ".tmp"
+        tmp = f"{PROFILES_FILE}.tmp{threading.get_ident()}"
         with open(tmp, "w") as f:
             json.dump(snapshot, f)
         os.replace(tmp, PROFILES_FILE)
@@ -3158,10 +3168,13 @@ def run_strat2_loop():
             active = bool(rev_open) or bool(follow_open)
         if not active: continue
         now = time.time()
-        # рядки збираємо БЕЗ видалення трекера: видаляємо лише після
-        # успішного запису CSV, інакше завершений результат губився при
-        # збої диска (аудит v2.1 п.7); незаписаний трекер повторить
-        # спробу на наступному тику (рядок ідемпотентний по sig_id)
+        # Рядки збираємо БЕЗ видалення трекера: видаляємо після успішного
+        # запису CSV (аудит v2.1 п.7). Завершений-але-незаписаний трекер
+        # помічається done=1: він (а) не блокує busy для нових сигналів,
+        # (б) ретраїться з капом WFAIL_CAP, після чого скидається з одним
+        # логом — інакше збій диска тихо зупиняв збір даних (рев'ю v2.2).
+        # Дублі після краху знімає дедуп по sig_id/trade_id у strat2_api.
+        WFAIL_CAP = 20
         rev_rows, fol_rows = [], []
         with strat2_lock:
             for pid, p in list(rev_open.items()):
@@ -3170,6 +3183,7 @@ def run_strat2_loop():
                     # СПОЧАТКУ дедлайн (аудит п.3: пізній тик після
                     # закінчення вікна відкривав позицію заднім числом)
                     if now >= p["deadline"]:
+                        p["done"] = 1
                         rev_rows.append((pid, "rev", _rev_row(p, 0)))
                         continue
                     if not px: continue
@@ -3202,6 +3216,7 @@ def run_strat2_loop():
                     else:
                         p["samples"].append("")
                 if len(p["samples"]) >= REV_TRACK_MIN:
+                    p["done"] = 1
                     if p["strategy"] == "_OUTCOME":
                         rev_rows.append((pid, "out", _rev_out_row(p)))
                     else:
@@ -3219,6 +3234,7 @@ def run_strat2_loop():
                     if now - last >= p["timer"]:
                         reason = "silence"
                 if reason:
+                    p["done"] = 1
                     slip = _sim_slip(p.get("depth") or 0)
                     costs = (2 * SIM_COMMISSION + 2 * slip) * 100.0
                     _bm = p.get("btc_move")
@@ -3232,20 +3248,34 @@ def run_strat2_loop():
                         round(p["ratio"], 2), round(p["pos_usd"], 0),
                         p["vault"], p["hour"],
                         (round(_bm, 3) if _bm is not None else ""),
-                        round(p["profile_gap"], 1), DATA_ALGO_V]))
+                        round(p["profile_gap"], 1), DATA_ALGO_V, fid]))
         written_rev, written_fol = [], []
+        failed_rev, failed_fol = [], []
         for pid, kind, r in rev_rows:
             ok = (_strat_csv_append(REV_OUT_CSV, REV_OUT_HEADERS, r)
                   if kind == "out"
                   else _strat_csv_append(REV_CSV, REV_HEADERS, r))
-            if ok: written_rev.append(pid)
+            (written_rev if ok else failed_rev).append(pid)
         for fid, r in fol_rows:
-            if _strat_csv_append(FOLLOW_CSV, FOLLOW_HEADERS, r):
-                written_fol.append(fid)
-        if written_rev or written_fol:
+            ok = _strat_csv_append(FOLLOW_CSV, FOLLOW_HEADERS, r)
+            (written_fol if ok else failed_fol).append(fid)
+        if rev_rows or fol_rows:
             with strat2_lock:
                 for pid in written_rev: rev_open.pop(pid, None)
                 for fid in written_fol: follow_open.pop(fid, None)
+                # кап ретраїв: після WFAIL_CAP невдалих записів трекер
+                # скидається (дані втрачені ЯВНО, з логом), а не висить
+                # зомбі, що спамить диск і роздуває стан
+                for coll, pid in ([(rev_open, x) for x in failed_rev]
+                                  + [(follow_open, x) for x in failed_fol]):
+                    it = coll.get(pid)
+                    if it is None: continue
+                    it["wfail"] = it.get("wfail", 0) + 1
+                    if it["wfail"] > WFAIL_CAP:
+                        coll.pop(pid, None)
+                        print(f"  [STRAT] DROP незаписаний трекер {pid} "
+                              f"після {WFAIL_CAP} спроб (диск?)")
+        if written_rev or written_fol:
             threading.Thread(target=save_state, daemon=True).start()
 
 # ── API для вкладки "Стратегії" ─────────────────────────
@@ -3275,9 +3305,20 @@ def strat2_api():
         except (TypeError, ValueError):
             return d
 
-    rev = read(REV_CSV)
-    sigs = read(REV_SIG_CSV)
-    fol = read(FOLLOW_CSV)
+    def dedup(rows, keyf):
+        # дублі можливі після краху між записом CSV і save_state
+        # (рестарт відновлює вже записаний трекер) — знімаємо на читанні
+        seen, out2 = set(), []
+        for r in rows:
+            k = keyf(r)
+            if k and k in seen: continue
+            if k: seen.add(k)
+            out2.append(r)
+        return out2
+    rev = dedup(read(REV_CSV),
+                lambda r: (r.get("sig_id"), r.get("strategy")))
+    sigs = dedup(read(REV_SIG_CSV), lambda r: r.get("sig_id"))
+    fol = dedup(read(FOLLOW_CSV), lambda r: r.get("trade_id"))
     out = {"updated": now, "strategies": {}, "desc": STRAT2_DESC}
 
     for st in ("R1_загальний", "R2_breakout", "R3_великі", "R4_великий",
@@ -3371,24 +3412,32 @@ def strat2_api():
         }
 
     with strat2_lock:
-        # "відкрито зараз" = лише paper-позиції; тіньові _OUTCOME-трекери
-        # рахуємо окремо, щоб лічильник не завищував (аудит v2.1 п.2.4)
+        # "відкрито зараз" = лише РЕАЛЬНІ paper-позиції: без тіней
+        # (_OUTCOME), без озброєних R2 (входу ще немає) і без done
         out["open"] = (
-            [{"strategy": p["strategy"], "coin": p["coin"],
-              "state": p.get("state", "open"),
+            [{"strategy": p["strategy"], "coin": p["coin"], "state": "open",
               "age_s": round(now - p.get("entry_ts", p["detect_ts"]), 0)}
-             for p in rev_open.values() if p["strategy"] != "_OUTCOME"]
+             for p in rev_open.values()
+             if p["strategy"] != "_OUTCOME" and not p.get("done")
+             and p.get("state", "open") == "open"]
             + [{"strategy": p["strategy"], "coin": p["coin"], "state": "open",
                 "age_s": round(now - p["open_ts"], 0)}
-               for p in follow_open.values()])
+               for p in follow_open.values() if not p.get("done")])
+        out["armed"] = sum(1 for p in rev_open.values()
+                           if p.get("state") == "armed" and not p.get("done"))
         out["shadow_open"] = sum(1 for p in rev_open.values()
-                                 if p["strategy"] == "_OUTCOME")
+                                 if p["strategy"] == "_OUTCOME"
+                                 and not p.get("done"))
         out["profiles"] = {"total": len(wallet_profiles),
                            "ok": sum(1 for v in wallet_profiles.values()
                                      if isinstance(v, dict) and v.get("ok"))}
-    out["signals_total"] = len(sigs)
-    out["btc_veto"] = sum(1 for s in sigs
-                          if fnum(s.get("btc_ok"), 1) == 0)
+    # лічильники сигналів — лише події >=1% (ті, що можуть відкривати
+    # стратегії); суб-порогові 0.5-1% рахуємо окремо (рев'ю v2.2)
+    full_sigs = [s2 for s2 in sigs if (fnum(s2.get("move_3m_pct")) or 0) >= 1.0]
+    out["signals_total"] = len(full_sigs)
+    out["signals_sub"] = len(sigs) - len(full_sigs)
+    out["btc_veto"] = sum(1 for s2 in full_sigs
+                          if fnum(s2.get("btc_ok"), 1) == 0)
     out["outcomes_total"] = len(read(REV_OUT_CSV))
     _strat2_cache["data"] = out
     _strat2_cache["ts"] = now

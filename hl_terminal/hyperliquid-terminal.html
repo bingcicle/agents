@@ -308,6 +308,7 @@ footer .fr{margin-left:auto;display:flex;gap:20px}
     <div class="hstat"><i>Сигналів</i><b id="svSig">—</b></div>
     <div class="hstat"><i>BTC-вето</i><b id="svVeto">—</b></div>
     <div class="hstat"><i>Відкрито зараз</i><b class="sig" id="svOpen">—</b></div>
+    <div class="hstat"><i>Чекають breakout</i><b id="svArmed">—</b></div>
     <div class="hstat"><i>Тіней (outcome)</i><b id="svShadow">—</b></div>
     <div class="hstat"><i>Профілів F4</i><b id="svProf">—</b></div>
     <div class="note">paper trading · $1000/угода · net після витрат · клік по картці — деталі</div>
@@ -660,6 +661,7 @@ function renderStrat(){
   document.getElementById('svVeto').textContent=sData.btc_veto??'—';
   document.getElementById('svOpen').textContent=(sData.open||[]).length;
   document.getElementById('svShadow').textContent=sData.shadow_open??'—';
+  document.getElementById('svArmed').textContent=sData.armed??'—';
   const pr=sData.profiles||{};
   document.getElementById('svProf').textContent=(pr.ok??0)+'/'+(pr.total??0);
   const openBy={};
