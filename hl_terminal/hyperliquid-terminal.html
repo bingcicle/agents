@@ -222,6 +222,9 @@ footer .fr{margin-left:auto;display:flex;gap:20px}
 .fbtn.on{color:var(--signal);border-color:var(--signal)}
 .sd-tbl{overflow-x:auto}
 .sd-tbl table{min-width:760px}
+.thsort{cursor:pointer;user-select:none}
+.thsort:hover{color:var(--ink)}
+.thsort.on{color:var(--signal)}
 .pos-badge{font-size:9px;color:var(--amber);border:1px solid var(--line2);
   padding:1px 6px;border-radius:3px;margin-left:6px}
 
@@ -576,6 +579,14 @@ function renderTable(){
 
 /* ═══ ВКЛАДКА СТРАТЕГІЙ ═══ */
 let view='term', sData=null, sSel=null, sT=null, fSht='all', fVault='all';
+let sMore=false, sSortK=null, sSortD=-1;   // детальні колонки і сортування
+function usdTxt(v){if(v==null)return '—';const a=Math.abs(v);
+  if(a>=1e6)return '$'+(v/1e6).toFixed(2)+'M';
+  if(a>=1e3)return '$'+(v/1e3).toFixed(1)+'K';
+  return '$'+v.toFixed(0);}
+function setMore(){sMore=!sMore;renderSDetail();}
+function setSort(k){if(sSortK===k){sSortD=-sSortD;}else{sSortK=k;sSortD=-1;}
+  renderSDetail();}
 const S_ORDER=['R1_загальний','R2_breakout','R3_великі','R4_великий','R5_дуже',
                'R6_волт','F1_1хв','F2_2хв','F3_3хв','F4_розумний'];
 
@@ -645,11 +656,12 @@ function curveSvg(curve,curveN,w=680,h=180){
   </svg>`;
 }
 function curveTip(ev,w,L,R){
-  const st=sData&&sData.strategies[sSel]; if(!st||!st.curve) return;
+  const st=sData&&sData.strategies[sSel];
+  if(!st||!(st._dispCurve||st.curve)) return;
   const box=ev.currentTarget.getBoundingClientRect();
   const x=(ev.clientX-box.left)*(w/box.width);
   let m=Math.round((x-L)/(w-L-R)*59)+1; m=Math.max(1,Math.min(60,m));
-  const v=(st._dispCurve||st.curve)[m-1];
+  const v=(st._dispCurve||st.curve||[])[m-1];
   const n=(st._dispN||st.curve_n||[])[m-1];
   const tip=document.getElementById('cTip'); if(!tip) return;
   if(v==null){tip.style.display='none';return;}
@@ -685,7 +697,9 @@ function renderStrat(){
         +' · рух 0.5–1% '+c(rs.mag_05_1)
         +' · 1–2% '+c(rs.mag_1_2)+' · ≥2% '+c(rs.mag_2p)
         +' · штанга '+c(rs.shtanga_1)+' vs ні '+c(rs.shtanga_0)
-        +(legacy?' · поза поточною версією: '+legacy:'');
+        +((rs.partial&&rs.partial.n)?' · часткові закриття '+c(rs.partial):'')
+        +(legacy?' · поза поточною версією: '+legacy:'')
+        +(sData.quarantined?' · битих рядків у карантині: '+sData.quarantined:'');
     } else if(legacy){
       rEl.style.display='';
       rEl.textContent='Статистика рахується з нуля для нової версії логіки. '
@@ -702,7 +716,7 @@ function renderStrat(){
     const s=sData.strategies[name]; if(!s) continue;
     const skipped=s.signals-s.entered;
     html+=`<div class="scard${name===sSel?' on':''}" onclick="selStrat('${name}')">
-      <div class="scard-r1"><span class="scard-name">${name.replace(/_/g,' ')}</span>
+      <div class="scard-r1"><span class="scard-name">${(sData.titles||{})[name]||name.replace(/_/g,' ')}</span>
         ${openBy[name]?`<span class="pos-badge">у ринку: ${openBy[name]}</span>`:''}
         <span class="scard-n">${s.n} угод${skipped>0?' · '+skipped+' проп.':''}</span></div>
       <div class="scard-desc">${(sData.desc||{})[name]||''}</div>
@@ -731,21 +745,53 @@ function renderSDetail(){
   if(fVault!=='all') trades=trades.filter(t=>(t.vault??0)===(fVault==='y'?1:0));
   const fb=(k,v,lbl)=>`<button class="fbtn${(k==='sht'?fSht:fVault)===v?' on':''}" onclick="setF('${k}','${v}')">${lbl}</button>`;
   const isRev=s.kind==='rev';
+  // колонки як дані: спільний механізм для сортування і "детальніше"
+  const C=(k,l,f,srt)=>({k,l,f,srt:srt!==false});
+  const fmt={pct:v=>v!=null?pctTxt(v):'—',
+             sec:v=>v!=null?v.toFixed(0)+'с':'—',
+             p2:v=>v!=null?v.toFixed(2)+'%':'—',
+             p1:v=>v!=null?v.toFixed(1)+'%':'—',
+             r:v=>v!=null?v.toFixed(2):'—'};
+  let cols=[
+    C('date','Дата',t=>t.date||''),
+    C('coin','Монета',t=>`<span class="side ${t.side==='LONG'?'L':'S'}">${t.side||''}</span> ${t.coin||''}${t.vault?' 🏦':''}`),
+    C('net30','Net'+(isRev?' m30':''),t=>t.entered===0?'<span class="dim">пропуск</span>':pctTxt(t.net30)),
+    C('peak','Peak',t=>fmt.pct(t.peak)),
+    C('trough','Trough',t=>fmt.pct(t.trough)),
+  ];
+  if(isRev){
+    cols.push(C('move','Рух 3хв',t=>fmt.p2(t.move)),
+              C('dur','Злив, с',t=>fmt.sec(t.dur)),
+              C('shtanga','Тип',t=>t.shtanga!=null?(t.shtanga?'штанга':'серед.'):'—'));
+    if(sMore) cols.push(C('ratio','Ratio',t=>fmt.r(t.ratio)),
+                        C('sum_usd','Закрито $',t=>usdTxt(t.sum_usd)),
+                        C('p3u','3хв ↑',t=>fmt.pct(t.p3u)),
+                        C('p3d','3хв ↓',t=>fmt.pct(t.p3d)));
+  }else{
+    cols.push(C('tx_pct','Шматок',t=>fmt.p1(t.tx_pct)),
+              C('hold','Холд, с',t=>fmt.sec(t.hold)),
+              C('reason','Вихід',t=>t.reason||'—'));
+    if(sMore) cols.push(C('ratio','Ratio',t=>fmt.r(t.ratio)),
+                        C('tx_usd','Шматок $',t=>usdTxt(t.tx_usd)),
+                        C('pos_usd','Позиція $',t=>usdTxt(t.pos_usd)));
+  }
+  cols.push(C('hour','Год',t=>t.hour!=null?String(t.hour).padStart(2,'0')+':00':'—'),
+            C('btc','BTC 3хв',t=>fmt.pct(t.btc)));
+  // сортування: клік по заголовку; null-и завжди в кінці
+  if(sSortK){
+    const nul=sSortD===-1?-Infinity:Infinity;
+    trades.sort((a,b)=>{
+      let x=a[sSortK],y=b[sSortK];
+      if(typeof x==='string'||typeof y==='string')
+        return sSortD*String(y??'').localeCompare(String(x??''));
+      x=(x==null||isNaN(x))?nul:x; y=(y==null||isNaN(y))?nul:y;
+      return sSortD*(y-x);});
+  }
   let rows='';
   for(const t of trades.slice(0,150)){
-    rows+=`<tr>
-      <td>${t.date||''}</td>
-      <td style="text-align:center"><span class="side ${t.side==='LONG'?'L':'S'}">${t.side||''}</span> ${t.coin||''}${t.vault?' 🏦':''}</td>
-      <td class="${pctCls(t.net30)}">${t.entered===0?'<span class="dim">пропуск</span>':pctTxt(t.net30)}</td>
-      <td class="dim">${t.peak!=null?pctTxt(t.peak):'—'}</td>
-      <td class="dim">${t.trough!=null?pctTxt(t.trough):'—'}</td>
-      <td class="dim">${isRev?(t.move!=null?t.move.toFixed(2)+'%':'—'):(t.tx_pct!=null?t.tx_pct.toFixed(1)+'%':'—')}</td>
-      <td class="dim">${isRev?(t.dur!=null?t.dur.toFixed(0)+'с':'—'):(t.hold!=null?t.hold.toFixed(0)+'с':'—')}</td>
-      <td class="dim">${t.shtanga!=null?(t.shtanga?'штанга':'серед.'):(t.reason||'—')}</td>
-      <td class="dim">${t.hour!=null?String(t.hour).padStart(2,'0')+':00':'—'}</td>
-      <td class="dim">${t.btc!=null?pctTxt(t.btc):'—'}</td>
-    </tr>`;
+    rows+='<tr>'+cols.map((c,i)=>`<td class="${i>2?'dim':''}"${c.k==='coin'?' style="text-align:center"':''}>${c.f(t)}</td>`).join('')+'</tr>';
   }
+  const thead=cols.map(c=>`<th${c.srt?` class="thsort${sSortK===c.k?' on':''}" onclick="setSort('${c.k}')" title="сортувати"`:''}>${c.l}${sSortK===c.k?(sSortD===-1?' ↓':' ↑'):''}</th>`).join('');
   // Метрики зрізу рахуємо з ВІДФІЛЬТРОВАНИХ угод — інакше таблиця
   // показує підгрупу, а числа лишаються від усієї вибірки (аудит п.11).
   // Зріз обмежений переданими останніми угодами (до 120) — так і підписуємо.
@@ -758,7 +804,7 @@ function renderSDetail(){
   const filtersOn=fSht!=='all'||fVault!=='all';
   box.style.display='block';
   box.innerHTML=`
-    <h3>${sSel.replace(/_/g,' ')}</h3>
+    <h3>${(sData.titles||{})[sSel]||sSel.replace(/_/g,' ')} <span class="dim" style="font-size:11px">${sSel}</span></h3>
     <div class="sub">${(sData.desc||{})[sSel]||''} · показано ${Math.min(trades.length,150)} з ${trades.length}</div>
     <div class="sd-stats">
       <div class="snum"><i>Вибірка</i><b>вся</b></div>
@@ -778,28 +824,31 @@ function renderSDetail(){
       <div class="snum"><i>Win</i><b>${fWin==null?'—':fWin.toFixed(0)+'%'}</b></div>
       <div class="snum"><i>PnL</i><b class="${pctCls(fPnl)}">${fPnl==null?'—':(fPnl>=0?'+':'')+'$'+Math.abs(fPnl).toFixed(0)}</b></div>
     </div>`:''}
-    ${isRev?(()=>{
+    ${(()=>{
+      // крива хвилин виходу: у реверсів — власна, у follow — СПІЛЬНА
+      // тіньова стрічка входів (одні сигнали на всі F-стратегії)
+      const src=isRev?s:(sData.follow_tape&&sData.follow_tape.n?sData.follow_tape:null);
+      if(!src) return '';
       // спільна когорта: кожна хвилина з ТИХ САМИХ угод — лише тоді
       // "найкраща хвилина" є порівнянням, а не збігом різних вибірок
-      const useC=(s.curve_common_n||0)>=3&&s.curve_common;
-      s._dispCurve=useC?s.curve_common:(s.curve||[]);
-      s._dispN=useC?(s.curve_common||[]).map(()=>s.curve_common_n):(s.curve_n||[]);
-      const lbl=useC?('спільна когорта (усі 60 хв у кожній угоді) · n='+s.curve_common_n)
-                    :'вся вибірка · увага: різні хвилини = різні набори угод';
+      const useC=(src.curve_common_n||0)>=3&&src.curve_common;
+      s._dispCurve=useC?src.curve_common:(src.curve||[]);
+      s._dispN=useC?(src.curve_common||[]).map(()=>src.curve_common_n):(src.curve_n||[]);
+      const lbl=(isRev?'':'спільна стрічка follow-входів · ')
+        +(useC?('спільна когорта (усі 60 хв у кожній угоді) · n='+src.curve_common_n)
+              :'вся вибірка · увага: різні хвилини = різні набори угод');
       return `<div class="sd-chart"><h4>Медіана net за хвилиною виходу (1–60) · ${lbl}</h4>${curveSvg(s._dispCurve,s._dispN)}<div class="ctip" id="cTip"></div></div>`;
-    })():''}
+    })()}
     <div class="sfilters">
       ${fb('sht','all','всі')}${fb('sht','y','штанга')}${fb('sht','n','середина')}
       <span style="width:10px"></span>
       ${fb('vault','all','всі')}${fb('vault','y','волти')}${fb('vault','n','без волтів')}
+      <span style="width:10px"></span>
+      <button class="fbtn${sMore?' on':''}" onclick="setMore()">детальніше</button>
     </div>
-    <div class="sd-tbl"><h4>Угоди</h4>
-    <table><thead><tr>
-      <th>Дата</th><th class="rt">Монета</th><th>Net${isRev?' m30':''}</th>
-      <th>Peak</th><th>Trough</th><th>${isRev?'Рух 3хв':'Шматок'}</th>
-      <th>${isRev?'Злив, с':'Холд, с'}</th><th>${isRev?'Тип':'Вихід'}</th>
-      <th>Год</th><th>BTC 3хв</th>
-    </tr></thead><tbody>${rows||'<tr><td colspan="10" class="dim">порожньо</td></tr>'}</tbody></table></div>`;
+    <div class="sd-tbl"><h4>Угоди · клік по колонці — сортування</h4>
+    <table><thead><tr>${thead}</tr></thead>
+    <tbody>${rows||`<tr><td colspan="${cols.length}" class="dim">порожньо</td></tr>`}</tbody></table></div>`;
 }
 
 poll();
