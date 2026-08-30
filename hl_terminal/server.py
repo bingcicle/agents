@@ -2654,10 +2654,12 @@ F4_MIN_NOTIONAL  = 100_000.0
 F4_MAX_UNLOAD_S  = 300.0
 F4_CHUNK_PCT     = 0.05
 F4_CLAMP         = (60.0, 300.0)
-PROFILE_ALGO_V   = 3      # версія алгоритму профілів: старі записи без
+PROFILE_ALGO_V   = 4      # версія алгоритму профілів: старі записи без
                           # цієї позначки перераховуються (аудит v2.1 п.3;
-                          # v3: boundary-safe пагінація, аудит v2.2 п.2)
-DATA_ALGO_V      = "2.3"  # версія логіки збору: трекер отримує її при
+                          # v3: boundary-safe пагінація; v4: епізод =
+                          # позиція (без пауза-спліту), malformed
+                          # fail-closed, композитний tid-ключ)
+DATA_ALGO_V      = "2.4"  # версія логіки збору: трекер отримує її при
                           # СТВОРЕННІ і несе у рядок; API рахує лише
                           # поточну версію (аудит v2.2: рестарт підписував
                           # старі трекери новою версією). При зміні
@@ -2780,8 +2782,18 @@ def _strat_csv_append(path, headers, row):
             w = _csv.writer(buf)
             if need_header: w.writerow(headers)
             w.writerow(row)
-            with open(path, "a", newline="", encoding="utf-8") as f:
-                f.write(buf.getvalue())
+            with open(path, "a+b") as fb:
+                # обірваний минулим збоєм (ENOSPC/short write) хвіст без
+                # \n закривається, інакше ретрай приклеївся б до
+                # недописаного рядка і зіпсував ОБИДВА (аудит v2.3 п.7);
+                # битий короткий рядок потім відкине читання, а дедуп
+                # по sig_id залишить повний повторний запис
+                fb.seek(0, 2)
+                if fb.tell() > 0:
+                    fb.seek(-1, 2)
+                    if fb.read(1) != b"\n":
+                        fb.write(b"\r\n")
+                fb.write(buf.getvalue().encode("utf-8"))
         return True
     except Exception as e:
         print(f"  [STRAT] csv err ({os.path.basename(path)}): {e}")
@@ -3044,11 +3056,14 @@ def follow_on_txs(addr, coin, old, mfills, full_close):
     need_profile = not prof_valid
     # обрізана історія (8 сторінок вичерпано або >2000 філів в одній мс)
     # НЕ дає права на F4: "поведінковий профіль" з огризка — не профіль
-    # (аудит v2.2 п.2). Але truncated — стан ТИМЧАСОВИЙ: 14-денне вікно
-    # ковзає, тому після TTL профіль перетягується (need_profile=True;
-    # шторм гасить TTL-гейт у _profile_request) — інакше найактивніші
-    # кити випадали з F4 назавжди (рев'ю v2.3)
-    if prof_valid and prof.get("truncated"):
+    # (аудит v2.2 п.2). truncated — стан ТИМЧАСОВИЙ (рев'ю v2.3), а
+    # ЗДОРОВИЙ профіль просто старіє (аудит v2.3 п.4: кеш 100-денної
+    # давності — не "останні 14 днів") — обидва йдуть на рефреш;
+    # шторм гасить TTL-гейт у _profile_request. Поточний сигнал при
+    # цьому користується кешем (політика "свіжий-вчора краще, ніж
+    # нічого"), рефреш доїде фоном до наступного сигналу
+    if prof_valid and (prof.get("truncated")
+                       or now - prof.get("fetched", 0) >= PROFILE_TTL_S):
         need_profile = True
     f4_ok = prof_valid and prof.get("ok") and not prof.get("truncated")
     with strat2_lock:
@@ -3073,6 +3088,10 @@ def follow_on_txs(addr, coin, old, mfills, full_close):
 
 # ── F4: профілі гаманців з історії філів ────────────────
 PROFILE_ERR_TTL_S = 6 * 3600   # збій запиту = "невідомо", ретрай за 6 год
+PROFILE_TTL_S     = 24 * 3600  # і ЗДОРОВИЙ профіль старіє: "останні 14
+                               # днів" — ковзне вікно, кеш 100-денної
+                               # давності не є актуальною поведінкою
+                               # (аудит v2.3 п.4); оновлення раз на добу
 
 def _profile_request(addr):
     a = addr.lower()
@@ -3082,12 +3101,14 @@ def _profile_request(addr):
         if prof is not None:
             stale_version = prof.get("v") != PROFILE_ALGO_V
             soft = prof.get("err") or prof.get("truncated")
-            if not stale_version and not soft: return
-            # збійний ("невідомо") чи обрізаний профіль — ретрай лише
-            # після TTL (вікно історії ковзає, обрізаність минає);
-            # застаріла версія алгоритму перераховується одразу
+            age = time.time() - prof.get("fetched", 0)
+            # застаріла версія алгоритму — перерахунок одразу; збійний/
+            # обрізаний — ретрай після PROFILE_ERR_TTL_S; ЗДОРОВИЙ
+            # (ok і не-ok) — рефреш після PROFILE_TTL_S: 14-денне вікно
+            # ковзає, і позитивна, і негативна кваліфікація старіють
+            # (аудит v2.3 п.4)
             if not stale_version and \
-               time.time() - prof.get("fetched", 0) < PROFILE_ERR_TTL_S:
+               age < (PROFILE_ERR_TTL_S if soft else PROFILE_TTL_S):
                 return
         profiles_fetching.add(a)
     threading.Thread(target=_fetch_profile, args=(a,), daemon=True).start()
@@ -3114,6 +3135,7 @@ def _build_profile(fills):
         get_recent_market_fills: інакше той самий ордер, порізаний
         матчінгом на 10 дрібних філів, валив шматок-тест (аудит п.4)."""
     txs = {}   # (coin, hash) -> [t, cost, sz, start_pos]
+    bad = 0    # close-філи, які НЕ вдалося розібрати: історія неповна
     for f in fills:
         d = str(f.get("dir", ""))
         if not (d.startswith("Close") or ">" in d): continue
@@ -3124,8 +3146,11 @@ def _build_profile(fills):
             sz = float(f.get("sz", 0))
             sp = abs(float(f.get("startPosition", 0) or 0))
         except (TypeError, ValueError):
+            bad += 1   # биті значення = невідомий шматок історії, а не
+            continue   # "його не було" (аудит v2.3 п.5.2)
+        if t <= 0 or px <= 0 or sz <= 0:
+            bad += 1
             continue
-        if t <= 0 or px <= 0 or sz <= 0: continue
         k = (f.get("coin", "?"), f.get("hash") or f"t{t}")
         agg = txs.setdefault(k, [t, 0.0, 0.0, sp])
         agg[0] = min(agg[0], t)
@@ -3147,11 +3172,16 @@ def _build_profile(fills):
             if ep:
                 prev = ep[-1]
                 prev_remaining = max(0.0, prev[3] - prev[2])
-                # нова позиція = або пауза >5хв, або позиція ВИРОСЛА між
-                # закриттями (закрив у нуль і перевідкрив — це ДВА
-                # епізоди, навіть з короткою паузою; аудит v2.1 п.4)
+                # епізод ділиться ЛИШЕ коли позиція ВИРОСЛА між
+                # закриттями (закрив і перевідкрив = дві позиції).
+                # Пауза сама по собі НЕ створює нову позицію: 95% злиті
+                # швидко + хвіст за 10 хв — це ОДНЕ повільне
+                # розвантаження, а не два швидкі епізоди (аудит v2.3
+                # п.3; стара пауза >5хв давала фальшиві n_ep=2 і
+                # пропускала dur-тест). Повільний злив тепер чесно
+                # валиться на F4_MAX_UNLOAD_S у _grade_episode.
                 reopened = row[3] > prev_remaining + 0.02 * max(row[3], prev[3])
-                if row[0] - prev[0] > 300_000 or reopened:
+                if reopened:
                     n, g = _grade_episode(ep); n_ok += n; gaps += g
                     ep = []
             ep.append(row)
@@ -3159,14 +3189,22 @@ def _build_profile(fills):
             n, g = _grade_episode(ep); n_ok += n; gaps += g
     ok = n_ok >= F4_MIN_EPISODES
     avg = (sum(gaps) / len(gaps)) if gaps else 30.0   # одним пострілом = мін. кламп
-    return {"ok": ok, "n_ep": n_ok, "avg_gap_s": round(avg, 1)}
+    out = {"ok": ok, "n_ep": n_ok, "avg_gap_s": round(avg, 1)}
+    if bad:
+        # fail-closed: профіль з дір — "невідомо", не кваліфікація;
+        # err=1 -> F4 закритий, ретрай після TTL (аудит v2.3 п.5.2)
+        out.update(ok=False, err=1, bad_rows=bad)
+    return out
 
 def _fill_key(f):
-    """Ідентичність філа для дедуплікації між сторінками: tid унікальний
-    у Hyperliquid; фолбек — повний кортеж полів."""
+    """Ідентичність філа для дедуплікації між сторінками. Докстрока HL
+    гарантує унікальність трейду по (block_time, coin, tid), НЕ по
+    одному tid (аудит v2.3 п.5.1) — ключ композитний; фолбек без tid —
+    повний кортеж полів."""
     tid = f.get("tid")
-    if tid is not None: return ("tid", tid)
-    return (f.get("hash"), f.get("time"), str(f.get("px")),
+    if tid is not None:
+        return ("tid", f.get("time"), f.get("coin"), tid)
+    return (f.get("coin"), f.get("hash"), f.get("time"), str(f.get("px")),
             str(f.get("sz")), str(f.get("startPosition")), f.get("dir"))
 
 def _fetch_profile(addr):
@@ -3425,14 +3463,18 @@ def strat2_api():
 
     def dedup(rows, keyf):
         # дублі можливі після краху між записом CSV і save_state
-        # (рестарт відновлює вже записаний трекер) — знімаємо на читанні
-        seen, out2 = set(), []
+        # (рестарт відновлює вже записаний трекер) — знімаємо на
+        # читанні. ОСТАННІЙ запис виграє: після обірваного append
+        # перший рядок ключа може бути битим огризком, а повний —
+        # повторним записом нижче (аудит v2.3 п.7)
+        best, order, keyless = {}, [], []
         for r in rows:
             k = keyf(r)
-            if k and k in seen: continue
-            if k: seen.add(k)
-            out2.append(r)
-        return out2
+            if not k:
+                keyless.append(r); continue
+            if k not in best: order.append(k)
+            best[k] = r
+        return [best[k] for k in order] + keyless
     rev = dedup(read(REV_CSV),
                 lambda r: (r.get("sig_id"), r.get("strategy")))
     sigs = dedup(read(REV_SIG_CSV), lambda r: r.get("sig_id"))
@@ -3459,16 +3501,21 @@ def strat2_api():
         nets30, trades = [], []
         n_entered = 0
         curve = [[] for _ in range(REV_TRACK_MIN)]
+        complete = []   # угоди з УСІМА 60 хвилинами: спільна когорта
         for r in rows:
             entered = 1 if fnum(r.get("entered"), 0) == 1 else 0
             costs = fnum(r.get("costs_pct"), 0.15) or 0.15
             net30 = None
             if entered:
                 n_entered += 1
+                row_vals = []
                 for i in range(REV_TRACK_MIN):
                     v = fnum(r.get(f"m{i+1}"))
+                    row_vals.append(v)
                     if v is not None:
                         curve[i].append(v - costs)
+                if all(v is not None for v in row_vals):
+                    complete.append([v - costs for v in row_vals])
                 n30 = fnum(r.get("m30"))
                 net30 = (n30 - costs) if n30 is not None else None
                 if net30 is not None: nets30.append(net30)
@@ -3503,6 +3550,14 @@ def strat2_api():
             # мають РІЗНУ кількість спостережень — без n крива порівнює
             # різні вибірки як одну (аудит v2.1 п.6)
             "curve_n": [len(c) for c in curve],
+            # СПІЛЬНА когорта: медіани лише по угодах, що мають УСІ 60
+            # хвилин — однакове n НЕ означає однакові події (аудит v2.3
+            # п.8: m1 з одних угод проти m2 з інших — не порівняння);
+            # тут кожна хвилина рахується з ТИХ САМИХ угод
+            "curve_common": ([_median([c[i] for c in complete])
+                              for i in range(REV_TRACK_MIN)]
+                             if complete else None),
+            "curve_common_n": len(complete),
             "trades": trades[-120:],
         }
 
@@ -3557,19 +3612,26 @@ def strat2_api():
         out["shadow_open"] = sum(1 for p in rev_open.values()
                                  if p["strategy"] == "_OUTCOME"
                                  and not p.get("done"))
-        # ok = справді придатні для F4: обрізаний профіль не рахується
-        # (інакше розбіжність "ok у хедері, а F4 мовчить" невидима)
+        # ok = справді придатні для F4 ЗАРАЗ: ті самі умови, що й гейт
+        # f4_ok (версія, без err, без truncated) — інакше хедер показує
+        # більше "придатних", ніж F4 реально допускає (аудит v2.3 п.9.5)
         out["profiles"] = {"total": len(wallet_profiles),
                            "ok": sum(1 for v in wallet_profiles.values()
                                      if isinstance(v, dict) and v.get("ok")
+                                     and v.get("v") == PROFILE_ALGO_V
+                                     and not v.get("err")
                                      and not v.get("truncated"))}
     # лічильники сигналів — лише події >=1% (ті, що можуть відкривати
     # стратегії); суб-порогові 0.5-1% рахуємо окремо (рев'ю v2.2)
     full_sigs = [s2 for s2 in sigs if (fnum(s2.get("move_3m_pct")) or 0) >= 1.0]
     out["signals_total"] = len(full_sigs)
     out["signals_sub"] = len(sigs) - len(full_sigs)
+    # вето = виміряний BTC, що заборонив; відсутні котирування — окремо
     out["btc_veto"] = sum(1 for s2 in full_sigs
-                          if fnum(s2.get("btc_ok"), 1) == 0)
+                          if fnum(s2.get("btc_move_pct")) is not None
+                          and fnum(s2.get("btc_ok"), 1) == 0)
+    out["btc_unknown"] = sum(1 for s2 in full_sigs
+                             if fnum(s2.get("btc_move_pct")) is None)
     out["outcomes_total"] = len(outs)   # дедуп + поточна версія
     # ── Перші common-cohort порівняння на СПІЛЬНІЙ outcome-стрічці ──
     # (аудит v2.2: дані збирались, але саме порівняння ніхто не рахував).
@@ -3586,11 +3648,19 @@ def strat2_api():
     def _mag(r):
         return fnum(r.get("move_3m_pct")) or 0
     full_out = [r for r in outs if _mag(r) >= 1.0]
+    # "вето" != "BTC не виміряли": btc_ok=0 ставиться і при відсутніх
+    # котируваннях (fail-closed для входу), але в дослідженні це ТРИ
+    # стани — PASS / VETO / UNKNOWN (аудит v2.3 п.6). Виміряність =
+    # непорожній btc_move_pct у рядку.
+    def _btc_measured(r):
+        return fnum(r.get("btc_move_pct")) is not None
     out["research"] = {
-        "btc_on":   _cohort([r for r in full_out
-                             if fnum(r.get("btc_ok")) == 1]),
-        "btc_off":  _cohort([r for r in full_out
-                             if fnum(r.get("btc_ok")) == 0]),
+        "btc_on":   _cohort([r for r in full_out if _btc_measured(r)
+                             and fnum(r.get("btc_ok")) == 1]),
+        "btc_off":  _cohort([r for r in full_out if _btc_measured(r)
+                             and fnum(r.get("btc_ok")) == 0]),
+        "btc_na":   _cohort([r for r in full_out
+                             if not _btc_measured(r)]),
         "mag_05_1": _cohort([r for r in outs if 0.5 <= _mag(r) < 1.0]),
         "mag_1_2":  _cohort([r for r in outs if 1.0 <= _mag(r) < 2.0]),
         "mag_2p":   _cohort([r for r in outs if _mag(r) >= 2.0]),

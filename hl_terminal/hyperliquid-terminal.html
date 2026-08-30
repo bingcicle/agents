@@ -649,8 +649,8 @@ function curveTip(ev,w,L,R){
   const box=ev.currentTarget.getBoundingClientRect();
   const x=(ev.clientX-box.left)*(w/box.width);
   let m=Math.round((x-L)/(w-L-R)*59)+1; m=Math.max(1,Math.min(60,m));
-  const v=st.curve[m-1];
-  const n=(st.curve_n||[])[m-1];
+  const v=(st._dispCurve||st.curve)[m-1];
+  const n=(st._dispN||st.curve_n||[])[m-1];
   const tip=document.getElementById('cTip'); if(!tip) return;
   if(v==null){tip.style.display='none';return;}
   tip.style.display='block';
@@ -680,7 +680,9 @@ function renderStrat(){
     if(any){
       rEl.style.display='';
       rEl.textContent='Спільна стрічка, медіана m30 net: BTC ok '+c(rs.btc_on)
-        +' vs вето '+c(rs.btc_off)+' · рух 0.5–1% '+c(rs.mag_05_1)
+        +' vs вето '+c(rs.btc_off)
+        +((rs.btc_na&&rs.btc_na.n)?' vs BTC н/д '+c(rs.btc_na):'')
+        +' · рух 0.5–1% '+c(rs.mag_05_1)
         +' · 1–2% '+c(rs.mag_1_2)+' · ≥2% '+c(rs.mag_2p)
         +' · штанга '+c(rs.shtanga_1)+' vs ні '+c(rs.shtanga_0)
         +(legacy?' · поза поточною версією: '+legacy:'');
@@ -776,7 +778,16 @@ function renderSDetail(){
       <div class="snum"><i>Win</i><b>${fWin==null?'—':fWin.toFixed(0)+'%'}</b></div>
       <div class="snum"><i>PnL</i><b class="${pctCls(fPnl)}">${fPnl==null?'—':(fPnl>=0?'+':'')+'$'+Math.abs(fPnl).toFixed(0)}</b></div>
     </div>`:''}
-    ${isRev?`<div class="sd-chart"><h4>Медіана net за хвилиною виходу (1–60) · вся вибірка</h4>${curveSvg(s.curve||[],s.curve_n||[])}<div class="ctip" id="cTip"></div></div>`:''}
+    ${isRev?(()=>{
+      // спільна когорта: кожна хвилина з ТИХ САМИХ угод — лише тоді
+      // "найкраща хвилина" є порівнянням, а не збігом різних вибірок
+      const useC=(s.curve_common_n||0)>=3&&s.curve_common;
+      s._dispCurve=useC?s.curve_common:(s.curve||[]);
+      s._dispN=useC?(s.curve_common||[]).map(()=>s.curve_common_n):(s.curve_n||[]);
+      const lbl=useC?('спільна когорта (усі 60 хв у кожній угоді) · n='+s.curve_common_n)
+                    :'вся вибірка · увага: різні хвилини = різні набори угод';
+      return `<div class="sd-chart"><h4>Медіана net за хвилиною виходу (1–60) · ${lbl}</h4>${curveSvg(s._dispCurve,s._dispN)}<div class="ctip" id="cTip"></div></div>`;
+    })():''}
     <div class="sfilters">
       ${fb('sht','all','всі')}${fb('sht','y','штанга')}${fb('sht','n','середина')}
       <span style="width:10px"></span>
