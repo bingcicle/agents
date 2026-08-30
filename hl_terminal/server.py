@@ -1034,9 +1034,21 @@ def run_alert_sender():
     while True:
         a = alert_queue.get()
         try:
-            send_close_alert(a)
+            ok = send_close_alert(a)
         except Exception as e:
             print(f"  [ALERT] sender err: {e}")
+            ok = False
+        if not ok:
+            # TG упав на всіх ретраях: алерт повертається В ЧЕРГУ, а не
+            # губиться (аудит v2.6 №3: hash уже в дедупі, повторної
+            # детекції не буде — доставка мусить доїхати звідси)
+            a["_attempts"] = a.get("_attempts", 0) + 1
+            if a["_attempts"] <= 10:
+                time.sleep(5)
+                alert_queue.put(a)
+            else:
+                print(f"  [ALERT] DROP після 10 спроб доставки: "
+                      f"{a['coin']} {a['addr'][:10]}…")
 
 # Лічильники з моменту старту. Дивитись: localhost:3000/status або щогодинний рядок у лозі
 stats = {
@@ -1380,6 +1392,10 @@ def run_prio_fetcher():
                         _prio_direct.popleft()
                     if len(_prio_direct) >= PRIO_DIRECT_PER_MIN:
                         prio_stats["dropped"] += 1
+                        # запиту НЕ БУЛО — кулдаун знімаємо, наступний
+                        # великий трейд кита тригерне знову (аудит
+                        # v2.6 №8: інакше 10 хв глухоти без перевірки)
+                        _prio_seen.pop(addr, None)
                         _prio_log(addr, coin0, pos_side, notional, depth0,
                                   thr, "budget", 0, "", via_proxy)
                         continue
@@ -1495,6 +1511,15 @@ def get_recent_market_fills(addr, coin, since_ms, side=None):
         if batch and len(batch) > 0 and not isinstance(batch[0], dict):
             raise APIError(f"userFillsByTime unexpected format for {addr[:10]}")
         batch = batch or []
+        # пагінація спирається на зростання time: якщо API раптом
+        # віддав інший порядок, "остання сторінка коротша" означала б
+        # НЕ "все прочитано" (аудит v2.6 №4в) — fail-closed
+        _tprev = 0
+        for _bf in batch:
+            _bt = _bf.get("time", 0)
+            if _bt < _tprev:
+                raise APIError("fills not ascending — unexpected order")
+            _tprev = _bt
         fresh = 0
         for f in batch:
             _k = (f.get("time"), f.get("tid"), f.get("hash"), f.get("oid"))
@@ -1528,8 +1553,31 @@ def get_recent_market_fills(addr, coin, since_ms, side=None):
     # Групуємо по HASH (транзакція)
     txs = {}  # hash -> {sz, cost, ts, oids, dir}
     for f in (fills or []):
+        # СТРОГА схема (аудит v2.6 №2): це головний детектор, битий
+        # рядок тут = НЕ "пропустимо", а "результату довіряти не можна"
+        # (fail-closed -> викликач пропускає цикл без алерту і без руху
+        # курсора/бази). Раніше: два hashless-філи по 3% клеїлись у
+        # фальшиву транзакцію 6%; crossed="false" (рядок) був truthy;
+        # px="inf" проходив доларовий поріг; філ без dir тихо зникав.
+        if "coin" not in f:
+            raise APIError("fill without coin")
         if f.get("coin") != coin: continue
-        is_taker = f.get("crossed", False)
+        for _k in ("time", "px", "sz", "dir", "hash", "crossed"):
+            if _k not in f:
+                raise APIError(f"fill missing '{_k}'")
+        _cr = f.get("crossed")
+        if not isinstance(_cr, bool):
+            raise APIError("fill 'crossed' is not bool")
+        if not f.get("hash"):
+            raise APIError("fill with empty hash")
+        try:
+            _vpx = float(f.get("px")); _vsz = float(f.get("sz"))
+        except (TypeError, ValueError):
+            raise APIError("fill px/sz not numeric")
+        if not (math.isfinite(_vpx) and math.isfinite(_vsz)) \
+           or _vpx <= 0 or _vsz <= 0:
+            raise APIError("fill px/sz non-finite or <=0")
+        is_taker = _cr
         d = f.get("dir", "")
         f_liq = bool(f.get("liquidation")) or ("Liquidat" in d)
         if side == "LONG":
@@ -1542,9 +1590,8 @@ def get_recent_market_fills(addr, coin, since_ms, side=None):
         if not ((is_taker or f_liq) and is_close and not is_twap):
             continue
         oid = f.get("oid")
-        h  = f.get("hash", "")
-        px = float(f.get("px", 0))
-        sz = float(f.get("sz", 0))
+        h  = f.get("hash")
+        px, sz = _vpx, _vsz   # уже валідовані finite > 0
         if h not in txs:
             txs[h] = {
                 "hash": h, "sz": 0.0, "cost": 0.0,
@@ -2007,6 +2054,8 @@ def check_position_changes(new_result, depth_snap):
         prev = dict(prev_positions)
 
     new_by_addr = {}  # addr -> {coin -> pos}
+    failed_keep = {}  # addr -> {coin -> СТАРА позиція}: пари, чиє
+                      # підтвердження впало — база НЕ рухається
     for coin, positions in new_result.items():
         if coin.upper() in COIN_BLACKLIST: continue
         d = depth_snap.get(coin)
@@ -2065,7 +2114,12 @@ def check_position_changes(new_result, depth_snap):
                 mfills = get_recent_market_fills(addr, coin, since_ms,
                                                  old.get("side"))
             except (RateLimited, APIError, Exception):
-                # Не можемо підтвердити — пропускаємо без алерту
+                # Не можемо підтвердити — пропускаємо без алерту, а БАЗУ
+                # пари лишаємо СТАРОЮ (аудит v2.6 №1: інакше "наступний
+                # sweep спробує знову" було брехнею — знімок безумовно
+                # затирав стару позицію, 100→80 ставало 80→80 і дельта
+                # губилась назавжди)
+                failed_keep.setdefault(addr, {})[coin] = old
                 continue
             if not mfills:
                 # Немає маркет fills — не шлемо алерт
@@ -2111,8 +2165,12 @@ def check_position_changes(new_result, depth_snap):
                     "fills":     [_f],
                 })
 
-    # Оновлюємо попередні позиції
+    # Оновлюємо попередні позиції; пари зі збоєм підтвердження
+    # зберігають СТАРУ базу — наступний прохід побачить дельту знову
     with tracking_lock:
+        for _fa, _fcoins in failed_keep.items():
+            for _fc, _fp in _fcoins.items():
+                new_by_addr.setdefault(_fa, {})[_fc] = _fp
         prev_positions = new_by_addr
 
     return alerts
@@ -2211,10 +2269,16 @@ def send_close_alert(a):
     # ── ОСТАННЯ ЛІНІЯ ЗАХИСТУ: без fills алерт не йде ──
     if not fills:
         print(f"  [BLOCKED][{now}] coin={a['coin']} side={a['side']} full_close={a['full_close']} — fills=0, НЕ відправляємо")
-        return
+        return True   # свідомий не-алерт, ретрай не потрібен
     _lat = time.time() * 1000 - max(f["ts"] for f in fills)
     print(f"  [ALERT][{now}] coin={a['coin']} side={a['side']} ratio={a['ratio']:.2f}x "
           f"close_pct={a['close_pct']*100:.1f}% fills={len(fills)} | блок→алерт {_lat:.0f}ms")
+    tg_result = tg_send(msg)
+    print(f"  [ALERT]  tg_sent={'ok' if tg_result else 'FAIL'}")
+    if not tg_result:
+        return False   # sender поверне в чергу; стата НЕ бреше
+    # історія і лічильник — ЛИШЕ після реальної доставки (аудит v2.6
+    # №3: "alerts_sent: 1" при невідправленому повідомленні)
     with alerts_lock:
         recent_alerts.insert(0, {
             "ts":        time.time(),
@@ -2228,8 +2292,7 @@ def send_close_alert(a):
         })
         del recent_alerts[50:]
     stats["alerts_sent"] += 1
-    tg_result = tg_send(msg)
-    print(f"  [ALERT]  tg_sent={'ok' if tg_result else 'FAIL'}")
+    return True
 
 
 # ═════════════════════════════════════════════════════════
@@ -2969,14 +3032,14 @@ F4_MIN_NOTIONAL  = 100_000.0
 F4_MAX_UNLOAD_S  = 300.0
 F4_CHUNK_PCT     = 0.05
 F4_CLAMP         = (60.0, 300.0)
-PROFILE_ALGO_V   = 5      # версія алгоритму профілів: старі записи без
+PROFILE_ALGO_V   = 6      # версія алгоритму профілів: старі записи без
                           # цієї позначки перераховуються (аудит v2.1 п.3;
                           # v3: boundary-safe пагінація; v4: епізод =
                           # позиція, malformed fail-closed, композитний
                           # tid-ключ; v5: flat-спліт — нова позиція
                           # будь-якого розміру після зливу в нуль,
                           # структурні поля обов'язкові)
-DATA_ALGO_V      = "2.6"  # версія логіки збору: трекер отримує її при
+DATA_ALGO_V      = "2.7"  # версія логіки збору: трекер отримує її при
                           # СТВОРЕННІ і несе у рядок; API рахує лише
                           # поточну версію (аудит v2.2: рестарт підписував
                           # старі трекери новою версією). При зміні
@@ -3083,6 +3146,9 @@ _prof_save_lock   = threading.Lock()
 # Межа чесності: черга в пам'яті, смерть процесу її втрачає.
 _sig_retry_lock   = threading.Lock()
 _sig_retry_q      = []   # [path, headers, row, fails]
+_sig_seq          = [0]  # лічильник унікальності sig_id: дві події в
+                         # одну мс з однаковим hash більше не колізують
+                         # (аудит v2.6 №9)
 
 try:
     with open(PROFILES_FILE) as _pf:
@@ -3182,7 +3248,10 @@ def run_px_poller():
                         px = float(v)
                     except (TypeError, ValueError):
                         continue
-                    if px <= 0: continue
+                    # NaN проходив крізь "px <= 0" (порівняння з nan =
+                    # False) і давав сигнал "+nan%" та отруєні медіани
+                    # аж до битого JSON у /strat2 (аудит v2.6 №7)
+                    if not math.isfinite(px) or px <= 0: continue
                     h = px_hist.setdefault(c, [])
                     h.append((now, px))
                     if len(h) > 50: del h[:len(h) - 50]
@@ -3290,7 +3359,8 @@ def rev_on_close(addr, coin, old, mfills, full_close):
     now = time.time()
     # унікальність: мс + монета + гаманець + hash транзакції-тригера
     _txh = str(mfills[-1].get("hash", ""))[2:10]
-    sig_id = f"{int(now * 1000)}-{coin}-{addr[2:8]}-{_txh}"
+    _sig_seq[0] += 1
+    sig_id = f"{int(now * 1000)}-{coin}-{addr[2:8]}-{_txh}-{_sig_seq[0]}"
     if below_threshold or src == "partial":
         strats = []   # 0.5-1% або часткове закриття: лише outcome-стрічка
     elif src == "vault":
@@ -3586,12 +3656,20 @@ def _build_profile(fills):
         # coin теж обов'язковий (аудит v2.5: без нього філ ліпився
         # у групу "?" і тихо псував чужі епізоди)
         if not all(k in f for k in ("dir", "crossed", "px", "sz",
-                                    "time", "startPosition", "coin")):
+                                    "time", "startPosition", "coin",
+                                    "hash")):
             bad += 1
+            continue
+        if not f.get("hash"):
+            bad += 1   # порожній hash: hashless-філи однієї мс клеїлись
+            continue   # у фальшивий "великий шматок" (аудит v2.6 №6)
+        _cr = f.get("crossed")
+        if not isinstance(_cr, bool):
+            bad += 1   # crossed="false" (рядок) — це БИТЕ, не maker
             continue
         d = str(f.get("dir", ""))
         if not (d.startswith("Close") or ">" in d): continue
-        if not f.get("crossed"): continue      # пасивні != тиск
+        if not _cr: continue                   # пасивні != тиск
         if f.get("twapId") is not None: continue
         try:
             t = int(f.get("time", 0)); px = float(f.get("px", 0))
@@ -3855,6 +3933,12 @@ def run_strat2_loop():
                     last = follow_last_close.get(p["key"], p["open_ts"])
                     if now - last >= p["timer"]:
                         reason = "silence"
+                        # ціни не було на дедлайні і вихід стався значно
+                        # пізніше таймера: маркуємо чесно — "1 хв тиші",
+                        # виконана на 5-й хвилині, це ІНША стратегія
+                        # (аудит v2.6 №11); аналіз фільтрує за reason
+                        if now - (last + p["timer"]) > 60:
+                            reason = "silence_late"
                 if reason:
                     p["done"] = 1
                     slip = _sim_slip(p.get("depth") or 0)
@@ -3921,6 +4005,7 @@ def strat2_api():
     import csv as _csv
 
     quarantined = [0]
+    read_errors = [0]
 
     def read(path):
         # ЧЕСНЕ читання: рядок з іншою кількістю полів, ніж у заголовку
@@ -3947,14 +4032,23 @@ def strat2_api():
                         continue
                     rows2.append(dict(zip(hdr, rr)))
                 return rows2
-        except Exception:
+        except FileNotFoundError:
+            return []   # файла ще немає — норма першого запуску
+        except Exception as e:
+            # битий файл != "нуль угод": рахуємо і логуємо, щоб дашборд
+            # не показував тихий нуль замість діагнозу (аудит v2.6)
+            read_errors[0] += 1
+            print(f"  [STRAT] read {os.path.basename(path)}: {e}")
             return []
 
     def fnum(x, d=None):
         try:
-            return float(x)
+            v = float(x)
         except (TypeError, ValueError):
             return d
+        # non-finite з битого CSV труїть медіани і ламає JSON.parse
+        # у браузера (bare NaN — невалідний JSON; аудит v2.6 №7)
+        return v if math.isfinite(v) else d
 
     def dedup(rows, keyf):
         # дублі можливі після краху між записом CSV і save_state
@@ -3994,7 +4088,8 @@ def strat2_api():
                               + len(outs) + len(fouts))
     out = {"updated": now, "strategies": {}, "desc": STRAT2_DESC,
            "titles": STRAT2_TITLES,
-           "legacy_rows": legacy_rows, "quarantined": quarantined[0]}
+           "legacy_rows": legacy_rows, "quarantined": quarantined[0],
+           "read_errors": read_errors[0]}
 
     for st in ("R1_загальний", "R2_breakout", "R3_великі", "R4_великий",
                "R5_дуже", "R6_волт"):
