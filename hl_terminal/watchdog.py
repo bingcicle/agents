@@ -12,19 +12,24 @@ ST = os.path.join(DATA, "watchdog_state.json")
 
 
 def tg(text):
+    """True лише коли Telegram РЕАЛЬНО прийняв повідомлення — інакше
+    стан 'вже повідомив' не фіксується і наступний тик повторить
+    (аудит v2.5: алерт, що впав разом із TG, губився назавжди)."""
     try:
         tok = open(os.path.join(DATA, "tg_token.txt")).read().strip()
         chat = json.load(open(os.path.join(DATA, "tg_chat.json")))["chat_id"]
     except Exception:
-        return   # без токена/чату повідомляти нікуди
+        return False   # без токена/чату повідомляти нікуди
     try:
-        urllib.request.urlopen(urllib.request.Request(
-            f"https://api.telegram.org/bot{tok}/sendMessage",
-            data=urllib.parse.urlencode(
-                {"chat_id": chat, "text": "🐕 WATCHDOG: " + text}).encode()),
-            timeout=10)
+        with urllib.request.urlopen(urllib.request.Request(
+                f"https://api.telegram.org/bot{tok}/sendMessage",
+                data=urllib.parse.urlencode(
+                    {"chat_id": chat,
+                     "text": "🐕 WATCHDOG: " + text}).encode()),
+                timeout=10) as r:
+            return r.status == 200
     except Exception:
-        pass   # TG ліг — наступний тик спробує знову
+        return False   # TG ліг — наступний тик спробує знову
 
 
 prev = {}
@@ -87,8 +92,13 @@ try:
 except Exception:
     pass
 
+sent_ok = True
 for a in alerts:
-    tg(a)
+    sent_ok = tg(a) and sent_ok
+if alerts and not sent_ok:
+    # відправка впала: НЕ фіксуємо новий стан — наступний тик побачить
+    # ті самі умови і повторить алерт, замість "запам'ятав і мовчу"
+    cur = prev
 try:
     json.dump(cur, open(ST, "w"))
 except Exception:

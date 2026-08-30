@@ -9,6 +9,7 @@ import threading
 import socket
 import ssl
 import struct
+import math
 import queue
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -1119,7 +1120,7 @@ prio_stats   = {"triggers": 0, "added": 0, "dropped": 0, "errors": 0}
 PRIO_CSV     = os.path.join(DATA_DIR, "prio_fetch.csv")
 PRIO_HEADERS = ["date", "addr", "trigger_coin", "pos_side", "notional_usd",
                 "depth_usd", "threshold_usd", "result", "best_ratio",
-                "coins_added", "via_proxy"]
+                "coins_added", "via_proxy", "eol"]
 
 def _prio_note(addr, coin, taker_side, t):
     """WS-потік: великий трейд НЕвідомої адреси -> у чергу перевірки.
@@ -1406,6 +1407,11 @@ def run_prio_fetcher():
                               f"{PRIO_DIRECT_PER_MIN}/хв, ретрай проксі "
                               f"за 30 хв")
                 print(f"  [PRIO] {addr[:10]}… перевірка впала: {e}")
+                with _prio_lock:
+                    # transient збій НЕ має глушити адресу на 10 хв
+                    # (аудит v2.5): наступний великий трейд цього кита
+                    # тригерне перевірку знову
+                    _prio_seen.pop(addr, None)
                 _prio_log(addr, coin0, pos_side, notional, depth0, thr,
                           "error", 0, "", via_proxy)
                 continue
@@ -1481,7 +1487,8 @@ def get_recent_market_fills(addr, coin, since_ms, side=None):
     fills = []
     _seen = set()
     _start = since_ms
-    for _page in range(5):
+    _complete = False
+    for _page in range(8):
         batch = hl_post({"type": "userFillsByTime",
                          "user": addr,
                          "startTime": _start})
@@ -1497,13 +1504,26 @@ def get_recent_market_fills(addr, coin, since_ms, side=None):
             fills.append(f)
             fresh += 1
         if len(batch) < 2000:
+            _complete = True
             break
         if fresh == 0:
-            # 2000+ філів в одну мілісекунду: далі не просунемось
+            # 2000+ філів в одну мілісекунду: хвіст ФІЗИЧНО недоступний
+            # через API — беремо, що є (fail-closed тут дав би вічний
+            # клінч: since_ms не зрушить ніколи)
             print(f"  [FILLS] {addr[:10]}: 2000+ філів в одну мс, "
                   f"хвіст вікна недоступний")
+            _complete = True
             break
         _start = max(f.get("time", 0) for f in batch)
+    if not _complete:
+        # 8 повних сторінок і дані ще Є: результат НЕПОВНИЙ. Прийняти
+        # його "як є" означало б підтверджувати закриття огризком
+        # історії (аудит v2.5 №1: 5 сторінок обривались мовчки).
+        # Fail-closed: помилка -> викликач пропускає цикл БЕЗ алерту і
+        # БЕЗ руху курсора, наступний sweep спробує знову.
+        print(f"  [FILLS] {addr[:10]}: вікно >16k філів, НЕ повне — "
+              f"пропускаю цикл (fail-closed)")
+        raise APIError(f"fills window incomplete for {addr[:10]}")
 
     # Групуємо по HASH (транзакція)
     txs = {}  # hash -> {sz, cost, ts, oids, dir}
@@ -2050,6 +2070,12 @@ def check_position_changes(new_result, depth_snap):
             if not mfills:
                 # Немає маркет fills — не шлемо алерт
                 continue
+            # Курсор рухаємо ОДРАЗУ після підтвердження, ЯК У REALTIME
+            # (аудит v2.5 №2): інакше філ 4.9%, відхилений порогом,
+            # лишався ПЕРЕД курсором і на наступній перевірці (база вже
+            # менша: 4.9/96=5.1%) породжував хибний алерт СТАРОЮ
+            # транзакцією
+            fill_cursor[key_ac] = max(f["ts"] for f in mfills)
             for _f in mfills:   # фліп: закритого не більше за позицію
                 if ">" in _f.get("dir", "") and _f["sz"] > old["size"]:
                     _f["sz"] = old["size"]
@@ -2064,7 +2090,6 @@ def check_position_changes(new_result, depth_snap):
             if not big_txs or (old.get("ratio") or 0) < 2.0 \
                or (old.get("val") or 0) < MIN_POS_USD:
                 continue
-            fill_cursor[key_ac] = max(f["ts"] for f in mfills)
 
             # окреме повідомлення на кожну достатню транзакцію;
             # дублі з realtime знімає LRU за hash транзакції
@@ -2951,7 +2976,7 @@ PROFILE_ALGO_V   = 5      # версія алгоритму профілів: с
                           # tid-ключ; v5: flat-спліт — нова позиція
                           # будь-якого розміру після зливу в нуль,
                           # структурні поля обов'язкові)
-DATA_ALGO_V      = "2.5"  # версія логіки збору: трекер отримує її при
+DATA_ALGO_V      = "2.6"  # версія логіки збору: трекер отримує її при
                           # СТВОРЕННІ і несе у рядок; API рахує лише
                           # поточну версію (аудит v2.2: рестарт підписував
                           # старі трекери новою версією). При зміні
@@ -3003,19 +3028,19 @@ STRAT2_DESC = {
 REV_SIG_HEADERS = ["sig_id", "date", "coin", "fade_side", "whale_addr", "src",
                    "px", "move_3m_pct", "dur_s", "sum_usd", "usd_s", "ratio",
                    "shtanga", "vault", "hour", "btc_move_pct", "btc_ok",
-                   "depth_usd", "opened", "algo_v"]
+                   "depth_usd", "opened", "algo_v", "eol"]
 REV_HEADERS = (["sig_id", "strategy", "date", "coin", "our_side", "whale_addr",
                 "src", "detect_px", "entry_px", "entered", "move_3m_pct",
                 "dur_s", "sum_usd", "usd_s", "ratio", "shtanga", "vault",
                 "hour", "btc_move_pct", "depth_usd", "costs_pct", "peak_pct",
                 "trough_pct", "algo_v"]
-               + [f"m{i}" for i in range(1, REV_TRACK_MIN + 1)])
+               + [f"m{i}" for i in range(1, REV_TRACK_MIN + 1)] + ["eol"])
 FOLLOW_HEADERS = ["date_open", "date_close", "strategy", "coin", "our_side",
                   "whale_addr", "entry_px", "exit_px", "exit_reason", "hold_s",
                   "gross_pct", "costs_pct", "net_pct", "peak_pct", "trough_pct",
                   "tx_pct_of_pos", "tx_usd", "ratio", "pos_usd", "vault",
                   "hour", "btc_move_pct", "profile_gap_s", "algo_v",
-                  "trade_id"]
+                  "trade_id", "eol"]
 # Тіньова хвилинна стрічка FOLLOW-входів: m1..m60 у НАШОМУ напрямку від
 # ціни входу, незалежно від правил виходу F1-F4 — щоб крива "яка хвилина
 # виходу найкраща" існувала й для follow (запит користувача 30.08)
@@ -3025,7 +3050,7 @@ FOLLOW_OUT_HEADERS = (["fo_id", "date", "coin", "our_side", "whale_addr",
                        "pos_usd", "vault", "hour", "btc_move_pct",
                        "depth_usd", "costs_pct", "peak_pct", "trough_pct",
                        "algo_v"]
-                      + [f"m{i}" for i in range(1, REV_TRACK_MIN + 1)])
+                      + [f"m{i}" for i in range(1, REV_TRACK_MIN + 1)] + ["eol"])
 
 # OUTCOME-стрічка: шлях ціни КОЖНОГО сигналу від детекту, незалежно від
 # BTC-вето/зайнятості/breakout — спільна база для чесного порівняння
@@ -3036,7 +3061,7 @@ REV_OUT_HEADERS = (["sig_id", "date", "coin", "fade_side", "whale_addr",
                     "usd_s", "ratio", "shtanga", "vault", "hour",
                     "btc_move_pct", "btc_ok", "would_open", "depth_usd",
                     "costs_pct", "peak_pct", "trough_pct", "algo_v"]
-                   + [f"m{i}" for i in range(1, REV_TRACK_MIN + 1)])
+                   + [f"m{i}" for i in range(1, REV_TRACK_MIN + 1)] + ["eol"])
 
 strat2_lock       = threading.RLock()   # RLock: захист від self-deadlock
                                         # (аудит 29.08: Lock завис у F4)
@@ -3106,6 +3131,14 @@ def _strat_csv_append(path, headers, row):
                     print(f"  [STRAT] {os.path.basename(path)}: старий формат "
                           f"-> {os.path.basename(legacy)}")
                 # first == "": порожній файл — допишемо заголовок
+            # EOL-вартовий: обрив запису ВСЕРЕДИНІ останнього поля
+            # лишає рядок з правильною кількістю колонок, але битим хвостом
+            # ("trade-123" замість "trade-123456") — підрахунок колонок
+            # такого не ловить (аудит v2.5). Константа "^" в останній
+            # колонці: обірваний рядок її втрачає, читання карантинить.
+            if headers and headers[-1] == "eol" \
+               and len(row) == len(headers) - 1:
+                row = list(row) + ["^"]
             buf = io.StringIO()
             w = _csv.writer(buf)
             if need_header: w.writerow(headers)
@@ -3194,6 +3227,12 @@ def rev_on_close(addr, coin, old, mfills, full_close):
     # (обговорення 30.08; досі такі події не збирались взагалі)
     part_shadow = (not full_close
                    and sum(f["sz"] for f in mfills) >= base_sz * PART_OUT_PCT)
+    # СВІДОМИЙ виняток (аудит v2.5 №4): ПОВНЕ закриття — сигнал
+    # незалежно від розміру окремих транзакцій ($100k, злиті 20x$2.5k,
+    # це той самий "кит пішов", що і одним шотом; перевірені 40
+    # історичних епізодів рахувались саме так). MIN_TX_USD ріже дрібні
+    # ТРИГЕРИ (часткові шматки), а не спосіб нарізки повного зливу;
+    # сам розмір події гейтить MIN_POS_USD вище.
     if not (full_close or big_any or part_shadow):
         return   # і не повне, і без шматка >=5% — сигналу точно немає
     vault = is_vault(addr)   # мережа лише тут (кешується назавжди)
@@ -3543,9 +3582,11 @@ def _build_profile(fills):
     for f in fills:
         # структурні поля перевіряються ДО класифікації: філ без dir чи
         # crossed — це НЕ "не-close" і НЕ "maker", це БИТИЙ запис
-        # (аудит v2.4 п.3: раніше він тихо зникав як "пасивний")
+        # (аудит v2.4 п.3: раніше він тихо зникав як "пасивний");
+        # coin теж обов'язковий (аудит v2.5: без нього філ ліпився
+        # у групу "?" і тихо псував чужі епізоди)
         if not all(k in f for k in ("dir", "crossed", "px", "sz",
-                                    "time", "startPosition")):
+                                    "time", "startPosition", "coin")):
             bad += 1
             continue
         d = str(f.get("dir", ""))
@@ -3559,6 +3600,12 @@ def _build_profile(fills):
         except (TypeError, ValueError):
             bad += 1   # биті значення = невідомий шматок історії, а не
             continue   # "його не було" (аудит v2.3 п.5.2)
+        # NaN проходив крізь "px <= 0" (усі порівняння з nan = False) і
+        # труїв агрегати — тепер finite обов'язковий (аудит v2.5)
+        if not (math.isfinite(px) and math.isfinite(sz)
+                and math.isfinite(sp)):
+            bad += 1
+            continue
         if t <= 0 or px <= 0 or sz <= 0:
             bad += 1
             continue
@@ -3887,9 +3934,15 @@ def strat2_api():
                 hdr = next(rd, None)
                 if not hdr:
                     return []
+                has_eol = bool(hdr) and hdr[-1] == "eol"
                 rows2 = []
                 for rr in rd:
                     if len(rr) != len(hdr):
+                        quarantined[0] += 1
+                        continue
+                    if has_eol and rr[-1] != "^":
+                        # обрив усередині останнього поля: колонок
+                        # стільки ж, але вартовий загублений
                         quarantined[0] += 1
                         continue
                     rows2.append(dict(zip(hdr, rr)))

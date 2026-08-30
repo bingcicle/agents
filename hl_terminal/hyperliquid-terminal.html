@@ -741,7 +741,10 @@ function renderSDetail(){
   if(!sSel||!sData.strategies[sSel]){box.style.display='none';return;}
   const s=sData.strategies[sSel];
   let trades=(s.trades||[]).slice().reverse();
-  if(fSht!=='all') trades=trades.filter(t=>(t.shtanga??null)===(fSht==='y'?1:0));
+  // follow-угоди не мають поля shtanga: фільтр лише для реверсів,
+  // інакше залишковий вибір зі R-картки спустошував F-таблицю
+  if(fSht!=='all'&&s.kind==='rev')
+    trades=trades.filter(t=>(t.shtanga??null)===(fSht==='y'?1:0));
   if(fVault!=='all') trades=trades.filter(t=>(t.vault??0)===(fVault==='y'?1:0));
   const fb=(k,v,lbl)=>`<button class="fbtn${(k==='sht'?fSht:fVault)===v?' on':''}" onclick="setF('${k}','${v}')">${lbl}</button>`;
   const isRev=s.kind==='rev';
@@ -836,14 +839,16 @@ function renderSDetail(){
       const useC=(src.curve_common_n||0)>=3&&src.curve_common;
       s._dispCurve=useC?src.curve_common:(src.curve||[]);
       s._dispN=useC?(src.curve_common||[]).map(()=>src.curve_common_n):(src.curve_n||[]);
-      const lbl=(isRev?'':'спільна стрічка follow-входів · ')
+      // ЧЕСНИЙ підпис для F: стрічка — ВСІ follow-сигнали, не входи
+      // саме цієї стратегії (F4 відкривається на підмножині — його
+      // власна вибірка інша; аудит v2.5 №3)
+      const lbl=(isRev?'':'усі follow-сигнали, НЕ лише входи цієї стратегії · ')
         +(useC?('спільна когорта (усі 60 хв у кожній угоді) · n='+src.curve_common_n)
               :'вся вибірка · увага: різні хвилини = різні набори угод');
       return `<div class="sd-chart"><h4>Медіана net за хвилиною виходу (1–60) · ${lbl}</h4>${curveSvg(s._dispCurve,s._dispN)}<div class="ctip" id="cTip"></div></div>`;
     })()}
     <div class="sfilters">
-      ${fb('sht','all','всі')}${fb('sht','y','штанга')}${fb('sht','n','середина')}
-      <span style="width:10px"></span>
+      ${isRev?fb('sht','all','всі')+fb('sht','y','штанга')+fb('sht','n','середина')+'<span style="width:10px"></span>':''}
       ${fb('vault','all','всі')}${fb('vault','y','волти')}${fb('vault','n','без волтів')}
       <span style="width:10px"></span>
       <button class="fbtn${sMore?' on':''}" onclick="setMore()">детальніше</button>
