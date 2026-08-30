@@ -746,7 +746,7 @@ function renderSDetail(){
   const fb=(k,v,lbl)=>`<button class="fbtn${(k==='sht'?fSht:fVault)===v?' on':''}" onclick="setF('${k}','${v}')">${lbl}</button>`;
   const isRev=s.kind==='rev';
   // колонки як дані: спільний механізм для сортування і "детальніше"
-  const C=(k,l,f,srt)=>({k,l,f,srt:srt!==false});
+  const C=(k,l,f,cls)=>({k,l,f,cls});
   const fmt={pct:v=>v!=null?pctTxt(v):'—',
              sec:v=>v!=null?v.toFixed(0)+'с':'—',
              p2:v=>v!=null?v.toFixed(2)+'%':'—',
@@ -755,7 +755,9 @@ function renderSDetail(){
   let cols=[
     C('date','Дата',t=>t.date||''),
     C('coin','Монета',t=>`<span class="side ${t.side==='LONG'?'L':'S'}">${t.side||''}</span> ${t.coin||''}${t.vault?' 🏦':''}`),
-    C('net30','Net'+(isRev?' m30':''),t=>t.entered===0?'<span class="dim">пропуск</span>':pctTxt(t.net30)),
+    C('net30','Net'+(isRev?' m30':''),
+      t=>t.entered===0?'<span class="dim">пропуск</span>':pctTxt(t.net30),
+      t=>t.entered===0?'':pctCls(t.net30)),
     C('peak','Peak',t=>fmt.pct(t.peak)),
     C('trough','Trough',t=>fmt.pct(t.trough)),
   ];
@@ -777,21 +779,21 @@ function renderSDetail(){
   }
   cols.push(C('hour','Год',t=>t.hour!=null?String(t.hour).padStart(2,'0')+':00':'—'),
             C('btc','BTC 3хв',t=>fmt.pct(t.btc)));
-  // сортування: клік по заголовку; null-и завжди в кінці
+  // сортування: клік по заголовку; ↓ = спадання; null-и завжди в кінці
   if(sSortK){
     const nul=sSortD===-1?-Infinity:Infinity;
     trades.sort((a,b)=>{
       let x=a[sSortK],y=b[sSortK];
       if(typeof x==='string'||typeof y==='string')
-        return sSortD*String(y??'').localeCompare(String(x??''));
+        return sSortD*String(x??'').localeCompare(String(y??''));
       x=(x==null||isNaN(x))?nul:x; y=(y==null||isNaN(y))?nul:y;
-      return sSortD*(y-x);});
+      return sSortD*(x-y);});
   }
   let rows='';
   for(const t of trades.slice(0,150)){
-    rows+='<tr>'+cols.map((c,i)=>`<td class="${i>2?'dim':''}"${c.k==='coin'?' style="text-align:center"':''}>${c.f(t)}</td>`).join('')+'</tr>';
+    rows+='<tr>'+cols.map((c,i)=>`<td class="${c.cls?c.cls(t):(i>2?'dim':'')}"${c.k==='coin'?' style="text-align:center"':''}>${c.f(t)}</td>`).join('')+'</tr>';
   }
-  const thead=cols.map(c=>`<th${c.srt?` class="thsort${sSortK===c.k?' on':''}" onclick="setSort('${c.k}')" title="сортувати"`:''}>${c.l}${sSortK===c.k?(sSortD===-1?' ↓':' ↑'):''}</th>`).join('');
+  const thead=cols.map(c=>`<th class="thsort${sSortK===c.k?' on':''}" onclick="setSort('${c.k}')" title="сортувати">${c.l}${sSortK===c.k?(sSortD===-1?' ↓':' ↑'):''}</th>`).join('');
   // Метрики зрізу рахуємо з ВІДФІЛЬТРОВАНИХ угод — інакше таблиця
   // показує підгрупу, а числа лишаються від усієї вибірки (аудит п.11).
   // Зріз обмежений переданими останніми угодами (до 120) — так і підписуємо.

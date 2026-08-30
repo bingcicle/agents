@@ -483,17 +483,19 @@ if REST_PROXY:
         urllib.request.ProxyHandler({"https": "http://" + REST_PROXY,
                                      "http":  "http://" + REST_PROXY}))
 
-def hl_post_prio(body, retries=2):
+def hl_post_prio(body, retries=2, direct=False):
     """hl_post пріоритетного каналу: через REST_PROXY, щоб перевірки
-    невідомих китів не їли ліміт основної IP. Без проксі — прямий
-    запит (викликач сам тримає жорсткіший кап PRIO_DIRECT_PER_MIN)."""
+    невідомих китів не їли ліміт основної IP. direct=True (або без
+    проксі) — прямий запит; викликач тоді сам тримає жорсткіший кап
+    PRIO_DIRECT_PER_MIN."""
     data = json.dumps(body).encode()
     req = urllib.request.Request(
         "https://api.hyperliquid.xyz/info", data=data,
         headers={"Content-Type": "application/json",
                  "User-Agent": "Mozilla/5.0"},
         method="POST")
-    opener = _prio_opener.open if _prio_opener else urllib.request.urlopen
+    opener = (urllib.request.urlopen
+              if direct or not _prio_opener else _prio_opener.open)
     last_was_429 = False
     for attempt in range(retries):
         try:
@@ -509,6 +511,9 @@ def hl_post_prio(body, retries=2):
         raise RateLimited("prio 429 after retries")
     raise APIError("prio max retries")
 
+def _hl_post_prio_direct(body, retries=2):
+    return hl_post_prio(body, retries, direct=True)
+
 def _prio_probe():
     """Разова перевірка проксі на старті: одразу видно в лозі, чи канал
     живий, а не через годину мовчазних збоїв."""
@@ -523,7 +528,9 @@ def _prio_probe():
               f"{'OK' if ok else 'відповідь дивна: ' + str(r)[:80]}")
     except Exception as e:
         print(f"  [PRIO] проксі {REST_PROXY.split('@')[-1]} НЕ працює: {e} "
-              f"— перевірки підуть напряму з капом {PRIO_DIRECT_PER_MIN}/хв")
+              f"— після 3 збоїв поспіль воркер сам перемкнеться на прямий "
+              f"канал ({PRIO_DIRECT_PER_MIN}/хв) і пробуватиме проксі "
+              f"кожні 30 хв")
 
 # ── LEADERBOARD ──────────────────────────────────────────
 def load_leaderboard():
@@ -1107,6 +1114,7 @@ _prio_event  = threading.Event()
 _prio_seen   = {}        # addr -> ts останнього тригера (кулдаун)
 _prio_minute = deque()   # ts тригерів за останню хвилину (стеля)
 _prio_direct = deque()   # ts прямих (без проксі) запитів за хвилину
+_prio_proxy_state = {"streak": 0, "dead_since": 0.0}  # фолбек мертвої проксі
 prio_stats   = {"triggers": 0, "added": 0, "dropped": 0, "errors": 0}
 PRIO_CSV     = os.path.join(DATA_DIR, "prio_fetch.csv")
 PRIO_HEADERS = ["date", "addr", "trigger_coin", "pos_side", "notional_usd",
@@ -1357,6 +1365,13 @@ def run_prio_fetcher():
                     break
                 addr, coin0, pos_side, notional, depth0, thr = _prio_q.popleft()
             via_proxy = 1 if REST_PROXY else 0
+            if via_proxy and _prio_proxy_state["dead_since"]:
+                # проксі визнана мертвою: працюємо напряму, але раз на
+                # 30 хв ОДИН запит іде через проксі як проба оживлення
+                if time.time() - _prio_proxy_state["dead_since"] >= 1800:
+                    _prio_proxy_state["dead_since"] = time.time()  # re-arm
+                else:
+                    via_proxy = 0
             if not via_proxy:
                 now = time.time()
                 with _prio_lock:
@@ -1369,15 +1384,31 @@ def run_prio_fetcher():
                         continue
                     _prio_direct.append(now)
             best_ratio, added = 0.0, []
+            now_ms = int(time.time() * 1000)   # курсор = час ДО запиту
             try:
-                positions = check_one_wallet(addr, post=hl_post_prio)
+                positions = check_one_wallet(
+                    addr, post=(hl_post_prio if via_proxy
+                                else _hl_post_prio_direct))
+                if via_proxy and _prio_proxy_state["streak"]:
+                    _prio_proxy_state["streak"] = 0
+                    if _prio_proxy_state["dead_since"]:
+                        _prio_proxy_state["dead_since"] = 0.0
+                        print("  [PRIO] проксі ожила — повертаюсь на неї")
             except Exception as e:
                 prio_stats["errors"] += 1
+                if via_proxy:
+                    _prio_proxy_state["streak"] += 1
+                    if (_prio_proxy_state["streak"] >= 3
+                            and not _prio_proxy_state["dead_since"]):
+                        _prio_proxy_state["dead_since"] = time.time()
+                        print("  [PRIO] проксі мертва (3 збої поспіль) — "
+                              f"перемикаюсь на прямий канал "
+                              f"{PRIO_DIRECT_PER_MIN}/хв, ретрай проксі "
+                              f"за 30 хв")
                 print(f"  [PRIO] {addr[:10]}… перевірка впала: {e}")
                 _prio_log(addr, coin0, pos_side, notional, depth0, thr,
                           "error", 0, "", via_proxy)
                 continue
-            now_ms = int(time.time() * 1000)
             for c, p in positions.items():
                 if c.upper() in COIN_BLACKLIST:
                     continue
@@ -1387,23 +1418,27 @@ def run_prio_fetcher():
                 if ratio < 2.0:
                     continue
                 with watchlist_lock:
-                    known = c in watchlist.get(addr, {})
+                    if c in watchlist.get(addr, {}):
+                        # ВІДОМУ пару НЕ чіпаємо: перезапис size/side
+                        # обходив би конвеєр підтвердження монітора —
+                        # незвірене закриття 30% губилось би назавжди,
+                        # а перезаписаний side ховав фліп (рев'ю v2.5 п.1)
+                        continue
                     watchlist.setdefault(addr, {})[c] = {
                         "size": p["size"], "val": p["val"],
                         "side": p["side"], "ratio": ratio,
                         "entry": p["entry"], "liq": p.get("liq", 0),
                         "upd": time.time()}
-                    if not known:
-                        k = f"{addr}:{c}"
-                        # ініціалізація нової пари ЯК У СКАНА: все, що
-                        # сталося до цього моменту, вже враховано в базі
-                        # і не має права підтверджувати майбутні дельти
-                        sent_alerts.discard(k)
-                        close_episodes.pop(k, None)
-                        delta_seen.pop(k, None)
-                        fill_cursor[k] = max(fill_cursor.get(k, 0), now_ms)
-                if not known:
-                    added.append(c)
+                    k = f"{addr}:{c}"
+                    # ініціалізація нової пари ЯК У СКАНА: курсор на час
+                    # ДО запиту (now_ms) — філ, що впав у вікно RTT, не
+                    # опиниться позаду курсора (рев'ю v2.5 п.8, той
+                    # самий урок, що й у скана)
+                    sent_alerts.discard(k)
+                    close_episodes.pop(k, None)
+                    delta_seen.pop(k, None)
+                    fill_cursor[k] = max(fill_cursor.get(k, 0), now_ms)
+                added.append(c)
             if added:
                 prio_stats["added"] += 1
                 result = "added"
@@ -2623,6 +2658,12 @@ def _prune_leaks():
         fast_last.pop(k, None)
     for k in [k for k, ts in list(delta_seen.items()) if ts < now_ - 3600]:
         delta_seen.pop(k, None)
+    # кулдаун-кеш пріоритетного фетчу: запис старший за кулдаун — зайвий
+    # (рев'ю v2.5 п.7: ~14k адрес/добу текли б вічно)
+    with _prio_lock:
+        for k in [k for k, ts in list(_prio_seen.items())
+                  if ts < now_ - PRIO_COOLDOWN_S]:
+            _prio_seen.pop(k, None)
     # Курсори АКТИВНИХ пар не чистимо ніколи: після годинного простою
     # монітора видалення курсора відкочувало б пару на 5-хвилинне вікно
     # і губило б хвіст історії, який курсор якраз тримає
@@ -3143,7 +3184,10 @@ def rev_on_close(addr, coin, old, mfills, full_close):
     # хард-фільтр: позиція < $50k — не сигнал і не статистика (кейс MET)
     if (old.get("val") or 0) < MIN_POS_USD: return
     base_sz = old.get("size") or 1e-12
-    big_any = any(f["sz"] >= base_sz * VAULT_PART_PCT for f in mfills)
+    # шматок волта: >=5% позиції І >= $5k (той самий доларовий поріг,
+    # що в алертах і follow — рев'ю v2.5 п.6: 5% від $60k = $3k пил)
+    big_any = any(f["sz"] >= base_sz * VAULT_PART_PCT
+                  and f["px"] * f["sz"] >= MIN_TX_USD for f in mfills)
     # ЧАСТКОВЕ закриття >=30% позиції: лише ТІНЬОВА outcome-стрічка
     # (src=partial, стратегії не відкриваються) — інакше ми ніколи не
     # дізнаємось, чи працює реверс після великого часткового зливу
@@ -3153,14 +3197,26 @@ def rev_on_close(addr, coin, old, mfills, full_close):
     if not (full_close or big_any or part_shadow):
         return   # і не повне, і без шматка >=5% — сигналу точно немає
     vault = is_vault(addr)   # мережа лише тут (кешується назавжди)
-    if vault:
+    # ВОЛТ = реальна стратегія ЛИШЕ за старим гейтом (повне АБО шматок
+    # >=5%); партіал-30% без великого шматка — тінь src=partial і для
+    # волта (рев'ю v2.5 п.3: інакше R6 тихо отримував новий клас подій)
+    if vault and (full_close or big_any):
         src = "vault"
-    elif full_close:
+    elif not vault and full_close:
         src = "wallet"
     elif part_shadow:
         src = "partial"
     else:
         return
+    if src == "partial":
+        # серійний дедуп (рев'ю v2.5 п.9): поки по парі кит:монета вже
+        # трекається активний partial-_OUTCOME, нові батчі того самого
+        # розвантаження не породжують нові корельовані рядки
+        with strat2_lock:
+            if any(p.get("src") == "partial" and p.get("coin") == coin
+                   and p.get("addr") == addr and not p.get("done")
+                   for p in rev_open.values()):
+                return
     side = old.get("side")
     if side not in ("LONG", "SHORT"): return
     px_now = _px_now(coin)
