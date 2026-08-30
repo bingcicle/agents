@@ -185,12 +185,12 @@ def tg_send(text):
     """3 спроби з паузами: алерт — це продукт системи, разовий збій
     мережі чи Telegram не має право його з'їсти назавжди."""
     if not TG_TOKEN:
-        return False
+        return None   # нема токена — постійно, ретрай безглуздий
     with tg_chat_lock:
         chat_id = TG_CHAT_ID
     if not chat_id:
         print(f"  [TG] No chat_id yet. Message: {text[:60]}")
-        return False
+        return None   # до /start доставляти нікуди — не ретраїмо
     data = json.dumps({"chat_id": chat_id, "text": text,
                        "parse_mode": "HTML", "disable_web_page_preview": True}).encode()
     for attempt in range(3):
@@ -215,7 +215,11 @@ def tg_send(text):
                 pass
             print(f"  [TG] HTTP {e.code} (спроба {attempt+1}/3): {_body}")
             if e.code in (400, 403):
-                break   # постійна помилка — ретрай не допоможе
+                # постійна помилка (битий HTML / бот заблокований):
+                # None = «не ретраїти» — sender дропне одразу, а не
+                # молотитиме 11 приречених циклів (рев'ю v2.7 №2)
+                stats["tg_errors"] = stats.get("tg_errors", 0) + 1
+                return None
         except Exception as e:
             print(f"  [TG] Send error (спроба {attempt+1}/3): {e}")
         if attempt < 2:
@@ -1033,22 +1037,30 @@ alert_queue    = queue.Queue()   # алерти шле ОДИН потік по 
 def run_alert_sender():
     while True:
         a = alert_queue.get()
-        try:
-            ok = send_close_alert(a)
-        except Exception as e:
-            print(f"  [ALERT] sender err: {e}")
-            ok = False
-        if not ok:
-            # TG упав на всіх ретраях: алерт повертається В ЧЕРГУ, а не
-            # губиться (аудит v2.6 №3: hash уже в дедупі, повторної
-            # детекції не буде — доставка мусить доїхати звідси)
-            a["_attempts"] = a.get("_attempts", 0) + 1
-            if a["_attempts"] <= 10:
-                time.sleep(5)
-                alert_queue.put(a)
-            else:
-                print(f"  [ALERT] DROP після 10 спроб доставки: "
-                      f"{a['coin']} {a['addr'][:10]}…")
+        # Ретраїмо ЦЕЙ алерт до успіху/капу, НЕ беручи наступний:
+        # порядок доставки — інваріант v1.3 (черга існує саме для
+        # нього), реенкью в хвіст його ламав (рев'ю v2.7 №1).
+        # Head-of-line затримка свіжих алертів при мертвому TG —
+        # свідома ціна порядку. Дубль можливий, якщо TG прийняв, а
+        # таймаут з'їв відповідь — дубль кращий за втрату.
+        for _try in range(11):
+            try:
+                ok = send_close_alert(a)
+            except Exception as e:
+                print(f"  [ALERT] sender err: {e}")
+                ok = False
+            if ok:
+                break
+            if ok is None:
+                # постійна помилка TG (400/403/нема chat_id):
+                # ретрай приречений — дроп одразу (рев'ю v2.7 №2)
+                print(f"  [ALERT] DROP (постійна помилка TG): "
+                      f"{a.get('coin', '?')} {str(a.get('addr', '?'))[:10]}…")
+                break
+            time.sleep(min(30, 5 * (_try + 1)))
+        else:
+            print(f"  [ALERT] DROP після 11 спроб доставки: "
+                  f"{a.get('coin', '?')} {str(a.get('addr', '?'))[:10]}…")
 
 # Лічильники з моменту старту. Дивитись: localhost:3000/status або щогодинний рядок у лозі
 stats = {
@@ -1392,10 +1404,13 @@ def run_prio_fetcher():
                         _prio_direct.popleft()
                     if len(_prio_direct) >= PRIO_DIRECT_PER_MIN:
                         prio_stats["dropped"] += 1
-                        # запиту НЕ БУЛО — кулдаун знімаємо, наступний
-                        # великий трейд кита тригерне знову (аудит
-                        # v2.6 №8: інакше 10 хв глухоти без перевірки)
-                        _prio_seen.pop(addr, None)
+                        # запиту НЕ БУЛО — але кулдаун не знімаємо
+                        # повністю (рев'ю v2.7 №4: гіперактивна адреса
+                        # з ratio<2 монополізувала б стелю тригерів у
+                        # пікові хвилини), а вкорочуємо до ~75с — вікна
+                        # рефілу бюджету. Глухоти 10 хв нема (аудит
+                        # v2.6 №8), монополії теж
+                        _prio_seen[addr] = now - PRIO_COOLDOWN_S + 75
                         _prio_log(addr, coin0, pos_side, notional, depth0,
                                   thr, "budget", 0, "", via_proxy)
                         continue
@@ -2088,6 +2103,12 @@ def check_position_changes(new_result, depth_snap):
                 # Повне закриття між сканами звідси не шлемо: закриття могло
                 # статись до 30+ хв тому, а fills-підтвердження дивиться лише
                 # 5 хв назад. Повні закриття ловить real-time монітор (~20с).
+                if old.get("_pending"):
+                    # пара з незвіреною дельтою зникла зі знімка: дельта
+                    # втрачена — хоча б ГОЛОСНО (рев'ю v2.7 №5а);
+                    # realtime міг встигнути покрити її незалежно
+                    print(f"  [DIFF] незвірена дельта {addr[:10]}:{coin} "
+                          f"втрачена: пара зникла зі знімка")
                 continue
             else:
                 if new_pos.get("side") != old.get("side"):
@@ -2119,7 +2140,9 @@ def check_position_changes(new_result, depth_snap):
                 # sweep спробує знову" було брехнею — знімок безумовно
                 # затирав стару позицію, 100→80 ставало 80→80 і дельта
                 # губилась назавжди)
-                failed_keep.setdefault(addr, {})[coin] = old
+                _kept = dict(old)
+                _kept["_pending"] = time.time()   # маркер незвіреної дельти
+                failed_keep.setdefault(addr, {})[coin] = _kept
                 continue
             if not mfills:
                 # Немає маркет fills — не шлемо алерт
@@ -2141,7 +2164,11 @@ def check_position_changes(new_result, depth_snap):
             big_txs = [f for f in mfills
                        if f["sz"] >= _base * MIN_CLOSE_PCT
                        and f["px"] * f["sz"] >= MIN_TX_USD]
-            if not big_txs or (old.get("ratio") or 0) < 2.0 \
+            # ratio беремо СВІЖИЙ (new_pos, той самий знімок): база,
+            # збережена failed_keep через кілька сканів, несла б ratio
+            # годинної давнини — v1.3 вимагає "на момент алерту"
+            # (рев'ю v2.7 №5б); розмір ПОДІЇ гейтиться старою позицією
+            if not big_txs or (new_pos.get("ratio") or 0) < 2.0 \
                or (old.get("val") or 0) < MIN_POS_USD:
                 continue
 
@@ -2159,7 +2186,7 @@ def check_position_changes(new_result, depth_snap):
                     "old_val":   old["val"],
                     "old_size":  old["size"],
                     "close_pct": min(_f["sz"] / _base, 1.0),
-                    "ratio":     old["ratio"],
+                    "ratio":     new_pos.get("ratio", old["ratio"]),
                     "entry":     old["entry"],
                     "full_close": full_close,
                     "fills":     [_f],
@@ -2275,8 +2302,10 @@ def send_close_alert(a):
           f"close_pct={a['close_pct']*100:.1f}% fills={len(fills)} | блок→алерт {_lat:.0f}ms")
     tg_result = tg_send(msg)
     print(f"  [ALERT]  tg_sent={'ok' if tg_result else 'FAIL'}")
+    if tg_result is None:
+        return None    # постійна помилка — sender дропне без ретраїв
     if not tg_result:
-        return False   # sender поверне в чергу; стата НЕ бреше
+        return False   # transient — sender ретраїть ЦЕЙ алерт; стата чесна
     # історія і лічильник — ЛИШЕ після реальної доставки (аудит v2.6
     # №3: "alerts_sent: 1" при невідправленому повідомленні)
     with alerts_lock:
@@ -3038,7 +3067,9 @@ PROFILE_ALGO_V   = 6      # версія алгоритму профілів: с
                           # позиція, malformed fail-closed, композитний
                           # tid-ключ; v5: flat-спліт — нова позиція
                           # будь-якого розміру після зливу в нуль,
-                          # структурні поля обов'язкові)
+                          # структурні поля обов'язкові; v6: hash
+                          # обов'язковий непорожній, crossed — строгий
+                          # bool, NaN/coin fail-closed)
 DATA_ALGO_V      = "2.7"  # версія логіки збору: трекер отримує її при
                           # СТВОРЕННІ і несе у рядок; API рахує лише
                           # поточну версію (аудит v2.2: рестарт підписував
@@ -4014,14 +4045,32 @@ def strat2_api():
         # відкидає (аудит v2.4 п.4: огризок без trade_id рахувався
         # другою угодою)
         try:
-            with open(path, newline="", encoding="utf-8") as f:
+            # errors="replace": битий байт (обірваний мультибайт після
+            # ENOSPC) стає U+FFFD і рядок ловиться карантином — а НЕ
+            # вбиває декодування цілого чанка з тисячами здорових
+            # рядків (рев'ю v2.7 №3: utf-8 декодується буферами, тож
+            # виняток бив і по рядках ДО битого байта)
+            with open(path, newline="", encoding="utf-8",
+                      errors="replace") as f:
                 rd = _csv.reader(f)
                 hdr = next(rd, None)
                 if not hdr:
                     return []
                 has_eol = bool(hdr) and hdr[-1] == "eol"
                 rows2 = []
-                for rr in rd:
+                while True:
+                    try:
+                        rr = next(rd)
+                    except StopIteration:
+                        break
+                    except Exception:
+                        # битий байт/декодування ПОСЕРЕД файла: ітератор
+                        # мертвий, але НАКОПИЧЕНІ валідні рядки віддаємо
+                        # (рев'ю v2.7 №3: раніше один битий хвіст ховав
+                        # тисячі здорових рядків як "нуль угод")
+                        quarantined[0] += 1
+                        read_errors[0] += 1
+                        break
                     if len(rr) != len(hdr):
                         quarantined[0] += 1
                         continue

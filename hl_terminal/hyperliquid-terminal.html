@@ -699,12 +699,15 @@ function renderStrat(){
         +' · штанга '+c(rs.shtanga_1)+' vs ні '+c(rs.shtanga_0)
         +((rs.partial&&rs.partial.n)?' · часткові закриття '+c(rs.partial):'')
         +(legacy?' · поза поточною версією: '+legacy:'')
-        +(sData.quarantined?' · битих рядків у карантині: '+sData.quarantined:'');
-    } else if(legacy){
+        +(sData.quarantined?' · битих рядків у карантині: '+sData.quarantined:'')
+        +(sData.read_errors?' · ⚠️ ЗБОЇВ ЧИТАННЯ ФАЙЛІВ: '+sData.read_errors:'');
+    } else if(legacy||sData.read_errors){
       rEl.style.display='';
-      rEl.textContent='Статистика рахується з нуля для нової версії логіки. '
+      rEl.textContent=(legacy?'Статистика рахується з нуля для нової версії логіки. '
         +'Рядків попередніх версій приховано: '+legacy
-        +' (файли не чіпались, дані на місці)';
+        +' (файли не чіпались, дані на місці)':'')
+        +(sData.read_errors?' ⚠️ ЗБОЇВ ЧИТАННЯ ФАЙЛІВ: '+sData.read_errors
+          +' — нуль угод може бути битим файлом, а не відсутністю даних':'');
     } else rEl.style.display='none';
   }
   const pr=sData.profiles||{};
