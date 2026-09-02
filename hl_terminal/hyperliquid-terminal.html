@@ -588,7 +588,9 @@ function setMore(){sMore=!sMore;renderSDetail();}
 function setSort(k){if(sSortK===k){sSortD=-sSortD;}else{sSortK=k;sSortD=-1;}
   renderSDetail();}
 const S_ORDER=['R1_загальний','R2_breakout','R3_великі','R4_великий','R5_дуже',
-               'R6_волт','F1_1хв','F2_2хв','F3_3хв','F4_розумний'];
+               'R6_волт','F1_1хв','F2_2хв','F3_3хв','F4_розумний','F5_перший'];
+const S_PROF=new Set(['F4_розумний','F5_перший']);   // стратегії з профілем швидкості
+function secTxt(v){if(v==null)return '—';return v>=120?(v/60).toFixed(1)+' хв':v.toFixed(0)+' с';}
 
 function switchView(v){
   view=v;
@@ -731,6 +733,8 @@ function renderStrat(){
       </div>
       <div class="scard-spark">${sparkSvg(s.cum)}</div>
       <div class="scard-halves">половини: <b class="${pctCls(s.half1)}">${pctTxt(s.half1)}</b> / <b class="${pctCls(s.half2)}">${pctTxt(s.half2)}</b>${s.kind==='rev'?' · метрика: вихід m30':''}</div>
+      ${(S_PROF.has(name)&&s.prof&&s.prof.wallets)?`<div class="scard-halves">гаманців ${s.prof.wallets} · швидких/повільних епізодів ${s.prof.n_fast}/${s.prof.n_slow} · частка швидких (мед.) ${s.prof.fast_pct_med==null?'—':s.prof.fast_pct_med.toFixed(0)+'%'} · злив від 1-ї tx: мед. ${secTxt(s.prof.unload_med_s)}, сер. ${secTxt(s.prof.unload_mean_s)}</div>`:''}
+      ${(s.kind==='follow'&&!S_PROF.has(name)&&s.n)?`<div class="scard-halves">перших пострілів пари: ${s.first_shot_n||0} з ${s.n}</div>`:''}
     </div>`;
   }
   document.getElementById('sCards').innerHTML=html||'<div class="empty-note">Немає даних</div>';
@@ -778,10 +782,22 @@ function renderSDetail(){
   }else{
     cols.push(C('tx_pct','Шматок',t=>fmt.p1(t.tx_pct)),
               C('hold','Холд, с',t=>fmt.sec(t.hold)),
-              C('reason','Вихід',t=>t.reason||'—'));
+              C('reason','Вихід',t=>t.reason||'—'),
+              // v2.8: перший постріл пари (порожньо у старих рядках)
+              C('first_shot','1-й',t=>t.first_shot==null?'—':(t.first_shot?'так':'ні')));
+    if(S_PROF.has(sSel))
+      // профіль швидкості гаманця на момент входу: швидкі/повільні
+      // епізоди за 90 днів, частка швидких, медіанний злив від 1-ї tx ≥5%
+      cols.push(C('pf_pct','Швидк.%',t=>t.pf_pct==null?'—':t.pf_pct.toFixed(0)+'%'),
+                C('pf_fast','Шв/пов',t=>t.pf_fast==null?'—':(t.pf_fast+'/'+(t.pf_slow??0))),
+                C('pf_unload','Злив мед.',t=>secTxt(t.pf_unload)));
     if(sMore) cols.push(C('ratio','Ratio',t=>fmt.r(t.ratio)),
                         C('tx_usd','Шматок $',t=>usdTxt(t.tx_usd)),
-                        C('pos_usd','Позиція $',t=>usdTxt(t.pos_usd)));
+                        C('pos_usd','Позиція $',t=>usdTxt(t.pos_usd)),
+                        C('pair_gap','Пауза пари',t=>secTxt(t.pair_gap)),
+                        C('wallet','Гаманець',t=>t.wallet||'—'));
+    if(sMore&&S_PROF.has(sSel))
+      cols.push(C('pf_unload_mean','Злив сер.',t=>secTxt(t.pf_unload_mean)));
   }
   cols.push(C('hour','Год',t=>t.hour!=null?String(t.hour).padStart(2,'0')+':00':'—'),
             C('btc','BTC 3хв',t=>fmt.pct(t.btc)));
