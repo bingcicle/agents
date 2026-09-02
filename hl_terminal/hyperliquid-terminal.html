@@ -707,7 +707,7 @@ function renderStrat(){
       rEl.style.display='';
       rEl.textContent=(legacy?'Статистика рахується з нуля для нової версії логіки. '
         +'Рядків попередніх версій приховано: '+legacy
-        +' (файли не чіпались, дані на місці)':'')
+        +' (дані на місці: файли зі старим заголовком перейменовано у *.legacy-<ts>.csv)':'')
         +(sData.read_errors?' ⚠️ ЗБОЇВ ЧИТАННЯ ФАЙЛІВ: '+sData.read_errors
           +' — нуль угод може бути битим файлом, а не відсутністю даних':'');
     } else rEl.style.display='none';
@@ -734,7 +734,7 @@ function renderStrat(){
       <div class="scard-spark">${sparkSvg(s.cum)}</div>
       <div class="scard-halves">половини: <b class="${pctCls(s.half1)}">${pctTxt(s.half1)}</b> / <b class="${pctCls(s.half2)}">${pctTxt(s.half2)}</b>${s.kind==='rev'?' · метрика: вихід m30':''}</div>
       ${(S_PROF.has(name)&&s.prof&&s.prof.wallets)?`<div class="scard-halves">гаманців ${s.prof.wallets} · швидких/повільних епізодів ${s.prof.n_fast}/${s.prof.n_slow} · частка швидких (мед.) ${s.prof.fast_pct_med==null?'—':s.prof.fast_pct_med.toFixed(0)+'%'} · злив від 1-ї tx: мед. ${secTxt(s.prof.unload_med_s)}, сер. ${secTxt(s.prof.unload_mean_s)}</div>`:''}
-      ${(s.kind==='follow'&&!S_PROF.has(name)&&s.n)?`<div class="scard-halves">перших пострілів пари: ${s.first_shot_n||0} з ${s.n}</div>`:''}
+      ${(s.kind==='follow'&&name!=='F5_перший'&&s.n)?`<div class="scard-halves">перших пострілів пари: ${s.first_shot_n||0} з ${s.n}${name==='F4_розумний'?' (стільки ж «є» F5)':''}</div>`:''}
     </div>`;
   }
   document.getElementById('sCards').innerHTML=html||'<div class="empty-note">Немає даних</div>';
@@ -851,7 +851,10 @@ function renderSDetail(){
     ${(()=>{
       // крива хвилин виходу: у реверсів — власна, у follow — СПІЛЬНА
       // тіньова стрічка входів (одні сигнали на всі F-стратегії)
-      const src=isRev?s:(sData.follow_tape&&sData.follow_tape.n?sData.follow_tape:null);
+      // F5 — власна когорта: лише перші постріли пари (first_shot=1)
+      const tf=sData.follow_tape_first;
+      const useFirst=sSel==='F5_перший'&&tf&&tf.n>0;
+      const src=isRev?s:(useFirst?tf:(sData.follow_tape&&sData.follow_tape.n?sData.follow_tape:null));
       if(!src) return '';
       // спільна когорта: кожна хвилина з ТИХ САМИХ угод — лише тоді
       // "найкраща хвилина" є порівнянням, а не збігом різних вибірок
@@ -861,7 +864,7 @@ function renderSDetail(){
       // ЧЕСНИЙ підпис для F: стрічка — ВСІ follow-сигнали, не входи
       // саме цієї стратегії (F4 відкривається на підмножині — його
       // власна вибірка інша; аудит v2.5 №3)
-      const lbl=(isRev?'':'усі follow-сигнали, НЕ лише входи цієї стратегії · ')
+      const lbl=(isRev?'':(useFirst?'лише перші постріли пари (когорта F5) · ':'усі follow-сигнали, НЕ лише входи цієї стратегії · '))
         +(useC?('спільна когорта (усі 60 хв у кожній угоді) · n='+src.curve_common_n)
               :'вся вибірка · увага: різні хвилини = різні набори угод');
       return `<div class="sd-chart"><h4>Медіана net за хвилиною виходу (1–60) · ${lbl}</h4>${curveSvg(s._dispCurve,s._dispN)}<div class="ctip" id="cTip"></div></div>`;

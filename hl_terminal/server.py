@@ -465,24 +465,30 @@ def hl_post(body, retries=4):
         method="POST"
     )
     last_was_429 = False
+    last_err = ""
     for attempt in range(retries):
         try:
             with urllib.request.urlopen(req, timeout=10) as r:
                 return json.loads(r.read())
         except urllib.error.HTTPError as e:
+            last_err = f"HTTP {e.code}"
             if e.code == 429:
                 last_was_429 = True
                 time.sleep(2 ** attempt)
             else:
                 last_was_429 = False
                 time.sleep(1)
-        except Exception:
+        except Exception as e:
+            # причина зберігається для повідомлення винятку: інакше у лозі
+            # лише «max retries», і таймаут від DNS не відрізнити (рев'ю
+            # v2.8 — важкий шлях історії профілів робить до 18 спроб)
+            last_err = f"{type(e).__name__}: {str(e)[:80]}"
             last_was_429 = False
             time.sleep(1)
     # Вичерпали retry — кидаємо конкретний тип помилки
     if last_was_429:
         raise RateLimited("429 after retries")
-    raise APIError("max retries")
+    raise APIError(f"max retries ({last_err})")
 
 def hl_get(url):
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
@@ -511,19 +517,24 @@ def hl_post_prio(body, retries=2, direct=False):
     opener = (urllib.request.urlopen
               if direct or not _prio_opener else _prio_opener.open)
     last_was_429 = False
+    last_err = ""
     for attempt in range(retries):
         try:
             with opener(req, timeout=10) as r:
                 return json.loads(r.read())
         except urllib.error.HTTPError as e:
+            last_err = f"HTTP {e.code}"
             last_was_429 = e.code == 429
-            time.sleep(2 ** attempt if last_was_429 else 1)
-        except Exception:
+            if attempt < retries - 1:   # після останньої спроби не спати
+                time.sleep(2 ** attempt if last_was_429 else 1)
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {str(e)[:80]}"
             last_was_429 = False
-            time.sleep(1)
+            if attempt < retries - 1:
+                time.sleep(1)
     if last_was_429:
         raise RateLimited("prio 429 after retries")
-    raise APIError("prio max retries")
+    raise APIError(f"prio max retries ({last_err})")
 
 def _hl_post_prio_direct(body, retries=2):
     return hl_post_prio(body, retries, direct=True)
@@ -856,51 +867,70 @@ def _ws_conn(coins, label, initial_delay=0):
             # інакше A, вдало перепідключившись, обнуляв би стрік B
             stats[f"ws_connects_{label}"] = stats.get(f"ws_connects_{label}", 0) + 1
             stats[f"ws_up_{label}"] = connected_at
+            # «мовчить з»: початок серії конектів БЕЗ жодного трейда на
+            # цьому лейблі. Форс-реконекти його не переставляють (рев'ю
+            # v2.8: ws_up скидався кожні 3 хв, і _ws_dead_labels ніколи не
+            # бачив «5 хв без трейдів» — TG-алерт не приходив)
+            if not stats.get(f"ws_stale_streak_{label}") \
+               or not stats.get(f"ws_silent_since_{label}"):
+                stats[f"ws_silent_since_{label}"] = connected_at
             print(f"  [WS-{label}] connected, шлю {len(coins)} підписок "
                   f"по {WS_SUB_DELAY}s"
                   + (f" через проксі" if WS_PROXY else ""))
-            # Поріг тиші для ЦЬОГО конекту: базовий 3 хв, подвоюється
-            # за кожен попередній форс-реконект, після якого трейдів так
-            # і не було (стрік скидає перший трейд) — стеля 30 хв
-            stale_streak = stats.get(f"ws_stale_streak_{label}", 0)
-            stale_limit = min(WS_STALE_S * (2 ** min(stale_streak, 4)),
-                              WS_STALE_MAX_S)
-            def _stale(label=label, connected_at=connected_at,
-                       limit=stale_limit):
+            # Поріг тиші — ДИНАМІЧНИЙ від стріку у stats: базові 3 хв,
+            # подвоюється за кожен форс-реконект поспіль без трейдів,
+            # перший трейд скидає стрік — і поріг одразу знову 3 хв
+            # (рев'ю v2.8: ліміт, захоплений при конекті, лишав 30 хв
+            # на всю добу життя сокета, а стрік зі старого знімка ріс
+            # храповиком попри трейди)
+            def _stale_limit(label=label):
+                sk = stats.get(f"ws_stale_streak_{label}", 0)
+                return min(WS_STALE_S * (2 ** min(sk, 4)), WS_STALE_MAX_S)
+            def _stale(label=label, connected_at=connected_at):
                 """True = з'єднання формально живе (фрейми йдуть), але
                 трейдів немає довше за поріг. Рахується від пізнішого з
                 двох: конект або останній трейд цього з'єднання. Лише
                 при підтверджених підписках — інакше це справа
                 _sub_checker, а не «протухання»."""
                 now_s = time.time()
+                limit = _stale_limit()
                 if now_s - connected_at < limit:
                     return False
                 if stats.get(f"ws_subs_{label}", 0) <= 0:
                     return False
                 last = stats.get(f"ws_last_{label}", 0) / 1000.0
                 return not last or now_s - last >= limit
+            def _stale_fire(label=label, connected_at=connected_at,
+                            n_coins=len(coins)):
+                sk = f"ws_stale_streak_{label}"
+                stats[sk] = stats.get(sk, 0) + 1
+                stats[f"ws_stale_reconnects_{label}"] = \
+                    stats.get(f"ws_stale_reconnects_{label}", 0) + 1
+                _last = stats.get(f"ws_last_{label}", 0) / 1000.0
+                # тиша САМЕ цього сокета (не від трейда попереднього)
+                _age = time.time() - max(connected_at, _last)
+                _nxt = min(WS_STALE_S * (2 ** min(stats[sk], 4)),
+                           WS_STALE_MAX_S)
+                print(f"  [WS-{label}] тиша {_age:.0f}с при живому "
+                      f"з'єднанні ({stats.get(f'ws_subs_{label}', 0)}/"
+                      f"{n_coins} підписок) — форс-реконект "
+                      f"#{stats[f'ws_stale_reconnects_{label}']}, "
+                      f"стрік {stats[sk]}, наступний поріг {_nxt:.0f}с")
             while True:
                 frame = ws_recv(sock, send_lock, rbuf)
                 if frame is None: break
-                # перевірка на КОЖНОМУ фреймі, включно з pong-ами: саме
-                # вони і тримають «живим» сокет, у який біржа перестала
-                # слати трейди (60с таймаут recv його ніколи не зловить)
-                if _stale():
-                    stats[f"ws_stale_streak_{label}"] = stale_streak + 1
-                    stats[f"ws_stale_reconnects_{label}"] = \
-                        stats.get(f"ws_stale_reconnects_{label}", 0) + 1
-                    _last = stats.get(f"ws_last_{label}", 0)
-                    _age = ((time.time() * 1000 - _last) / 1000
-                            if _last else time.time() - connected_at)
-                    _nxt = min(WS_STALE_S * (2 ** min(stale_streak + 1, 4)),
-                               WS_STALE_MAX_S)
-                    print(f"  [WS-{label}] тиша {_age:.0f}с при живому "
-                          f"з'єднанні ({stats.get(f'ws_subs_{label}', 0)}/"
-                          f"{len(coins)} підписок) — форс-реконект "
-                          f"#{stats[f'ws_stale_reconnects_{label}']}, "
-                          f"наступний поріг {_nxt:.0f}с")
-                    break
-                if not frame: continue
+                if not frame:
+                    # службовий фрейм (pong-контроль): саме такі фрейми
+                    # тримають «живим» сокет, у який біржа перестала слати
+                    # трейди (60с таймаут recv його ніколи не зловить).
+                    # Тишу перевіряємо ТІЛЬКИ тут і на службових JSON-
+                    # повідомленнях нижче — не перед розбором даних (рев'ю
+                    # v2.8: перший трейд після паузи інакше сам ставав
+                    # приводом для розриву і губився)
+                    if _stale():
+                        _stale_fire()
+                        break
+                    continue
                 try:
                     obj = json.loads(frame.decode("utf-8", errors="ignore"))
                 except Exception:
@@ -916,11 +946,20 @@ def _ws_conn(coins, label, initial_delay=0):
                     stats[f"ws_subs_{label}"] = len(confirmed)
                     if len(confirmed) == len(coins):
                         print(f"  [WS-{label}] всі {len(confirmed)} підписок підтверджені")
+                    if _stale():
+                        _stale_fire()
+                        break
                     continue
                 if ch == "pong":
+                    if _stale():
+                        _stale_fire()
+                        break
                     continue
                 if ch == "error":
                     print(f"  [WS-{label}] server error: {str(obj)[:160]}")
+                    if _stale():
+                        _stale_fire()
+                        break
                     continue
                 # Сюди доходять лише реальні дані (трейди). Тільки вони
                 # оновлюють ws_last_ms: якщо рахувати й pong-и, з'єднання
@@ -1159,7 +1198,12 @@ def _ws_dead_labels():
                 dead.append(lb)
         else:
             # підключений, але жодного трейда за 5 хв: підписки порізані
-            up = stats.get(f"ws_up_{lb}", 0)
+            # або біржа мовчить. Рахуємо від початку СЕРІЇ мовчазних
+            # конектів (ws_silent_since), а не від останнього конекту —
+            # форс-реконекти v2.8 переставляли ws_up кожні 3 хв, і поріг
+            # 5 хв не наставав ніколи (рев'ю v2.8)
+            up = (stats.get(f"ws_silent_since_{lb}", 0)
+                  or stats.get(f"ws_up_{lb}", 0))
             if up and time.time() - up > 300:
                 dead.append(lb)
     return dead
@@ -1466,7 +1510,7 @@ def run_prio_fetcher():
                                   thr, "budget", 0, "", via_proxy)
                         continue
                     _prio_direct.append(now)
-            best_ratio, added = 0.0, []
+            best_ratio, added, marks = 0.0, [], []
             now_ms = int(time.time() * 1000)   # курсор = час ДО запиту
             try:
                 positions = check_one_wallet(
@@ -1527,6 +1571,17 @@ def run_prio_fetcher():
                     delta_seen.pop(k, None)
                     fill_cursor[k] = max(fill_cursor.get(k, 0), now_ms)
                 added.append(c)
+                if c == coin0 and p["side"] == pos_side:
+                    # тригерний трейд = закриття цього боку, і воно вже
+                    # позаду курсора: для F5 воно і є «першим пострілом»
+                    # пари, тож мітку ставимо тут — інакше НАСТУПНА tx
+                    # через 30с–59хв виглядала б першою (рев'ю v2.8);
+                    # поза watchlist_lock — порядок локів як усюди
+                    marks.append(k)
+            if marks:
+                with strat2_lock:
+                    for k in marks:
+                        follow_last_close[k] = time.time()
             if added:
                 prio_stats["added"] += 1
                 result = "added"
@@ -2848,9 +2903,14 @@ def _prune_leaks():
     for k in [k for k, ts in list(alerted_txs.items()) if ts < now_ - 3600]:
         alerted_txs.pop(k, None)
     with strat2_lock:
+        # 7 днів, не доба: мітка пари тепер і є pair_gap_s для F5 — після
+        # чистки «пауза >24 год» і «ніколи не бачили» були б однаковим ""
+        # (рев'ю v2.8); один float на пару — пам'ять мізерна
         for k in [k for k, ts in list(follow_last_close.items())
-                  if ts < now_ - 86400]:
+                  if ts < now_ - 7 * 86400]:
             follow_last_close.pop(k, None)
+        for k in [k for k, ts in list(profile_retry_at.items()) if ts < now_]:
+            profile_retry_at.pop(k, None)
     cut_ms = (now_ - 3600) * 1000
     with fc_lock:
         for k in list(fc_episodes):
@@ -3230,7 +3290,10 @@ FOLLOW_OUT_HEADERS = (["fo_id", "date", "coin", "our_side", "whale_addr",
                        "entry_px", "tx_pct_of_pos", "tx_usd", "ratio",
                        "pos_usd", "vault", "hour", "btc_move_pct",
                        "depth_usd", "costs_pct", "peak_pct", "trough_pct",
-                       "algo_v"]
+                       "algo_v",
+                       # v2.8: щоб крива «хвилина виходу» існувала і для
+                       # когорти першого пострілу (F5) окремо
+                       "first_shot", "pair_gap_s"]
                       + [f"m{i}" for i in range(1, REV_TRACK_MIN + 1)] + ["eol"])
 
 # OUTCOME-стрічка: шлях ціни КОЖНОГО сигналу від детекту, незалежно від
@@ -3592,7 +3655,8 @@ def _fol_out_row(p):
              round(p.get("depth") or 0, 0), round(costs, 4),
              (round(p["peak"], 4) if p["peak"] > -999 else ""),
              (round(p["trough"], 4) if p["trough"] < 999 else ""),
-             p.get("algo_v", "")]
+             p.get("algo_v", ""),
+             p.get("first_shot", ""), p.get("pair_gap", "")]
             + _rev_samples(p, 1))
 
 def _rev_out_row(p):
@@ -3668,9 +3732,10 @@ def follow_on_txs(addr, coin, old, mfills, full_close):
                   and prof.get("v") == PROFILE_ALGO_V
                   and not prof.get("err"))
     need_profile = not prof_valid
-    # обрізана історія (8 сторінок вичерпано або >2000 філів в одній мс)
-    # НЕ дає права на F4: "поведінковий профіль" з огризка — не профіль
-    # (аудит v2.2 п.2). truncated — стан ТИМЧАСОВИЙ (рев'ю v2.3), а
+    # діра в історії (>2000 філів в одній мс = truncated) НЕ дає права
+    # на F4: "поведінковий профіль" з огризка — не профіль (аудит v2.2
+    # п.2); 10k-кап API (hist_capped) — навпаки, дає (v2.8: вікно просто
+    # коротше). truncated — стан ТИМЧАСОВИЙ (рев'ю v2.3), а
     # ЗДОРОВИЙ профіль просто старіє (аудит v2.3 п.4: кеш 100-денної
     # давності — не "останні 14 днів") — обидва йдуть на рефреш;
     # шторм гасить TTL-гейт у _profile_request. Поточний сигнал при
@@ -3707,7 +3772,15 @@ def follow_on_txs(addr, coin, old, mfills, full_close):
             # самі гаманці, але ЛИШЕ перший постріл пари (або пауза
             # ≥1 год): повтори в межах години — шум (дослідження H080)
             for st_name, allowed in ((F4_NAME, True), (F5_NAME, first_shot)):
-                if not allowed or (st_name, coin) in busy: continue
+                if not allowed: continue
+                if (st_name, coin) in busy:
+                    # пропуск через «монета зайнята» іншим китом видимий:
+                    # F5-події рідкісні, мовчазний скіп ховав би частку
+                    # вибірки (рев'ю v2.8)
+                    stats["follow_busy_skips"] = stats.get("follow_busy_skips", 0) + 1
+                    print(f"  [FOLLOW] {st_name} пропуск: {coin} зайнята "
+                          f"({addr[:10]}…)")
+                    continue
                 it = dict(base); it["strategy"] = st_name
                 it["timer"] = timer4; it["profile_gap"] = timer4
                 follow_open[f"{key}|{st_name}|{int(now)}"] = it
@@ -3728,6 +3801,7 @@ def follow_on_txs(addr, coin, old, mfills, full_close):
                 "vault": base["vault"], "hour": hour,
                 "btc_move": btc_move, "depth": depth,
                 "algo_v": DATA_ALGO_V,
+                "first_shot": first_shot, "pair_gap": base["pair_gap"],
                 "samples": [], "peak": -999.0, "trough": 999.0}
     # фоновий підтяг історії — СУВОРО поза strat2_lock (аудит 29.08:
     # виклик зсередини критичної секції давав self-deadlock усього модуля)
@@ -3738,10 +3812,10 @@ def follow_on_txs(addr, coin, old, mfills, full_close):
 
 # ── F4: профілі гаманців з історії філів ────────────────
 PROFILE_ERR_TTL_S = 6 * 3600   # збій запиту = "невідомо", ретрай за 6 год
-PROFILE_TTL_S     = 24 * 3600  # і ЗДОРОВИЙ профіль старіє: "останні 14
-                               # днів" — ковзне вікно, кеш 100-денної
-                               # давності не є актуальною поведінкою
-                               # (аудит v2.3 п.4); оновлення раз на добу
+PROFILE_TTL_S     = 24 * 3600  # і ЗДОРОВИЙ профіль старіє: "останні 90
+                               # днів / 10k філів" — ковзне вікно, кеш
+                               # 100-денної давності не є актуальною
+                               # поведінкою (аудит v2.3 п.4); раз на добу
 PROFILE_HARD_TTL_S = 48 * 3600 # жорстка стеля для ВХОДУ F4: до 24г кеш
                                # свіжий, 24-48г — stale-while-revalidate
                                # (користуємось, рефреш їде фоном),
@@ -3749,10 +3823,18 @@ PROFILE_HARD_TTL_S = 48 * 3600 # жорстка стеля для ВХОДУ F4:
                                # (аудит v2.4 п.1: 100-денний ok
                                # відкривав угоди)
 
+profile_retry_at  = {}   # addr -> ts: не перезапитувати історію раніше
+                         # (429 / збій рефрешу при ще валідному профілі)
+PROFILE_QUEUE_MAX = 100  # стеля черги потоків на семафорі: каскадний день
+                         # після бампа версії не має плодити сотні потоків
+PROFILE_429_RETRY_S = 300
+PROFILE_FAIL_RETRY_S = 1800
+
 def _profile_request(addr):
     a = addr.lower()
     with strat2_lock:
         if a in profiles_fetching: return
+        if time.time() < profile_retry_at.get(a, 0): return
         prof = wallet_profiles.get(a)
         if prof is not None:
             stale_version = prof.get("v") != PROFILE_ALGO_V
@@ -3760,34 +3842,54 @@ def _profile_request(addr):
             age = time.time() - prof.get("fetched", 0)
             # застаріла версія алгоритму — перерахунок одразу; збійний/
             # обрізаний — ретрай після PROFILE_ERR_TTL_S; ЗДОРОВИЙ
-            # (ok і не-ok) — рефреш після PROFILE_TTL_S: 14-денне вікно
+            # (ok і не-ok) — рефреш після PROFILE_TTL_S: 90-денне вікно
             # ковзає, і позитивна, і негативна кваліфікація старіють
             # (аудит v2.3 п.4)
             if not stale_version and \
                age < (PROFILE_ERR_TTL_S if soft else PROFILE_TTL_S):
                 return
+        if len(profiles_fetching) >= PROFILE_QUEUE_MAX:
+            # стеля: адреса не втрачена — наступний сигнал кита попросить
+            # знову, коли черга розсмокчеться (рев'ю v2.8)
+            if time.time() - stats.get("profile_q_warn", 0) > 60:
+                stats["profile_q_warn"] = time.time()
+                print(f"  [F4] черга профілів повна ({PROFILE_QUEUE_MAX}) — "
+                      f"{a[:10]}… відкладено")
+            return
         profiles_fetching.add(a)
-    threading.Thread(target=_fetch_profile, args=(a,), daemon=True).start()
+    try:
+        threading.Thread(target=_fetch_profile, args=(a,), daemon=True).start()
+    except Exception as e:
+        # збій старту потоку (ліміт потоків ОС): без discard адреса
+        # висіла б у profiles_fetching назавжди (рев'ю v2.8)
+        with strat2_lock:
+            profiles_fetching.discard(a)
+        print(f"  [F4] потік профілю {a[:10]}… не стартував: {e}")
 
-def _grade_episode(ep, coin, depth_fn, now_ms, is_last):
+def _grade_episode(ep, coin, depth_fn, now_ms, is_last, tail=()):
     """Оцінка ОДНОГО сегмента позиції (між реопенами/flat) за ТЗ 01.09.
     ep: закриття у хронології: (t_ms, px, sz_close, start_pos, aggr, side),
         aggr = тейкер (crossed) і не-TWAP — «агресивна транзакція».
+    tail: рядки монети ПІСЛЯ сегмента (наступні сегменти) — кінець
+        епізоду шукається і там у межах 5 хв від старту: долив >2% посеред
+        зливу ділить СЕГМЕНТ, але не епізод (рев'ю v2.8: «продав 10%,
+        докупив 5%, за 40с злив усе» — один швидкий, не slow + fast 0с).
     Повертає:
       None                — не великий епізод (жодна агресивна tx ≥5% не
-                            пройшла гейти $100k / ratio ≥2) АБО епізод ще
-                            триває (старт <5 хв тому, не закрито);
+                            пройшла гейти $100k / ratio ≥2);
       {"nodepth": 1}      — глибини монети немає: ratio не порахувати;
-      {"fast": 0/1, "unload_s": с|None, "gaps": [...], "usd": $, "ratio": r}
+      {"inprog": 1}       — старт <5 хв тому і ще не закрито: триває;
+      {"fast": 0/1, "unload_s": с|None, "gaps": [...], "usd": $,
+       "ratio": r, "end_t": ms|None}
     Старт = ПЕРША агресивна tx з часткою ≥5% від позиції НА ТОЙ МОМЕНТ,
     за умови позиції ≥$100k і ratio ≥2 (до ПОТОЧНОЇ глибини сторони).
     Позиція в сегменті лише зменшується, тому гейти $/ratio монотонні:
     перевіряємо кожен шматок ≥5%, доки один не пройде. Кінець = перший
     філ, після якого залишок (startPosition − закрите — це число самої
-    біржі) ≤5% від позиції на старті; рахуються ВСІ закриття, і мейкер,
-    і TWAP: «закрив повністю» не залежить від способу. Швидкий = кінець
-    − старт ≤5 хв. Не закрив: старт >5 хв тому → повільний; останній
-    сегмент монети зі стартом <5 хв тому → триває, не рахуємо."""
+    біржі) ≤5% від позиції на старті; рахуються ВСІ закриття — мейкер,
+    TWAP, ліквідація: «закрив повністю» не залежить від способу.
+    Швидкий = кінець − старт ≤5 хв. Не закрив і старт >5 хв тому →
+    повільний."""
     start_i = None
     ratio = 0.0
     usd0 = 0.0
@@ -3806,23 +3908,34 @@ def _grade_episode(ep, coin, depth_fn, now_ms, is_last):
     if start_i is None:
         return None
     t0, _px0, _szc0, sp0, _a0, _s0 = ep[start_i]
+    done_rem = sp0 * (1.0 - F4_FULL_PCT)
     end_t = None
     aggr_ts = []
     for (t, px, szc, sp, aggr, side) in ep[start_i:]:
         if aggr: aggr_ts.append(t)
-        if max(0.0, sp - szc) <= sp0 * (1.0 - F4_FULL_PCT):
+        if max(0.0, sp - szc) <= done_rem:
             end_t = t
             break
+    if end_t is None:
+        # за межами сегмента — лише у вікні «швидкого»: пізніший кінець
+        # належить уже іншій позиції (реопен), а для «повільний» точний
+        # час не потрібен
+        for (t, px, szc, sp, aggr, side) in tail:
+            if t - t0 > F4_MAX_UNLOAD_S * 1000: break
+            if aggr: aggr_ts.append(t)
+            if max(0.0, sp - szc) <= done_rem:
+                end_t = t
+                break
     gaps = [(aggr_ts[i] - aggr_ts[i - 1]) / 1000.0
             for i in range(1, len(aggr_ts))]
     if end_t is None:
-        if is_last and now_ms - t0 < F4_MAX_UNLOAD_S * 1000:
-            return None          # епізод ще триває — не оцінюємо
+        if now_ms - t0 < F4_MAX_UNLOAD_S * 1000:
+            return {"inprog": 1}   # епізод ще триває — не оцінюємо
         return {"fast": 0, "unload_s": None, "gaps": gaps,
-                "usd": usd0, "ratio": ratio}
+                "usd": usd0, "ratio": ratio, "end_t": None}
     unload = (end_t - t0) / 1000.0
     return {"fast": int(unload <= F4_MAX_UNLOAD_S), "unload_s": unload,
-            "gaps": gaps, "usd": usd0, "ratio": ratio}
+            "gaps": gaps, "usd": usd0, "ratio": ratio, "end_t": end_t}
 
 def _build_profile(fills, now_ms=None, depth_fn=None):
     """Історія філів гаманця -> профіль ШВИДКОСТІ розвантажень (ТЗ 01.09).
@@ -3861,23 +3974,34 @@ def _build_profile(fills, now_ms=None, depth_fn=None):
             bad += 1   # crossed="false" (рядок) — це БИТЕ, не maker
             continue
         d = str(f.get("dir", ""))
-        if not (d.startswith("Close") or ">" in d): continue
-        # бік, який ЗАКРИВАЄТЬСЯ: "Close Long" / "Long > Short" — лонг
-        # (продаж у bid), "Close Short" / "Short > Long" — шорт (купівля
-        # з ask); глибина для ratio береться по цій стороні, як у
-        # watchlist (depth_for_side)
-        side = "LONG" if d.startswith("Close Long") or d.startswith("Long") \
-               else "SHORT"
-        # агресивна = тейкер і не TWAP; пасивні/TWAP закриття лишаються
-        # в історії як зменшення позиції (v7), але епізод не відкривають
-        aggr = bool(_cr) and f.get("twapId") is None
+        # ліквідація/ADL: dir не «Close…», але позиція ЗМЕНШУЄТЬСЯ — та
+        # сама класифікація, що у live-детекторі (рев'ю v2.8: інакше
+        # сегмент лишався «незакритим» і клеївся з наступною позицією)
+        f_liq = (bool(f.get("liquidation")) or ("Liquidat" in d)
+                 or d.startswith("Auto-Delever"))
+        if not (d.startswith("Close") or ">" in d or f_liq): continue
         try:
             t = int(f.get("time", 0)); px = float(f.get("px", 0))
             sz = float(f.get("sz", 0))
-            sp = abs(float(f.get("startPosition", 0) or 0))
+            sp_signed = float(f.get("startPosition", 0) or 0)
+            sp = abs(sp_signed)
         except (TypeError, ValueError):
             bad += 1   # биті значення = невідомий шматок історії, а не
             continue   # "його не було" (аудит v2.3 п.5.2)
+        # бік, який ЗАКРИВАЄТЬСЯ: "Close Long" / "Long > Short" — лонг
+        # (продаж у bid), "Close Short" / "Short > Long" — шорт (купівля
+        # з ask); у ліквідації без слова в dir — знак startPosition;
+        # глибина для ratio береться по цій стороні, як у watchlist
+        if d.startswith("Close Long") or d.startswith("Long") or "Long" in d:
+            side = "LONG"
+        elif d.startswith("Close Short") or d.startswith("Short") or "Short" in d:
+            side = "SHORT"
+        else:
+            side = "LONG" if sp_signed > 0 else "SHORT"
+        # агресивна = тейкер, не TWAP, не ліквідація; пасивні/TWAP/
+        # ліквідаційні закриття лишаються в історії як зменшення позиції
+        # (v7), але епізод не відкривають — це не рішення гаманця
+        aggr = bool(_cr) and f.get("twapId") is None and not f_liq
         # NaN проходив крізь "px <= 0" (усі порівняння з nan = False) і
         # труїв агрегати — тепер finite обов'язковий (аудит v2.5)
         if not (math.isfinite(px) and math.isfinite(sz)
@@ -3887,7 +4011,17 @@ def _build_profile(fills, now_ms=None, depth_fn=None):
         if t <= 0 or px <= 0 or sz <= 0:
             bad += 1
             continue
-        k = (f.get("coin", "?"), f.get("hash") or f"t{t}")
+        h = str(f.get("hash"))
+        # системні філи (TWAP-суб-ордери, ліквідації, ADL) несуть нульовий
+        # hash 0x000…0: групувати їх по hash = склеїти ВСІ такі закриття
+        # монети за 90 днів в одну «транзакцію» (рев'ю v2.8, регресія
+        # проти v6, де TWAP відкидались до групування) — ключ по oid/tid
+        if h.lower().strip("0x") == "" or f.get("twapId") is not None or f_liq:
+            k = (f.get("coin", "?"), "sys",
+                 f.get("oid") if f.get("oid") is not None
+                 else f.get("tid", t))
+        else:
+            k = (f.get("coin", "?"), h)
         agg = txs.setdefault(k, [t, 0.0, 0.0, sp, aggr, side])
         agg[0] = min(agg[0], t)
         agg[1] += px * sz
@@ -3895,7 +4029,8 @@ def _build_profile(fills, now_ms=None, depth_fn=None):
         agg[3] = max(agg[3], sp)
         agg[4] = agg[4] and aggr   # ордер із TWAP-філом — не агресивний
     closes = {}
-    for (coin, _h), (t, cost, sz, sp, aggr, side) in txs.items():
+    for k, (t, cost, sz, sp, aggr, side) in txs.items():
+        coin = k[0]   # ключ — (coin, hash) або (coin, "sys", oid/tid)
         # фліп ("Long > Short") містить і закриття, і відкриття нового
         # боку: закритого не більше, ніж БУЛО позиції — кламп як у live
         # (аудит v2.1 п.4: $50k закриття рахувалось як $150k)
@@ -3943,16 +4078,20 @@ def _build_profile(fills, now_ms=None, depth_fn=None):
                     ep = []
             ep.append(row)
         if ep: segs.append(ep)
+        consumed_until = -1   # рядки до кінця знайденого епізоду вже
+                              # враховані — наступний сегмент не має
+                              # народити з них другий епізод
         for i, seg in enumerate(segs):
-            is_last = (i == len(segs) - 1)
-            res = _grade_episode(seg, coin, depth_fn, now_ms, is_last)
-            if res is None and is_last and seg:
-                # відрізнити «не великий» від «ще триває» для лічильника:
-                # триває = агресивна tx ≥5% у сегменті є, але старт <5 хв
-                if any(r[4] and r[3] > 0 and r[2] >= r[3] * F4_CHUNK_PCT
-                       and now_ms - r[0] < F4_MAX_UNLOAD_S * 1000
-                       for r in seg):
-                    n_inprog += 1
+            seg_eff = [r for r in seg if r[0] > consumed_until]
+            if not seg_eff: continue
+            tail = [r for s2 in segs[i + 1:] for r in s2]
+            res = _grade_episode(seg_eff, coin, depth_fn, now_ms,
+                                 i == len(segs) - 1, tail)
+            if res and res.get("inprog"):
+                n_inprog += 1
+                continue
+            if res and res.get("end_t") is not None:
+                consumed_until = max(consumed_until, res["end_t"])
             _take(res)
     n_big = n_fast + n_slow
     fast_pct = round(100.0 * n_fast / n_big, 1) if n_big else None
@@ -3991,17 +4130,66 @@ _profile_sem = threading.Semaphore(1)   # історія — найважчий 
                                         # каскадний день не з'їла ліміт IP,
                                         # на якій живе детекція
 
+# Бюджет ВАГИ історії за ковзну хвилину по каналах (рев'ю v2.8: семафор
+# обмежує лише конкурентність — два гіперактивні гаманці поспіль з'їдали
+# ліміт 1200/хв). userFillsByTime = 20 + 1 за кожні 20 філів, повна
+# сторінка ≈ 120. Проксі — половина її ліміту, прямий канал — лише
+# крихта: там живе детекція (скан + sweep ≈ 860/хв)
+PROFILE_W_PER_MIN = {"proxy": 600, "direct": 150}
+_profile_w = {"proxy": deque(), "direct": deque()}
+_profile_w_lock = threading.Lock()
+_profile_proxy = {"dead_until": 0.0}   # проксі мертва → 30 хв напряму
+
+def _profile_budget_wait(via, w_next=120):
+    """Спати, доки вага останніх 60с по каналу + очікувана вага сторінки
+    не вкладеться у стелю. Максимум ~65с (одне вікно)."""
+    cap = PROFILE_W_PER_MIN[via]
+    deadline = time.time() + 65
+    while True:
+        now_ = time.time()
+        with _profile_w_lock:
+            dq = _profile_w[via]
+            while dq and dq[0][0] < now_ - 60:
+                dq.popleft()
+            used = sum(w for _, w in dq)
+            oldest = dq[0][0] if dq else now_
+        if used + w_next <= cap or now_ >= deadline:
+            return
+        time.sleep(min(5.0, max(0.5, oldest + 60 - now_)))
+
+def _profile_budget_add(via, batch):
+    w = 20 + (len(batch) // 20 if isinstance(batch, list) else 0)
+    with _profile_w_lock:
+        _profile_w[via].append((time.time(), w))
+
 def _profile_post(body):
     """Сторінка історії: через REST-проксі (rest_proxy.txt), якщо вона
-    є — щоб важкі 90-денні вибірки не їли ліміт основної IP; збій проксі
-    = прямий канал для ЦІЄЇ сторінки (не «ніколи», як було б із фолбеком
-    на весь профіль)."""
-    if REST_PROXY:
+    є і не визнана мертвою — щоб важкі 90-денні вибірки не їли ліміт
+    основної IP. Мережевий збій проксі → 30 хв напряму (не таймаут 10с
+    на кожній із 6 сторінок кожного гаманця). 429 на проксі — це
+    ВИЧЕРПАНИЙ бюджет, а не мертвий канал: НЕ переносимо вагу на IP
+    детекції, віддаємо RateLimited викликачу (рев'ю v2.8)."""
+    now_ = time.time()
+    via = "direct"
+    if REST_PROXY and now_ >= _profile_proxy["dead_until"]:
+        ds = _prio_proxy_state.get("dead_since", 0.0)
+        if not ds or now_ - ds >= 1800:   # prio-воркер теж не вважає мертвою
+            via = "proxy"
+    if via == "proxy":
+        _profile_budget_wait("proxy")
         try:
-            return hl_post_prio(body, retries=1)
+            r = hl_post_prio(body, retries=1)
+            _profile_budget_add("proxy", r)
+            return r
+        except RateLimited:
+            raise
         except Exception as e:
-            print(f"  [F4] проксі історії: {e} — сторінка напряму")
-    return hl_post(body, retries=2)
+            _profile_proxy["dead_until"] = time.time() + 1800
+            print(f"  [F4] проксі історії: {e} — 30 хв напряму")
+    _profile_budget_wait("direct")
+    r = hl_post(body, retries=2)
+    _profile_budget_add("direct", r)
+    return r
 
 def _fetch_profile(addr):
     with _profile_sem:
@@ -4015,8 +4203,11 @@ def _fetch_profile_locked(addr):
         truncated = capped = 0
         for i in range(PROFILE_PAGES):
             if i: time.sleep(1.0)   # між сторінками: бюджет ваги
+            # endTime фіксований на всю пагінацію: вікно не «їде» під
+            # час запитів (визнана межа v2.4 закрита)
             batch = _profile_post({"type": "userFillsByTime", "user": addr,
-                                   "startTime": cursor})
+                                   "startTime": cursor,
+                                   "endTime": int(now_ms)})
             if not isinstance(batch, list):
                 # відповідь не історія (напр. {"error": ...}): збій, а не
                 # "порожня історія". І на початку, і ПОСЕРЕД пагінації це
@@ -4024,6 +4215,16 @@ def _fetch_profile_locked(addr):
                 # інакше кешувався назавжди (рев'ю v2.2)
                 raise ValueError(f"bad history payload: {type(batch).__name__}")
             if not batch: break
+            # порядок сторінки — oldest-first, як у докстроці API: інший
+            # порядок дав би тихий профіль із 2000 останніх філів без
+            # hist_capped (рев'ю v2.8) — fail-closed, як у детекторі
+            try:
+                _t_first = int(batch[0].get("time", 0) or 0)
+                _t_last = int(batch[-1].get("time", 0) or 0)
+            except (TypeError, ValueError, AttributeError):
+                raise ValueError("bad history row")
+            if _t_first > _t_last:
+                raise ValueError("history order: descending page")
             new = 0
             for f in batch:
                 k = _fill_key(f)
@@ -4052,8 +4253,30 @@ def _fetch_profile_locked(addr):
         prof["n_fills"] = len(fills)
         if capped: prof["hist_capped"] = 1
         if truncated: prof["truncated"] = 1
+    except RateLimited as e:
+        # 429 = вичерпаний бюджет, а не бита історія: профіль НЕ пишемо
+        # (валідний старий лишається чинним), ретрай за 5 хв — інакше
+        # у каскадний день уся черга діставала err на 6 год і втрачала
+        # право на F4/F5 при живому кеші (рев'ю v2.8)
+        with strat2_lock:
+            profile_retry_at[addr] = time.time() + PROFILE_429_RETRY_S
+            profiles_fetching.discard(addr)
+        print(f"  [F4] профіль {addr[:10]}…: {e} — ретрай за "
+              f"{PROFILE_429_RETRY_S // 60} хв")
+        return
     except Exception as e:
         print(f"  [F4] профіль {addr[:10]}…: {e}")
+        with strat2_lock:
+            old = wallet_profiles.get(addr)
+            if (old is not None and old.get("v") == PROFILE_ALGO_V
+                    and not old.get("err")
+                    and time.time() - old.get("fetched", 0) < PROFILE_HARD_TTL_S):
+                # збій РЕФРЕШУ при ще валідному профілі (stale-while-
+                # revalidate): не затираємо його err-ом, ретрай за 30 хв
+                old["refresh_failed_at"] = int(time.time())
+                profile_retry_at[addr] = time.time() + PROFILE_FAIL_RETRY_S
+                profiles_fetching.discard(addr)
+                return
         # err=1: "невідомо, історія не отрималась" — НЕ вирок гаманцю;
         # _profile_request повторить запит після TTL (аудит п.5)
         prof = {"ok": False, "err": 1, "n_ep": 0, "n_big": 0, "n_fast": 0,
@@ -4637,27 +4860,35 @@ def strat2_api():
     }
     # спільна крива FOLLOW-входів із тіньової стрічки: усі F-стратегії
     # входять на тих самих сигналах, тож крива в них одна на всіх
+    # v2.8: окремо когорта ПЕРШИХ пострілів пари (first_shot=1) — це
+    # власна крива F5 («яка хвилина виходу найкраща саме для неї»)
     fcurve = [[] for _ in range(REV_TRACK_MIN)]
-    fcomplete = []
+    f1curve = [[] for _ in range(REV_TRACK_MIN)]
+    fcomplete, f1complete, n_first = [], [], 0
     for r in fouts:
         fcosts = fnum(r.get("costs_pct"), 0.15) or 0.15
+        is_first = fnum(r.get("first_shot")) == 1
+        if is_first: n_first += 1
         row_vals = []
         for i in range(REV_TRACK_MIN):
             v = fnum(r.get(f"m{i+1}"))
             row_vals.append(v)
             if v is not None:
                 fcurve[i].append(v - fcosts)
+                if is_first: f1curve[i].append(v - fcosts)
         if row_vals and all(v is not None for v in row_vals):
             fcomplete.append([v - fcosts for v in row_vals])
-    out["follow_tape"] = {
-        "n": len(fouts),
-        "curve": [(_median(c) if c else None) for c in fcurve],
-        "curve_n": [len(c) for c in fcurve],
-        "curve_common": ([_median([c[i] for c in fcomplete])
-                          for i in range(REV_TRACK_MIN)]
-                         if fcomplete else None),
-        "curve_common_n": len(fcomplete),
-    }
+            if is_first: f1complete.append([v - fcosts for v in row_vals])
+    def _tape(n, curve, complete):
+        return {"n": n,
+                "curve": [(_median(c) if c else None) for c in curve],
+                "curve_n": [len(c) for c in curve],
+                "curve_common": ([_median([c[i] for c in complete])
+                                  for i in range(REV_TRACK_MIN)]
+                                 if complete else None),
+                "curve_common_n": len(complete)}
+    out["follow_tape"] = _tape(len(fouts), fcurve, fcomplete)
+    out["follow_tape_first"] = _tape(n_first, f1curve, f1complete)
     _strat2_cache["data"] = out
     _strat2_cache["ts"] = now
     return out
@@ -4949,6 +5180,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "rate_limited":   stats["rate_limited"],
                 "rev_active":     len(rev_open),
                 "follow_active":  len(follow_open),
+                "follow_busy_skips": stats.get("follow_busy_skips", 0),
+                "profiles_queued": len(profiles_fetching),
                 "prio_proxy":     bool(REST_PROXY),
                 "prio_triggers":  prio_stats["triggers"],
                 "prio_added":     prio_stats["added"],
