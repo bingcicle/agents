@@ -1,0 +1,12 @@
+# -> /etc/logrotate.d/whale-terminal
+# copytruncate: бот тримає файл відкритим (systemd append), тому файл
+# обрізається на місці, без рестарту сервіса.
+/home/hl_data/terminal.log {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}

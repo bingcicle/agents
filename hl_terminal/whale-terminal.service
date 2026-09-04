@@ -1,0 +1,22 @@
+[Unit]
+Description=Hyperliquid Whale Terminal
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/hl_terminal
+# python з venv ПОЗА папкою коду (створити один раз):
+#   python3 -m venv /home/hl_venv
+#   /home/hl_venv/bin/pip install gspread google-auth   # лише якщо Sheets
+# Тоді заміна/видалення /home/hl_terminal не чіпає ані venv, ані даних
+# (дані бот тримає у /home/hl_data і сам мігрує їх при першому старті).
+ExecStart=/home/hl_venv/bin/python3 /home/hl_terminal/server.py
+Restart=always
+RestartSec=5
+StandardOutput=append:/home/hl_data/terminal.log
+StandardError=append:/home/hl_data/terminal.log
+
+[Install]
+WantedBy=multi-user.target

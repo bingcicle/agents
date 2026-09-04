@@ -1,0 +1,10 @@
+venvName/
+__pycache__/
+terminal.log
+state.json
+tg_chat.json
+tg_token.txt
+ws_proxy.txt
+rest_proxy.txt
+creds.json
+*.csv
