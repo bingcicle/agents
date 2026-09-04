@@ -313,7 +313,7 @@ footer .fr{margin-left:auto;display:flex;gap:20px}
     <div class="hstat"><i>Відкрито зараз</i><b class="sig" id="svOpen">—</b></div>
     <div class="hstat"><i>Чекають breakout</i><b id="svArmed">—</b></div>
     <div class="hstat"><i>Тіней (outcome)</i><b id="svShadow">—</b></div>
-    <div class="hstat"><i>Профілів F4</i><b id="svProf">—</b></div>
+    <div class="hstat"><i>Профілів F4·F7</i><b id="svProf">—</b></div>
     <div class="note">paper trading · $1000/угода · net після витрат · клік по картці — деталі</div>
     <div class="note" id="svResearch" style="display:none"></div>
   </div>
@@ -588,8 +588,10 @@ function setMore(){sMore=!sMore;renderSDetail();}
 function setSort(k){if(sSortK===k){sSortD=-sSortD;}else{sSortK=k;sSortD=-1;}
   renderSDetail();}
 const S_ORDER=['R1_загальний','R2_breakout','R3_великі','R4_великий','R5_дуже',
-               'R6_волт','F1_1хв','F2_2хв','F3_3хв','F4_розумний','F5_перший'];
-const S_PROF=new Set(['F4_розумний','F5_перший']);   // стратегії з профілем швидкості
+               'R6_волт','R7_одним','F1_1хв','F2_2хв','F3_3хв','F6_1хв_перший',
+               'F4_розумний','F5_перший','F7_без_ратіо'];
+const S_PROF=new Set(['F4_розумний','F5_перший','F7_без_ратіо']);   // стратегії з профілем швидкості
+const S_FIRST=new Set(['F5_перший','F6_1хв_перший','F7_без_ратіо']); // вхід лише на 1-му пострілі пари
 function secTxt(v){if(v==null)return '—';return v>=120?(v/60).toFixed(1)+' хв':v.toFixed(0)+' с';}
 
 function switchView(v){
@@ -713,7 +715,8 @@ function renderStrat(){
     } else rEl.style.display='none';
   }
   const pr=sData.profiles||{};
-  document.getElementById('svProf').textContent=(pr.ok??0)+'/'+(pr.total??0);
+  // ok = придатні для F4/F5 (з ratio-гейтом); ok_nr = для F7 (без ratio)
+  document.getElementById('svProf').textContent=(pr.ok??0)+'·'+(pr.ok_nr??0)+'/'+(pr.total??0);
   const openBy={};
   (sData.open||[]).forEach(o=>{openBy[o.strategy]=(openBy[o.strategy]||0)+1;});
   let html='';
@@ -734,7 +737,7 @@ function renderStrat(){
       <div class="scard-spark">${sparkSvg(s.cum)}</div>
       <div class="scard-halves">половини: <b class="${pctCls(s.half1)}">${pctTxt(s.half1)}</b> / <b class="${pctCls(s.half2)}">${pctTxt(s.half2)}</b>${s.kind==='rev'?' · метрика: вихід m30':''}</div>
       ${(S_PROF.has(name)&&s.prof&&s.prof.wallets)?`<div class="scard-halves">гаманців ${s.prof.wallets} · швидких/повільних епізодів ${s.prof.n_fast}/${s.prof.n_slow} · частка швидких (мед.) ${s.prof.fast_pct_med==null?'—':s.prof.fast_pct_med.toFixed(0)+'%'} · злив від 1-ї tx: мед. ${secTxt(s.prof.unload_med_s)}, сер. ${secTxt(s.prof.unload_mean_s)}</div>`:''}
-      ${(s.kind==='follow'&&name!=='F5_перший'&&s.n)?`<div class="scard-halves">перших пострілів пари: ${s.first_shot_n||0} з ${s.n}${name==='F4_розумний'?' (стільки ж «є» F5)':''}</div>`:''}
+      ${(s.kind==='follow'&&!S_FIRST.has(name)&&s.n)?`<div class="scard-halves">перших пострілів пари: ${s.first_shot_n||0} з ${s.n}${name==='F4_розумний'?' (стільки ж «є» F5)':''}</div>`:''}
     </div>`;
   }
   document.getElementById('sCards').innerHTML=html||'<div class="empty-note">Немає даних</div>';
@@ -853,7 +856,7 @@ function renderSDetail(){
       // тіньова стрічка входів (одні сигнали на всі F-стратегії)
       // F5 — власна когорта: лише перші постріли пари (first_shot=1)
       const tf=sData.follow_tape_first;
-      const useFirst=sSel==='F5_перший'&&tf&&tf.n>0;
+      const useFirst=S_FIRST.has(sSel)&&tf&&tf.n>0;   // F5/F6/F7 — когорта 1-х пострілів
       const src=isRev?s:(useFirst?tf:(sData.follow_tape&&sData.follow_tape.n?sData.follow_tape:null));
       if(!src) return '';
       // спільна когорта: кожна хвилина з ТИХ САМИХ угод — лише тоді
@@ -864,7 +867,7 @@ function renderSDetail(){
       // ЧЕСНИЙ підпис для F: стрічка — ВСІ follow-сигнали, не входи
       // саме цієї стратегії (F4 відкривається на підмножині — його
       // власна вибірка інша; аудит v2.5 №3)
-      const lbl=(isRev?'':(useFirst?'лише перші постріли пари (когорта F5) · ':'усі follow-сигнали, НЕ лише входи цієї стратегії · '))
+      const lbl=(isRev?'':(useFirst?'лише перші постріли пари (когорта F5/F6/F7) · ':'усі follow-сигнали, НЕ лише входи цієї стратегії · '))
         +(useC?('спільна когорта (усі 60 хв у кожній угоді) · n='+src.curve_common_n)
               :'вся вибірка · увага: різні хвилини = різні набори угод');
       return `<div class="sd-chart"><h4>Медіана net за хвилиною виходу (1–60) · ${lbl}</h4>${curveSvg(s._dispCurve,s._dispN)}<div class="ctip" id="cTip"></div></div>`;

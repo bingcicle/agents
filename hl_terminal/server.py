@@ -65,6 +65,12 @@ DELAY     = 0.05   # затримка між запитами (сек)
 # повертатись до них раз на CHECK_EVERY сканів
 SKIP_AFTER  = 3
 CHECK_EVERY = 5
+# ВИНЯТОК (аудит покриття 04.09): топ-N лідерборду за accountValue
+# сканується КОЖЕН скан, без smart-skip. Хронічно "порожній" гаманець з
+# $50M екваті — це кит між позиціями, а не мертвий акаунт; смарт-скіп
+# бачив його раз на ~3.7 год нарівні з нульовими. Ціна: ~+6.5% часу
+# циклу (виміряно на лозі 944 год)
+VIP_TOP_N   = 2000
 
 # Скільки WS-знайдених гаманців (поза лідербордом) максимум додаємо
 # до одного скану. Запобіжник від сплеску нових адрес у стрімі трейдів.
@@ -1333,6 +1339,15 @@ def update_watchlist(result, depth_snap, scan_start=0, failed_addrs=None,
                      fetch_times=None):
     """Оновлює watchlist після повного скану. fetch_times: addr -> коли
     скан реально зчитав цей гаманець (для звірки з tombstone-ами)."""
+    # Гард глибини, ЯК у check_position_changes (аудит покриття 04.09):
+    # без нього порожній depth-знімок (Binance-бан довший за перший
+    # цикл глибини) дав би кожній позиції ratio=0 і СТЕР би весь
+    # watchlist. Старий watchlist кращий за порожній: sweep продовжить
+    # вести живі пари, наступний скан перебудує чесно.
+    if len(depth_snap) < 10:
+        print(f"  [WATCH] depth-знімок неповний ({len(depth_snap)} монет) "
+              f"— watchlist НЕ перезаписується")
+        return
     new_wl = {}
     for coin, positions in result.items():
         if coin.upper() in COIN_BLACKLIST:
@@ -2108,6 +2123,41 @@ def run_realtime_monitor():
                     if flipped_pos is not None:
                         _insert_flipped(addr, coin, flipped_pos,
                                         alert_key, snap_ms)
+
+            # НОВІ монети відомого кита (аудит покриття 04.09): відповідь
+            # clearinghouseState вже містить УСІ його позиції, але цикл
+            # вище дивиться лише на ті, що ВЖЕ у watchlist — нова монета
+            # чекала повного скану (до 30+ хв) при нулі додаткових
+            # запитів. ratio>=2 -> одразу під нагляд; курсор філів на
+            # момент знімка: все до нього — історія нової пари, не сигнал
+            for _nc, _np in current.items():
+                if _nc in coins or _nc.upper() in COIN_BLACKLIST:
+                    continue
+                with cache_lock:
+                    _dd = (cache["depth"].get(_nc)
+                           or cache.get("depth_prev", {}).get(_nc))
+                _ds = depth_for_side(_dd, _np.get("side"))
+                _r = _np["val"] / _ds if _ds else 0
+                if _r < 2.0:
+                    continue
+                _nk = f"{addr}:{_nc}"
+                with watchlist_lock:
+                    if _nc in watchlist.get(addr, {}):
+                        continue   # realtime додав її після нашого знімка
+                    watchlist.setdefault(addr, {})[_nc] = {
+                        "size":  _np["size"],
+                        "val":   _np["val"],
+                        "side":  _np["side"],
+                        "ratio": _r,
+                        "entry": _np.get("entry", 0),
+                        "liq":   _np.get("liq", 0),
+                        "upd":   time.time(),
+                    }
+                sent_alerts.discard(_nk)
+                close_episodes.pop(_nk, None)
+                fill_cursor[_nk] = max(fill_cursor.get(_nk, 0), snap_ms)
+                print(f"  [WATCH] {_nc} {addr[:10]} нова монета кита зі "
+                      f"sweep: {_np['side']} ratio {_r:.1f}x під наглядом")
 
     def _safe_worker(item):
         try:
@@ -2969,7 +3019,7 @@ def run_state_saver():
 #  Кит продав усю позицію маркетом за < 5 хвилин, ціна пішла
 #  за його потоком на >= 1%. Тиск скінчився: заходимо у
 #  протилежний до його продажу бік (лонг після дампа лонгіста,
-#  шорт після відкупу шортиста) і 30 хвилин щохвилини пишемо
+#  шорт після відкупу шортиста) і 60 хвилин щохвилини пишемо
 #  зміну ціни, щоб знайти статистично найкращу хвилину виходу.
 #  Вхід поки ВІРТУАЛЬНИЙ: для реальних ордерів на Binance
 #  потрібні API-ключі, місце для них позначено нижче.
@@ -2979,7 +3029,9 @@ FC_MIN_MOVE_PCT  = 0.7      # мінімальний рух ціни за час
                             # (28.08: 1.0 -> 0.7, більше епізодів у трек;
                             # аналіз показав +30-50% сигналів у зоні 0.7-1.0)
 FC_MAX_EPISODE_S = 300      # перша→остання транзакція максимум 5 хв
-FC_TRACK_MIN     = 30       # хвилин трекаємо після входу
+FC_TRACK_MIN     = 60       # хвилин трекаємо після входу (ТЗ 04.09:
+                            # 30 -> 60, старий fc_trades.csv ротується
+                            # у .legacy через зміну заголовків)
 FC_MAX_OPEN      = 5
 FC_WORKSHEET     = "fullclose"
 FC_CSV           = os.path.join(DATA_DIR, "fc_trades.csv")
@@ -2987,7 +3039,7 @@ HLP_LIQUIDATOR   = "0x2e3d94f0562703b25c83308a05046ddaf9a8dd14"  # backstop-vaul
 
 FC_HEADERS = (["date", "coin", "our_side", "whale_addr", "sum_usd",
                "duration_s", "ratio", "ratio_per_min", "move_pct",
-               "entry_px", "pnl_30m_pct", "peak_pct"]
+               "entry_px", "pnl_end_pct", "peak_pct"]
               + [f"m{i}" for i in range(1, FC_TRACK_MIN + 1)])
 
 fc_lock      = threading.Lock()
@@ -3076,22 +3128,17 @@ def _fc_finish(key):
            round(pos["ratio"], 2), round(rpm, 3),
            round(pos["move_pct"], 3), round(pos["entry_mid"], 8),
            round(pnl30, 3), round(pos["peak"], 3)] + pos["samples"][:FC_TRACK_MIN]
-    try:
-        import csv as _csv
-        newf = not os.path.exists(FC_CSV)
-        with open(FC_CSV, "a", newline="", encoding="utf-8") as f:
-            w = _csv.writer(f)
-            if newf: w.writerow(FC_HEADERS)
-            w.writerow(row)
-    except Exception as e:
-        print(f"  [FC] csv err: {e}")
+    # _strat_csv_append: старий файл із заголовком m1..m30 (до ТЗ 04.09
+    # «трек 60 хв») ротується у .legacy, а не отримує рядки чужої ширини
+    if not _strat_csv_append(FC_CSV, FC_HEADERS, row):
+        print(f"  [FC] csv err: рядок {pos['coin']} не записано")
     _sheets_append(FC_WORKSHEET, FC_HEADERS, row)
     print(f"  [FC] DONE {pos['coin']} за {FC_TRACK_MIN} хв | "
-          f"pnl30 {pnl30:+.2f}% | peak {pos['peak']:+.2f}%")
+          f"pnl_end {pnl30:+.2f}% | peak {pos['peak']:+.2f}%")
     threading.Thread(target=save_state, daemon=True).start()
 
 def run_fc_loop():
-    """Кожні 5с: семпли по хвилинах, закриття після 30-ї."""
+    """Кожні 5с: семпли по хвилинах, закриття після FC_TRACK_MIN-ї."""
     while True:
         time.sleep(5)
         with fc_lock:
@@ -3140,6 +3187,7 @@ def run_fc_loop():
 #   R3_великі    — лише ZEC/HYPE, рух >=1%
 #   R4_великий   — рух >=2%    R5_дуже — рух >=3%
 #   R6_волт      — сигнали від волтів (окремо, як просив користувач)
+#   R7_одним     — повне закриття ОДНІЄЮ транзакцією >=$100k (ТЗ 04.09)
 #   Кожна позиція трекає ціну ЩОХВИЛИНИ 60 хв (m1..m60) — з кривої
 #   видно, на якій хвилині виходити найкраще.
 #
@@ -3147,10 +3195,13 @@ def run_fc_loop():
 #   сигнал: одна транзакція закрила >=5% позиції за раз
 #   (одночасні — один вхід на монету на стратегію).
 #   F1/F2/F3 — вихід: повне закриття АБО 1/2/3 хв без нових закриттів
+#   F6_1хв_перший — як F1, але вхід лише на першому пострілі пари
 #   F4_розумний — лише гаманці, що РАНІШЕ зливали позиції >$100k
 #   шматками >=5% і до 5 хв (профіль з історії філів, кешується);
 #   вихід через 2 середні паузи гаманця (кламп 1..5 хв) або повне
 #   закриття.
+#   F5_перший — F4 + лише перший постріл пари (пауза >=1 год)
+#   F7_без_ратіо — F5, але кваліфікація профілю без ratio (лише $100k)
 # ═════════════════════════════════════════════════════════
 STRAT2_ENABLED   = True
 REV_CSV          = os.path.join(DATA_DIR, "rev_trades.csv")
@@ -3172,6 +3223,19 @@ F5_NAME          = "F5_перший"   # ті самі швидкі гаманц
                                  # монета або після паузи ≥1 год (ТЗ
                                  # 01.09 п.3; дослідження: повтори пари в
                                  # межах години — шум)
+# ── ТЗ 04.09 ──
+F6_NAME          = "F6_1хв_перший"  # «тиша 1 хв», але вхід лише на
+                                    # першому пострілі пари (як F5),
+                                    # БЕЗ вимоги профілю гаманця
+F6_TIMER_S       = 60.0
+F7_NAME          = "F7_без_ратіо"   # швидкі гаманці · перший постріл,
+                                    # але кваліфікація профілю БЕЗ
+                                    # ratio-гейта: великий епізод =
+                                    # лише ≥$100k (nr-гілка профілю)
+R7_NAME          = "R7_одним"       # реверс «одним пострілом»: ПОВНЕ
+                                    # закриття однією транзакцією
+                                    # ≥$100k, рух ≥1% — вхід одразу
+R7_MIN_TX_USD    = 100_000.0
 # ── ПРОФІЛЬ ШВИДКИХ ГАМАНЦІВ (ТЗ 01.09 п.2) ──
 # Вікно — 3 місяці історії філів (кап API: 10k останніх). Великий епізод
 # = розвантаження позиції, що на момент ПЕРШОЇ агресивної транзакції
@@ -3191,7 +3255,7 @@ F4_CLAMP         = (60.0, 300.0)
 F5_FIRST_SHOT_S  = 3600.0   # пауза пари, після якої tx знову «перша»
 PROFILE_WINDOW_D = 90       # глибина історії, днів
 PROFILE_PAGES    = 6        # 5 × 2000 = кап API 10k; 6-та — детект «є ще»
-PROFILE_ALGO_V   = 7      # версія алгоритму профілів: старі записи без
+PROFILE_ALGO_V   = 8      # версія алгоритму профілів: старі записи без
                           # цієї позначки перераховуються (аудит v2.1 п.3;
                           # v3: boundary-safe пагінація; v4: епізод =
                           # позиція, malformed fail-closed, композитний
@@ -3202,8 +3266,10 @@ PROFILE_ALGO_V   = 7      # версія алгоритму профілів: с
                           # bool, NaN/coin fail-closed; v7: профіль
                           # ШВИДКОСТІ — 90 днів, епізод від 1-ї tx ≥5%,
                           # ratio-гейт, швидкі/повільні, статистика
-                          # зливу; 10k-кап API більше не «truncated»)
-DATA_ALGO_V      = "2.8"  # версія логіки збору: трекер отримує її при
+                          # зливу; 10k-кап API більше не «truncated»;
+                          # v8: паралельна nr-гілка БЕЗ ratio-гейта
+                          # (лише ≥$100k) — кваліфікація F7, ТЗ 04.09)
+DATA_ALGO_V      = "2.9"  # версія логіки збору: трекер отримує її при
                           # СТВОРЕННІ і несе у рядок; API рахує лише
                           # поточну версію (аудит v2.2: рестарт підписував
                           # старі трекери новою версією). При зміні
@@ -3229,11 +3295,14 @@ STRAT2_TITLES = {
     "R4_великий":   "Реверс · сильний рух ≥2%",
     "R5_дуже":      "Реверс · екстрим ≥3%",
     "R6_волт":      "Реверс · волти",
+    "R7_одним":     "Реверс · одним пострілом",
     "F1_1хв":       "За китом · тиша 1 хв",
     "F2_2хв":       "За китом · тиша 2 хв",
     "F3_3хв":       "За китом · тиша 3 хв",
+    "F6_1хв_перший": "За китом · тиша 1 хв · перший постріл",
     "F4_розумний":  "За китом · швидкі гаманці",
     "F5_перший":    "За китом · швидкі гаманці · перший постріл",
+    "F7_без_ратіо": "За китом · перший постріл · без ratio",
 }
 STRAT2_DESC = {
     "R1_загальний": "Проти кита: він повністю злив позицію, монета впала "
@@ -3245,6 +3314,8 @@ STRAT2_DESC = {
     "R5_дуже":      "Відскок тільки після екстремального руху ≥3% за 3 хв",
     "R6_волт":      "Відскок після зливу ВОЛТОМ (механічний вивід коштів "
                     "вкладників, не рішення трейдера)",
+    "R7_одним":     "Проти кита: ВСЯ позиція закрита однією транзакцією "
+                    "≥$100k, рух ≥1% за 3 хв — вхід одразу",
     "F1_1хв":       "Разом з китом: він скинув ≥5% позиції — входимо в "
                     "його бік, виходимо після 1 хв без нових продажів",
     "F2_2хв":       "Разом з китом, вихід після 2 хв тиші",
@@ -3256,6 +3327,12 @@ STRAT2_DESC = {
     "F5_перший":    "Те саме, що швидкі гаманці, але вхід лише на ПЕРШІЙ "
                     "транзакції пари гаманець:монета (або після паузи "
                     "≥1 год) — повтори в межах години пропускаються",
+    "F6_1хв_перший": "Як «тиша 1 хв», але вхід лише на ПЕРШІЙ транзакції "
+                    "пари гаманець:монета (або після паузи ≥1 год); "
+                    "профіль гаманця не вимагається",
+    "F7_без_ратіо": "Як «перший постріл», але кваліфікація гаманця БЕЗ "
+                    "фільтра ratio: великий епізод = лише ≥$100k "
+                    "(≥5 швидких за 3 міс і ≥70% швидких)",
 }
 
 REV_SIG_HEADERS = ["sig_id", "date", "coin", "fade_side", "whale_addr", "src",
@@ -3542,6 +3619,16 @@ def rev_on_close(addr, coin, old, mfills, full_close):
     _txh = str(mfills[-1].get("hash", ""))[2:10]
     _sig_seq[0] += 1
     sig_id = f"{int(now * 1000)}-{coin}-{addr[2:8]}-{_txh}-{_sig_seq[0]}"
+    # «одним пострілом» (ТЗ 04.09 п.2): повне закриття, у якому ОДНА
+    # маркет-транзакція (hash-група; батч може нести ще пил) закрила
+    # ≥95% позиції і коштувала ≥$100k. mfills уже згруповані по hash у
+    # get_recent_market_fills, фліп-розмір клампнутий викликачем.
+    one_shot = 0
+    if full_close and mfills:
+        _big_tx = max(mfills, key=lambda f: f["sz"])
+        if _big_tx["sz"] >= base_sz * F4_FULL_PCT \
+           and _big_tx["px"] * _big_tx["sz"] >= R7_MIN_TX_USD:
+            one_shot = 1
     if below_threshold or src == "partial":
         strats = []   # 0.5-1% або часткове закриття: лише outcome-стрічка
     elif src == "vault":
@@ -3551,6 +3638,7 @@ def rev_on_close(addr, coin, old, mfills, full_close):
         if coin in BIG_COINS: strats.append("R3_великі")
         if mag >= 2.0: strats.append("R4_великий")
         if mag >= 3.0: strats.append("R5_дуже")
+        if one_shot: strats.append(R7_NAME)   # вхід одразу, як R1
     base_pos = {"sig_id": sig_id, "coin": coin,
                 "side": side, "addr": addr, "src": src,
                 "detect_ts": now, "detect_px": px_now,
@@ -3751,6 +3839,11 @@ def follow_on_txs(addr, coin, old, mfills, full_close):
     # раніше, м'який стан без права на вхід
     f4_ok = (prof_valid and prof.get("ok") and not prof.get("truncated")
              and now - prof.get("fetched", 0) < PROFILE_HARD_TTL_S)
+    # F7: та сама свіжість/цілісність, але кваліфікація по nr-гілці
+    # профілю (епізоди без ratio-гейта, лише ≥$100k — ТЗ 04.09 п.9)
+    nr_prof = (prof.get("nr") or {}) if prof_valid else {}
+    f7_ok = (prof_valid and nr_prof.get("ok") and not prof.get("truncated")
+             and now - prof.get("fetched", 0) < PROFILE_HARD_TTL_S)
     if prof_valid:
         base["prof"] = {"n_fast": prof.get("n_fast", 0),
                         "n_slow": prof.get("n_slow", 0),
@@ -3761,29 +3854,53 @@ def follow_on_txs(addr, coin, old, mfills, full_close):
     with strat2_lock:
         busy = {(p["strategy"], p["coin"]) for p in follow_open.values()
                 if not p.get("done")}
-        for st, timer in FOLLOW_TIMERS.items():
+        # F6 — таймер F1 (тиша 1 хв), але ЛИШЕ перший постріл пари; без
+        # вимоги профілю (ТЗ 04.09 п.3)
+        _timers = list(FOLLOW_TIMERS.items())
+        if first_shot:
+            _timers.append((F6_NAME, F6_TIMER_S))
+        for st, timer in _timers:
             if (st, coin) in busy: continue
             it = dict(base); it["strategy"] = st; it["timer"] = float(timer)
             follow_open[f"{key}|{st}|{int(now)}"] = it
+        # F4 — кожна достатня транзакція швидкого гаманця; F5 — ті
+        # самі гаманці, але ЛИШЕ перший постріл пари (або пауза
+        # ≥1 год): повтори в межах години — шум (дослідження H080);
+        # F7 — як F5, але кваліфікація nr (без ratio-гейта, ТЗ 04.09
+        # п.9): свій таймер 2×пауза зі СВОЄЇ популяції епізодів
+        _prof_strats = []
         if f4_ok:
             gap2 = 2.0 * float(prof.get("avg_gap_s", 0) or 0)
             timer4 = min(max(gap2, F4_CLAMP[0]), F4_CLAMP[1])
-            # F4 — кожна достатня транзакція швидкого гаманця; F5 — ті
-            # самі гаманці, але ЛИШЕ перший постріл пари (або пауза
-            # ≥1 год): повтори в межах години — шум (дослідження H080)
-            for st_name, allowed in ((F4_NAME, True), (F5_NAME, first_shot)):
-                if not allowed: continue
-                if (st_name, coin) in busy:
-                    # пропуск через «монета зайнята» іншим китом видимий:
-                    # F5-події рідкісні, мовчазний скіп ховав би частку
-                    # вибірки (рев'ю v2.8)
-                    stats["follow_busy_skips"] = stats.get("follow_busy_skips", 0) + 1
-                    print(f"  [FOLLOW] {st_name} пропуск: {coin} зайнята "
-                          f"({addr[:10]}…)")
-                    continue
-                it = dict(base); it["strategy"] = st_name
-                it["timer"] = timer4; it["profile_gap"] = timer4
-                follow_open[f"{key}|{st_name}|{int(now)}"] = it
+            _prof_strats += [(F4_NAME, timer4, True, None),
+                             (F5_NAME, timer4, first_shot, None)]
+        if f7_ok:
+            gap7 = 2.0 * float(nr_prof.get("avg_gap_s", 0) or 0)
+            timer7 = min(max(gap7, F4_CLAMP[0]), F4_CLAMP[1])
+            _prof_strats.append((F7_NAME, timer7, first_shot, nr_prof))
+        for st_name, timer_x, allowed, prof_override in _prof_strats:
+            if not allowed: continue
+            if (st_name, coin) in busy:
+                # пропуск через «монета зайнята» іншим китом видимий:
+                # F5/F7-події рідкісні, мовчазний скіп ховав би частку
+                # вибірки (рев'ю v2.8)
+                stats["follow_busy_skips"] = stats.get("follow_busy_skips", 0) + 1
+                print(f"  [FOLLOW] {st_name} пропуск: {coin} зайнята "
+                      f"({addr[:10]}…)")
+                continue
+            it = dict(base); it["strategy"] = st_name
+            it["timer"] = timer_x; it["profile_gap"] = timer_x
+            if prof_override is not None:
+                # рядок F7 несе ЙОГО кваліфікацію (nr-гілку), а не
+                # ratio-гейтнуту — інакше статистика приписувала б F7
+                # чужу популяцію епізодів
+                it["prof"] = {"n_fast": prof_override.get("n_fast", 0),
+                              "n_slow": prof_override.get("n_slow", 0),
+                              "fast_pct": prof_override.get("fast_pct"),
+                              "unload_med_s": prof_override.get("unload_med_s"),
+                              "unload_mean_s": prof_override.get("unload_mean_s"),
+                              "window_d": prof.get("window_d")}
+            follow_open[f"{key}|{st_name}|{int(now)}"] = it
         # ТІНЬОВА хвилинна стрічка follow-входу: m1..m60 незалежно від
         # правил виходу — одна на активну пару кит:монета
         fo_busy = any(p.get("strategy") == "_FOLLOW_OUT"
@@ -3866,7 +3983,8 @@ def _profile_request(addr):
             profiles_fetching.discard(a)
         print(f"  [F4] потік профілю {a[:10]}… не стартував: {e}")
 
-def _grade_episode(ep, coin, depth_fn, now_ms, is_last, tail=()):
+def _grade_episode(ep, coin, depth_fn, now_ms, is_last, tail=(),
+                   min_ratio=F4_MIN_RATIO):
     """Оцінка ОДНОГО сегмента позиції (між реопенами/flat) за ТЗ 01.09.
     ep: закриття у хронології: (t_ms, px, sz_close, start_pos, aggr, side),
         aggr = тейкер (crossed) і не-TWAP — «агресивна транзакція».
@@ -3874,22 +3992,26 @@ def _grade_episode(ep, coin, depth_fn, now_ms, is_last, tail=()):
         епізоду шукається і там у межах 5 хв від старту: долив >2% посеред
         зливу ділить СЕГМЕНТ, але не епізод (рев'ю v2.8: «продав 10%,
         докупив 5%, за 40с злив усе» — один швидкий, не slow + fast 0с).
+    min_ratio: гейт ratio на старті епізоду; 0 = БЕЗ гейта (nr-гілка
+        профілю для F7, ТЗ 04.09 п.9 — лишається тільки поріг $100k;
+        глибина тоді не обов'язкова, ratio у результаті інформативний).
     Повертає:
       None                — не великий епізод (жодна агресивна tx ≥5% не
-                            пройшла гейти $100k / ratio ≥2);
-      {"nodepth": 1}      — глибини монети немає: ratio не порахувати;
+                            пройшла гейти $100k / ratio);
+      {"nodepth": 1}      — глибини монети немає: ratio не порахувати
+                            (лише при min_ratio > 0);
       {"inprog": 1}       — старт <5 хв тому і ще не закрито: триває;
       {"fast": 0/1, "unload_s": с|None, "gaps": [...], "usd": $,
        "ratio": r, "end_t": ms|None}
     Старт = ПЕРША агресивна tx з часткою ≥5% від позиції НА ТОЙ МОМЕНТ,
-    за умови позиції ≥$100k і ratio ≥2 (до ПОТОЧНОЇ глибини сторони).
-    Позиція в сегменті лише зменшується, тому гейти $/ratio монотонні:
-    перевіряємо кожен шматок ≥5%, доки один не пройде. Кінець = перший
-    філ, після якого залишок (startPosition − закрите — це число самої
-    біржі) ≤5% від позиції на старті; рахуються ВСІ закриття — мейкер,
-    TWAP, ліквідація: «закрив повністю» не залежить від способу.
-    Швидкий = кінець − старт ≤5 хв. Не закрив і старт >5 хв тому →
-    повільний."""
+    за умови позиції ≥$100k і ratio ≥ min_ratio (до ПОТОЧНОЇ глибини
+    сторони). Позиція в сегменті лише зменшується, тому гейти $/ratio
+    монотонні: перевіряємо кожен шматок ≥5%, доки один не пройде.
+    Кінець = перший філ, після якого залишок (startPosition − закрите —
+    це число самої біржі) ≤5% від позиції на старті; рахуються ВСІ
+    закриття — мейкер, TWAP, ліквідація: «закрив повністю» не залежить
+    від способу. Швидкий = кінець − старт ≤5 хв. Не закрив і старт
+    >5 хв тому → повільний."""
     start_i = None
     ratio = 0.0
     usd0 = 0.0
@@ -3899,10 +4021,13 @@ def _grade_episode(ep, coin, depth_fn, now_ms, is_last, tail=()):
         usd = sp * px
         if usd < F4_MIN_NOTIONAL: continue
         d = depth_fn(coin, side) or 0
-        if d <= 0:
-            return {"nodepth": 1}
-        r = usd / d
-        if r < F4_MIN_RATIO: continue
+        if min_ratio > 0:
+            if d <= 0:
+                return {"nodepth": 1}
+            r = usd / d
+            if r < min_ratio: continue
+        else:
+            r = usd / d if d > 0 else 0.0
         start_i, ratio, usd0 = i, r, usd
         break
     if start_i is None:
@@ -4037,22 +4162,7 @@ def _build_profile(fills, now_ms=None, depth_fn=None):
         sz_close = min(sz, sp) if sp > 0 else sz
         closes.setdefault(coin, []).append((t, cost / sz, sz_close, sp,
                                             aggr, side))
-    n_fast = n_slow = n_nodepth = n_inprog = 0
-    unl_fast, unl_all, gaps = [], [], []
-    def _take(res):
-        nonlocal n_fast, n_slow, n_nodepth
-        if res is None: return
-        if res.get("nodepth"):
-            n_nodepth += 1
-            return
-        if res["fast"]:
-            n_fast += 1
-            unl_fast.append(res["unload_s"])
-            gaps.extend(res["gaps"])
-        else:
-            n_slow += 1
-        if res["unload_s"] is not None:
-            unl_all.append(res["unload_s"])
+    segs_by_coin = {}
     for coin, lst in closes.items():
         lst.sort(key=lambda r: (r[0], -r[3]))
         segs, ep = [], []
@@ -4078,38 +4188,69 @@ def _build_profile(fills, now_ms=None, depth_fn=None):
                     ep = []
             ep.append(row)
         if ep: segs.append(ep)
-        consumed_until = -1   # рядки до кінця знайденого епізоду вже
-                              # враховані — наступний сегмент не має
-                              # народити з них другий епізод
-        for i, seg in enumerate(segs):
-            seg_eff = [r for r in seg if r[0] > consumed_until]
-            if not seg_eff: continue
-            tail = [r for s2 in segs[i + 1:] for r in s2]
-            res = _grade_episode(seg_eff, coin, depth_fn, now_ms,
-                                 i == len(segs) - 1, tail)
-            if res and res.get("inprog"):
-                n_inprog += 1
-                continue
-            if res and res.get("end_t") is not None:
-                consumed_until = max(consumed_until, res["end_t"])
-            _take(res)
-    n_big = n_fast + n_slow
-    fast_pct = round(100.0 * n_fast / n_big, 1) if n_big else None
-    ok = (n_fast >= F4_MIN_EPISODES and fast_pct is not None
-          and fast_pct >= F4_MIN_FAST_PCT)
-    avg = (sum(gaps) / len(gaps)) if gaps else 30.0   # одним пострілом = мін. кламп
-    out = {"ok": ok, "n_ep": n_fast, "n_big": n_big, "n_fast": n_fast,
-           "n_slow": n_slow, "fast_pct": fast_pct,
-           "unload_med_s": (round(_median(unl_fast), 1) if unl_fast else None),
-           "unload_mean_s": (round(sum(unl_fast) / len(unl_fast), 1)
-                             if unl_fast else None),
-           "unload_all_med_s": (round(_median(unl_all), 1) if unl_all else None),
-           "avg_gap_s": round(avg, 1),
-           "n_nodepth": n_nodepth, "n_inprog": n_inprog}
+        segs_by_coin[coin] = segs
+
+    def _pass(min_ratio):
+        """Один прохід оцінки епізодів по СПІЛЬНИХ сегментах. min_ratio
+        = F4_MIN_RATIO для основної гілки (F4/F5), 0 — для nr-гілки F7
+        (ТЗ 04.09 п.9: старт епізоду можуть відкривати РІЗНІ транзакції,
+        тому прохід чесно окремий, а не фільтр по готових епізодах)."""
+        n_fast = n_slow = n_nodepth = n_inprog = 0
+        unl_fast, unl_all, gaps = [], [], []
+        for coin, segs in segs_by_coin.items():
+            consumed_until = -1   # рядки до кінця знайденого епізоду вже
+                                  # враховані — наступний сегмент не має
+                                  # народити з них другий епізод
+            for i, seg in enumerate(segs):
+                seg_eff = [r for r in seg if r[0] > consumed_until]
+                if not seg_eff: continue
+                tail = [r for s2 in segs[i + 1:] for r in s2]
+                res = _grade_episode(seg_eff, coin, depth_fn, now_ms,
+                                     i == len(segs) - 1, tail, min_ratio)
+                if res is None: continue
+                if res.get("inprog"):
+                    n_inprog += 1
+                    continue
+                if res.get("nodepth"):
+                    n_nodepth += 1
+                    continue
+                if res.get("end_t") is not None:
+                    consumed_until = max(consumed_until, res["end_t"])
+                if res["fast"]:
+                    n_fast += 1
+                    unl_fast.append(res["unload_s"])
+                    gaps.extend(res["gaps"])
+                else:
+                    n_slow += 1
+                if res["unload_s"] is not None:
+                    unl_all.append(res["unload_s"])
+        n_big = n_fast + n_slow
+        fast_pct = round(100.0 * n_fast / n_big, 1) if n_big else None
+        ok = (n_fast >= F4_MIN_EPISODES and fast_pct is not None
+              and fast_pct >= F4_MIN_FAST_PCT)
+        avg = (sum(gaps) / len(gaps)) if gaps else 30.0   # одним пострілом
+                                                          # = мін. кламп
+        return {"ok": ok, "n_ep": n_fast, "n_big": n_big, "n_fast": n_fast,
+                "n_slow": n_slow, "fast_pct": fast_pct,
+                "unload_med_s": (round(_median(unl_fast), 1)
+                                 if unl_fast else None),
+                "unload_mean_s": (round(sum(unl_fast) / len(unl_fast), 1)
+                                  if unl_fast else None),
+                "unload_all_med_s": (round(_median(unl_all), 1)
+                                     if unl_all else None),
+                "avg_gap_s": round(avg, 1),
+                "n_nodepth": n_nodepth, "n_inprog": n_inprog}
+
+    out = _pass(F4_MIN_RATIO)
+    # nr-гілка (F7): ті самі філи/сегменти, гейт лише ≥$100k. Надмножина
+    # основної: кожен ratio-гейтнутий епізод є і тут (можливо, зі
+    # старшим стартом), плюс епізоди «$100k у глибокій монеті»
+    out["nr"] = _pass(0.0)
     if bad:
         # fail-closed: профіль з дір — "невідомо", не кваліфікація;
-        # err=1 -> F4 закритий, ретрай після TTL (аудит v2.3 п.5.2)
+        # err=1 -> F4/F7 закриті, ретрай після TTL (аудит v2.3 п.5.2)
         out.update(ok=False, err=1, bad_rows=bad)
+        out["nr"]["ok"] = False
     return out
 
 def _fill_key(f):
@@ -4624,7 +4765,7 @@ def strat2_api():
            "read_errors": read_errors[0]}
 
     for st in ("R1_загальний", "R2_breakout", "R3_великі", "R4_великий",
-               "R5_дуже", "R6_волт"):
+               "R5_дуже", "R6_волт", R7_NAME):
         rows = [r for r in rev if r.get("strategy") == st]
         # половини рахуємо у ХРОНОЛОГІЇ сигналів, а не в порядку
         # завершення записів (аудит п.10)
@@ -4698,7 +4839,7 @@ def strat2_api():
             "trades": trades[-120:],
         }
 
-    for st in list(FOLLOW_TIMERS) + [F4_NAME, F5_NAME]:
+    for st in list(FOLLOW_TIMERS) + [F6_NAME, F4_NAME, F5_NAME, F7_NAME]:
         rows = [r for r in fol if r.get("strategy") == st]
         rows.sort(key=lambda r: r.get("date_open") or "")
         nets, trades = [], []
@@ -4792,14 +4933,18 @@ def strat2_api():
         # f4_ok (версія, без err/truncated, НЕ старіший за жорстку
         # стелю) — інакше хедер показує більше "придатних", ніж F4
         # реально допускає (аудити v2.3 п.9.5, v2.4 п.1)
+        def _prof_ok(v, okf):
+            return (isinstance(v, dict) and okf(v)
+                    and v.get("v") == PROFILE_ALGO_V
+                    and not v.get("err") and not v.get("truncated")
+                    and now - v.get("fetched", 0) < PROFILE_HARD_TTL_S)
         out["profiles"] = {"total": len(wallet_profiles),
                            "ok": sum(1 for v in wallet_profiles.values()
-                                     if isinstance(v, dict) and v.get("ok")
-                                     and v.get("v") == PROFILE_ALGO_V
-                                     and not v.get("err")
-                                     and not v.get("truncated")
-                                     and now - v.get("fetched", 0)
-                                         < PROFILE_HARD_TTL_S)}
+                                     if _prof_ok(v, lambda p: p.get("ok"))),
+                           # придатні для F7 (nr-гілка без ratio, v2.9)
+                           "ok_nr": sum(1 for v in wallet_profiles.values()
+                                        if _prof_ok(v, lambda p:
+                                            (p.get("nr") or {}).get("ok")))}
     # лічильники сигналів — лише події >=1% (ті, що можуть відкривати
     # стратегії); суб-порогові 0.5-1% окремо (рев'ю v2.2); часткові
     # закриття (src=partial, лише тіньова стрічка) — теж окремо
@@ -4935,19 +5080,29 @@ def run_scan():
             extra = random.sample(extra, WS_EXTRA_MAX)
         all_wallets = lb_wallets + extra
 
-        # Розділяємо: хто скипається, хто ні
+        # Розділяємо: хто скипається, хто ні. VIP-виняток: топ-N за
+        # accountValue (lb_wallets ВЖЕ відсортований за account desc)
+        # сканується завжди — капітал важливіший за історію порожніх
+        # сканів (аудит покриття 04.09)
+        vip = {w["addr"].lower() for w in lb_wallets[:VIP_TOP_N]}
         to_scan   = []
         skipped   = []
+        vip_kept  = 0
         for w in all_wallets:
             k = w["addr"].lower()
             if should_skip(k, sn):
-                skipped.append(w)
+                if k in vip:
+                    vip_kept += 1
+                    to_scan.append(w)
+                else:
+                    skipped.append(w)
             else:
                 to_scan.append(w)
 
         total = len(to_scan)
         print(f"  [SCAN #{sn}] Total: {len(all_wallets)} | "
-              f"Scan: {total} | Skipped (empty): {len(skipped)}")
+              f"Scan: {total} | Skipped (empty): {len(skipped)}"
+              + (f" | VIP повернуто зі скіпу: {vip_kept}" if vip_kept else ""))
         print(f"  [SCAN #{sn}] ~{total*DELAY/WORKERS:.0f}s estimated")
 
         with cache_lock:
@@ -5106,8 +5261,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/positions":
+            # Під локом — ЛИШЕ знімок посилань (аудит покриття 04.09:
+            # json.dumps 2+МБ і запис у сокет під cache_lock тримали лок
+            # сотні мс на повільному клієнті, а той самий лок бере
+            # обробник трейдів — одна відкрита вкладка гальмувала
+            # детекцію). cache["data"]/["depth"] замінюються цілком
+            # (ніколи не мутуються на місці), тож серіалізація поза
+            # локом безпечна; progress мутується — його копіюємо.
             with cache_lock:
-                self.send_json({
+                snap = {
                     "ready":      cache["data"] is not None,
                     "scanning":   cache["scanning"],
                     "progress":   dict(cache["progress"]),
@@ -5118,16 +5280,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     "scan_number": cache["scan_number"],
                     "depth":       cache["depth"],
                     "watchlist_size": len(watchlist),
-                })
+                }
+            self.send_json(snap)
         elif self.path == "/wallets":
             with cache_lock:
-                self.send_json({
+                snap = {
                     "wallets":    cache["wallets"],
                     "scanning":   cache["scanning"],
                     "lb_total":   cache["lb_total"],
                     "ws_discovered": cache["ws_discovered"],
                     "scan_number": cache["scan_number"],
-                })
+                }
+            self.send_json(snap)
         elif self.path == "/watchlist":
             with watchlist_lock:
                 wl = []
@@ -5235,7 +5399,8 @@ est = SCAN_TOP * DELAY / WORKERS
 print(f"\n  HL TERMINAL  →  http://localhost:{PORT}")
 print(f"  Full leaderboard scan (up to {SCAN_TOP}) | {WORKERS} workers | {DELAY}s delay")
 print(f"  First scan ETA: ~{est:.0f}s | After warmup: much faster (empty-skip)")
-print(f"  Skip logic: {SKIP_AFTER} empty scans → check every {CHECK_EVERY} scans\n")
+print(f"  Skip logic: {SKIP_AFTER} empty scans → check every {CHECK_EVERY} "
+      f"scans | VIP top-{VIP_TOP_N} за екваті — без скіпу\n")
 
 # Depth — запускаємо ПЕРШИМ, паралельно зі скануванням
 load_state()   # відновлюємо watchlist і сим-позиції з минулого запуску
