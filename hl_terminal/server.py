@@ -2144,6 +2144,11 @@ def run_realtime_monitor():
                 with watchlist_lock:
                     if _nc in watchlist.get(addr, {}):
                         continue   # realtime додав її після нашого знімка
+                    if scan_tombstones.get(_nk, 0) >= snap_ms / 1000.0:
+                        # пару закрито ПІСЛЯ нашого знімка (prio/fast
+                        # встигли за час циклу по монетах): знімок
+                        # застарілий, не воскрешаємо (рев'ю v2.9 C1)
+                        continue
                     watchlist.setdefault(addr, {})[_nc] = {
                         "size":  _np["size"],
                         "val":   _np["val"],
@@ -2153,9 +2158,15 @@ def run_realtime_monitor():
                         "liq":   _np.get("liq", 0),
                         "upd":   time.time(),
                     }
-                sent_alerts.discard(_nk)
-                close_episodes.pop(_nk, None)
-                fill_cursor[_nk] = max(fill_cursor.get(_nk, 0), snap_ms)
+                    # ініціалізація ПІД тим самим локом, що і видимість
+                    # пари (урок prio-фетчера, рев'ю v2.9 C3); delta_seen
+                    # теж чиститься — як у update_watchlist (C2), інакше
+                    # застаріла мітка минулого життя пари вимикала
+                    # анти-рейс «філи запізнюються» і закриття губилось
+                    sent_alerts.discard(_nk)
+                    close_episodes.pop(_nk, None)
+                    delta_seen.pop(_nk, None)
+                    fill_cursor[_nk] = max(fill_cursor.get(_nk, 0), snap_ms)
                 print(f"  [WATCH] {_nc} {addr[:10]} нова монета кита зі "
                       f"sweep: {_np['side']} ratio {_r:.1f}x під наглядом")
 
@@ -3033,7 +3044,9 @@ FC_TRACK_MIN     = 60       # хвилин трекаємо після вход�
                             # 30 -> 60, старий fc_trades.csv ротується
                             # у .legacy через зміну заголовків)
 FC_MAX_OPEN      = 5
-FC_WORKSHEET     = "fullclose"
+FC_WORKSHEET     = "fullclose60"  # v2.9: трек 60 хв — новий аркуш, бо
+                                  # старий "fullclose" створений на
+                                  # ширину m1..m30 і не ротується
 FC_CSV           = os.path.join(DATA_DIR, "fc_trades.csv")
 HLP_LIQUIDATOR   = "0x2e3d94f0562703b25c83308a05046ddaf9a8dd14"  # backstop-vault HLP
 
@@ -3623,11 +3636,25 @@ def rev_on_close(addr, coin, old, mfills, full_close):
     # маркет-транзакція (hash-група; батч може нести ще пил) закрила
     # ≥95% позиції і коштувала ≥$100k. mfills уже згруповані по hash у
     # get_recent_market_fills, фліп-розмір клампнутий викликачем.
+    # Рев'ю v2.9 S1: «позиція» — це НЕ залишок перед поточним батчем
+    # (при живому WS кожна tx серії підтверджується окремим батчем, і
+    # остання завжди закривала б «100% залишку»), а позиція на СТАРТІ
+    # епізоду продажу: звіряємо нотіонал tx з ep["val"] (вартість на
+    # момент першої tx серії; fc_on_txs уже поглинув поточний батч).
+    # Свідома межа: пауза >5 хв ресетить епізод — «доїв рештки одним
+    # маркетом після довгої паузи» рахується новою позицією.
+    # Рев'ю v2.9 S2: ліквідація — не рішення кита, R7 не відкриває
+    # (як у профілі швидкості; R1-R6 ліквідації включають, як раніше).
     one_shot = 0
     if full_close and mfills:
         _big_tx = max(mfills, key=lambda f: f["sz"])
+        _big_usd = _big_tx["px"] * _big_tx["sz"]
+        _ep_val = (ep["val"] if ep and ep.get("val") else 0) \
+                  or old.get("val") or 0
         if _big_tx["sz"] >= base_sz * F4_FULL_PCT \
-           and _big_tx["px"] * _big_tx["sz"] >= R7_MIN_TX_USD:
+           and _big_usd >= R7_MIN_TX_USD \
+           and _big_usd >= F4_FULL_PCT * _ep_val \
+           and not _big_tx.get("liq"):
             one_shot = 1
     if below_threshold or src == "partial":
         strats = []   # 0.5-1% або часткове закриття: лише outcome-стрічка
@@ -3860,7 +3887,15 @@ def follow_on_txs(addr, coin, old, mfills, full_close):
         if first_shot:
             _timers.append((F6_NAME, F6_TIMER_S))
         for st, timer in _timers:
-            if (st, coin) in busy: continue
+            if (st, coin) in busy:
+                if st == F6_NAME:
+                    # first-shot-когорта рідкісна: мовчазний скіп ховав
+                    # би частку вибірки F6 проти F5/F7 (рев'ю v2.9 S3)
+                    stats["follow_busy_skips"] = \
+                        stats.get("follow_busy_skips", 0) + 1
+                    print(f"  [FOLLOW] {st} пропуск: {coin} зайнята "
+                          f"({addr[:10]}…)")
+                continue
             it = dict(base); it["strategy"] = st; it["timer"] = float(timer)
             follow_open[f"{key}|{st}|{int(now)}"] = it
         # F4 — кожна достатня транзакція швидкого гаманця; F5 — ті
@@ -5363,9 +5398,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except Exception as e:
                 self.send_json({"error": str(e)})
         elif self.path == "/depth":
-            with cache_lock:
+            with cache_lock:   # знімок під локом, send поза (як /positions)
                 d = cache["depth"]
-                self.send_json({"count": len(d), "coins": list(d.keys())[:20], "sample": {k: d[k] for k in list(d.keys())[:3]}})
+                snap = {"count": len(d), "coins": list(d.keys())[:20],
+                        "sample": {k: d[k] for k in list(d.keys())[:3]}}
+            self.send_json(snap)
         elif self.path in ("/", "/index.html"):
             with open(os.path.join(DIR, "hyperliquid-terminal.html"), "rb") as f:
                 body = f.read()
