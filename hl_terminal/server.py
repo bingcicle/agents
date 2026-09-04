@@ -567,7 +567,15 @@ def _prio_probe():
 def load_leaderboard():
     print("  [LB] Fetching leaderboard...")
     lb   = hl_get("https://stats-data.hyperliquid.xyz/Mainnet/leaderboard")
-    rows = lb.get("leaderboardRows", lb if isinstance(lb, list) else [])
+    # list-відповідь ламала lb.get(...) ДО перевірки isinstance, а
+    # порожня — top[0] нижче (аудит v2.10): обидва випадки тепер чесна
+    # APIError -> run_scan пропускає цикл, watchlist переживає (carry)
+    if isinstance(lb, list):
+        rows = lb
+    elif isinstance(lb, dict):
+        rows = lb.get("leaderboardRows", [])
+    else:
+        rows = []
 
     wallets = []
     for r in rows:
@@ -588,6 +596,8 @@ def load_leaderboard():
 
     wallets.sort(key=lambda w: w["account"], reverse=True)
     top = wallets[:SCAN_TOP]
+    if not top:
+        raise APIError("порожній лідерборд — пропускаю цикл скану")
     with cache_lock:
         cache["lb_total"] = len(wallets)
     print(f"  [LB] {len(wallets)} total, scanning {len(top)} "
@@ -1715,7 +1725,11 @@ def get_recent_market_fills(addr, coin, since_ms, side=None):
             raise APIError("fill px/sz non-finite or <=0")
         is_taker = _cr
         d = f.get("dir", "")
-        f_liq = bool(f.get("liquidation")) or ("Liquidat" in d)
+        # ADL ("Auto-Deleveraging") класифікується як ліквідація — ЯК у
+        # профільному модулі: інакше ADL-закриття було видно в історії
+        # гаманця, але не в основному детекторі (аудит v2.10 №5в)
+        f_liq = (bool(f.get("liquidation")) or ("Liquidat" in d)
+                 or d.startswith("Auto-Delever"))
         if side == "LONG":
             is_close = d.startswith("Close Long") or d.startswith("Long >") or f_liq
         elif side == "SHORT":
@@ -1727,16 +1741,36 @@ def get_recent_market_fills(addr, coin, since_ms, side=None):
             continue
         oid = f.get("oid")
         h  = f.get("hash")
+        # СИСТЕМНІ філи (ліквідації/ADL) несуть нульовий hash 0x000…0:
+        # групування по ньому склеювало РІЗНІ ліквідації в одну фальшиву
+        # «велику транзакцію» (2×3% -> 6% алерт), а глобальний дедуп
+        # alerted_txs по цьому hash гасив УСІ наступні ліквідації будь-якої
+        # монети на годину (аудит v2.10 №5; дзеркало фікса v2.8 у
+        # профільному модулі) — стабільний штучний id по oid/tid+гаманець
+        if str(h).lower().strip("0x") == "" or f_liq:
+            h = (f"sys:{addr[:10]}:{coin}:"
+                 f"{oid if oid is not None else f.get('tid', f.get('time', 0))}")
         px, sz = _vpx, _vsz   # уже валідовані finite > 0
+        # startPosition — позиція НА МОМЕНТ цього філа за даними біржі:
+        # чесна база для порогів «≥5% позиції» незалежно від нарізки
+        # батчів (аудит v2.10 №7); для групи — максимум (позиція перед
+        # першим філом ордера)
+        try:
+            _spf = abs(float(f.get("startPosition") or 0))
+        except (TypeError, ValueError):
+            _spf = 0.0
+        if not math.isfinite(_spf):
+            _spf = 0.0
         if h not in txs:
             txs[h] = {
                 "hash": h, "sz": 0.0, "cost": 0.0,
                 "ts": f.get("time", 0), "dir": f.get("dir", ""),
-                "oids": set(), "liq": False, "liq_method": "",
+                "oids": set(), "liq": False, "liq_method": "", "sp": 0.0,
             }
         t = txs[h]
         t["sz"]   += sz
         t["cost"] += px * sz
+        t["sp"]   = max(t.get("sp", 0.0), _spf)
         t["oids"].add(oid)
         if f_liq:
             t["liq"] = True
@@ -1754,7 +1788,8 @@ def get_recent_market_fills(addr, coin, since_ms, side=None):
             "hash":    h,
             "px":      t["cost"] / t["sz"],   # середня ціна транзакції
             "sz":      t["sz"],               # сумарний розмір
-            "ts":      t["ts"],
+            "sp":      t.get("sp", 0.0),      # позиція перед транзакцією
+            "ts":      t["ts"],               # (біржова, 0 = невідома)
             "dir":     t["dir"],
             "n_orders": len(t["oids"]),
             "liq":     t["liq"],
@@ -1762,6 +1797,16 @@ def get_recent_market_fills(addr, coin, since_ms, side=None):
         })
     market_txs.sort(key=lambda x: x["ts"], reverse=True)
     return market_txs
+
+def _fresh_ratio(coin, side, val):
+    """ratio позиції за СВІЖОЮ глибиною кешу; None — глибини немає.
+    Аудит v2.10 №4: часткове закриття оновлювало size/val, а ratio
+    лишався від скану — пара, що впала нижче 2, далі проходила гейт
+    «ratio на момент алерту» і труїла CSV/когорти."""
+    with cache_lock:
+        d = cache["depth"].get(coin) or cache.get("depth_prev", {}).get(coin)
+    ds = depth_for_side(d, side)
+    return (val / ds) if ds else None
 
 def _insert_flipped(addr, coin, pos, alert_key, snap_ms=None):
     """Кит розвернувся (LONG↔SHORT): старий бік закритий і зааалертований,
@@ -1945,6 +1990,8 @@ def run_realtime_monitor():
                     if time.time() - delta_seen.get(alert_key, 0) < 45:
                         continue
                     delta_seen.pop(alert_key, None)
+                    _r9 = (None if full_close else
+                           _fresh_ratio(coin, old.get("side"), new_pos["val"]))
                     with watchlist_lock:
                         if full_close:
                             watchlist.get(addr, {}).pop(coin, None)
@@ -1959,6 +2006,8 @@ def run_realtime_monitor():
                             watchlist[addr][coin]["size"] = new_pos["size"]
                             watchlist[addr][coin]["val"]  = new_pos["val"]
                             watchlist[addr][coin]["upd"]  = time.time()
+                            if _r9 is not None:
+                                watchlist[addr][coin]["ratio"] = _r9
                     if full_close:
                         # тихе повне закриття (лімітками): tombstone проти
                         # воскресіння снапшотом скану + новий бік фліпа
@@ -2037,9 +2086,13 @@ def run_realtime_monitor():
                 # Ліквідації БЕЗ винятку: часткова ліквідація на 0.01%
                 # позиції ($273 пилу) — не сигнал, поріг один для всіх.
                 # Хард-фільтр $: транзакція < MIN_TX_USD — пил незалежно
-                # від відсотка (5% позиції на $30k — це $1.5k шуму)
+                # від відсотка (5% позиції на $30k — це $1.5k шуму).
+                # База відсотка — startPosition САМОЇ транзакції (число
+                # біржі: позиція перед нею), а не спільна база батча:
+                # 4 + 4.9 токена з 100 — друга це 4.9/96=5.1%, не 4.9%
+                # (аудит v2.10 №7; філ без sp — фолбек стара база)
                 big_txs = [f for f in mfills
-                           if f["sz"] >= _base * MIN_CLOSE_PCT
+                           if f["sz"] >= (f.get("sp") or _base) * MIN_CLOSE_PCT
                            and f["px"] * f["sz"] >= MIN_TX_USD]
 
                 # Пара могла пережити у watchlist падіння ratio нижче 2
@@ -2055,6 +2108,8 @@ def run_realtime_monitor():
                 if not big_txs:
                     # агресія є, але кожна транзакція дрібна: без алерту,
                     # базу рухаємо (курсор уже пересунутий вище)
+                    _r9 = (None if full_close else
+                           _fresh_ratio(coin, old.get("side"), new_pos["val"]))
                     with watchlist_lock:
                         if full_close:
                             watchlist.get(addr, {}).pop(coin, None)
@@ -2064,6 +2119,8 @@ def run_realtime_monitor():
                             watchlist[addr][coin]["size"] = new_pos["size"]
                             watchlist[addr][coin]["val"]  = new_pos["val"]
                             watchlist[addr][coin]["upd"]  = time.time()
+                            if _r9 is not None:
+                                watchlist[addr][coin]["ratio"] = _r9
                     if full_close:
                         scan_tombstones[alert_key] = time.time()
                         close_episodes.pop(alert_key, None)
@@ -2080,7 +2137,8 @@ def run_realtime_monitor():
                     # транзакціями батча (маркет-обсяг у ньому чесний)
                     _batches = [(mfills, 1.0, True)]
                 else:
-                    _batches = [([f], min(f["sz"] / _base, 1.0), False)
+                    _batches = [([f], min(f["sz"] / (f.get("sp") or _base), 1.0),
+                                 False)
                                 for f in big_txs]
                 for _txs, _pct, _fc in _batches:
                     _new_h = [f.get("hash", "") for f in _txs
@@ -2103,6 +2161,8 @@ def run_realtime_monitor():
                     }
                     alert_queue.put(a)
 
+                _r9 = (None if full_close else
+                       _fresh_ratio(coin, old.get("side"), new_pos["val"]))
                 with watchlist_lock:
                     if full_close:
                         watchlist.get(addr, {}).pop(coin, None)
@@ -2115,6 +2175,8 @@ def run_realtime_monitor():
                             watchlist[addr][coin]["size"] = new_pos["size"]
                             watchlist[addr][coin]["val"]  = new_pos["val"]
                             watchlist[addr][coin]["upd"]  = time.time()
+                            if _r9 is not None:
+                                watchlist[addr][coin]["ratio"] = _r9
                 if full_close:
                     # tombstone: скан, що почався до закриття, не воскресить
                     # позицію своїм застарілим снапшотом (повторний алерт)
@@ -2328,8 +2390,10 @@ def check_position_changes(new_result, depth_snap):
             # >= MIN_CLOSE_PCT позиції (ліквідації без винятку) і
             # ratio пари не нижче 2
             _base = old["size"] or 1e-12
+            # база відсотка — startPosition транзакції, як у realtime
+            # (аудит v2.10 №7)
             big_txs = [f for f in mfills
-                       if f["sz"] >= _base * MIN_CLOSE_PCT
+                       if f["sz"] >= (f.get("sp") or _base) * MIN_CLOSE_PCT
                        and f["px"] * f["sz"] >= MIN_TX_USD]
             # ratio беремо СВІЖИЙ (new_pos, той самий знімок): база,
             # збережена failed_keep через кілька сканів, несла б ratio
@@ -2878,8 +2942,20 @@ def _save_state_locked():
             "sent_alerts":   list(sent_alerts),
             "fill_cursor":   dict(fill_cursor),
             "close_episodes": {k: dict(v) for k, v in close_episodes.items()},
-            "fc_positions":  [[k[0], k[1], dict(p)] for k, p in fc_positions.items()],
         }
+        # під fc_lock: ітерація без нього могла зловити "dict changed
+        # size during iteration" від конкурентного fc_on_txs і зірвати
+        # ВЕСЬ знімок (аудит v2.10); fc_episodes теж персистяться —
+        # рестарт посеред 5-хв зливу втрачав старт епізоду, і R7/повне
+        # закриття рахувались від огризка (seen: set -> list для JSON)
+        with fc_lock:
+            snap["fc_positions"] = [[k[0], k[1], dict(p)]
+                                    for k, p in fc_positions.items()]
+            _eps = []
+            for k, e in fc_episodes.items():
+                ee = dict(e); ee["seen"] = list(e.get("seen") or ())
+                _eps.append([k[0], k[1], ee])
+            snap["fc_episodes"] = _eps
         with strat2_lock:
             snap["rev_open"] = {k: dict(v) for k, v in rev_open.items()}
             snap["follow_open"] = {k: dict(v) for k, v in follow_open.items()}
@@ -2925,6 +3001,9 @@ def load_state():
         with fc_lock:
             for a, c, p in snap.get("fc_positions", []):
                 fc_positions[(a, c)] = p
+            for a, c, e in snap.get("fc_episodes", []):
+                e["seen"] = set(e.get("seen") or [])
+                fc_episodes[(a, c)] = e
         with strat2_lock:
             rev_open.update(snap.get("rev_open", {}))
             follow_open.update(snap.get("follow_open", {}))
@@ -3078,12 +3157,23 @@ def fc_on_txs(addr, coin, old, mfills):
             ep = {"first_ts": t0["ts"], "first_px": t0["px"],
                   "last_ts": t0["ts"], "sum_usd": 0.0, "seen": set(),
                   "side": old.get("side", "?"),
-                  "ratio": old.get("ratio", 0), "val": old.get("val", 0)}
+                  "ratio": old.get("ratio", 0), "val": old.get("val", 0),
+                  # v2.10: стартовий РОЗМІР позиції (токени) і найбільша
+                  # транзакція всього епізоду — R7 «одним пострілом»
+                  # звіряється з ними, а не з залишком поточного батча
+                  # (аудит v2.10 №2: велика tx могла бути в попередньому
+                  # батчі, а частки в токенах не спотворює рух ціни)
+                  "start_size": old.get("size", 0),
+                  "max_sz": 0.0, "max_usd": 0.0, "max_liq": 0}
             fc_episodes[key] = ep
         for t in new:
             ep["seen"].add(t.get("hash"))
             ep["last_ts"] = max(ep["last_ts"], t.get("ts", 0))
             ep["sum_usd"] += t["px"] * t["sz"]
+            if t["sz"] > ep.get("max_sz", 0):
+                ep["max_sz"] = t["sz"]
+                ep["max_usd"] = t["px"] * t["sz"]
+                ep["max_liq"] = int(bool(t.get("liq")))
 
 def fc_on_full_close(addr, coin, old):
     """Кит продав усе: перевіряємо умови і відкриваємо відкат."""
@@ -3268,7 +3358,7 @@ F4_CLAMP         = (60.0, 300.0)
 F5_FIRST_SHOT_S  = 3600.0   # пауза пари, після якої tx знову «перша»
 PROFILE_WINDOW_D = 90       # глибина історії, днів
 PROFILE_PAGES    = 6        # 5 × 2000 = кап API 10k; 6-та — детект «є ще»
-PROFILE_ALGO_V   = 8      # версія алгоритму профілів: старі записи без
+PROFILE_ALGO_V   = 9      # версія алгоритму профілів: старі записи без
                           # цієї позначки перераховуються (аудит v2.1 п.3;
                           # v3: boundary-safe пагінація; v4: епізод =
                           # позиція, malformed fail-closed, композитний
@@ -3281,8 +3371,10 @@ PROFILE_ALGO_V   = 8      # версія алгоритму профілів: с
                           # ratio-гейт, швидкі/повільні, статистика
                           # зливу; 10k-кап API більше не «truncated»;
                           # v8: паралельна nr-гілка БЕЗ ratio-гейта
-                          # (лише ≥$100k) — кваліфікація F7, ТЗ 04.09)
-DATA_ALGO_V      = "2.9"  # версія логіки збору: трекер отримує її при
+                          # (лише ≥$100k) — кваліфікація F7, ТЗ 04.09;
+                          # v9: бік "Short > Long" — SHORT, глибина з
+                          # правильної сторони (аудит v2.10 №8))
+DATA_ALGO_V      = "2.10" # версія логіки збору: трекер отримує її при
                           # СТВОРЕННІ і несе у рядок; API рахує лише
                           # поточну версію (аудит v2.2: рестарт підписував
                           # старі трекери новою версією). При зміні
@@ -3476,6 +3568,15 @@ def _strat_csv_append(path, headers, row):
             if headers and headers[-1] == "eol" \
                and len(row) == len(headers) - 1:
                 row = list(row) + ["^"]
+            # рядок НЕ тієї ширини — це баг викликача, а не дані: писати
+            # його означає карантин на читанні при вже видаленому
+            # трекері (аудит v2.10) — відмова голосна, WFAIL-цикл
+            # викличе дроп із логом
+            if headers and len(row) != len(headers):
+                print(f"  [STRAT] {os.path.basename(path)}: рядок "
+                      f"{len(row)} колонок при заголовку {len(headers)} — "
+                      f"ВІДМОВА запису")
+                return False
             buf = io.StringIO()
             w = _csv.writer(buf)
             if need_header: w.writerow(headers)
@@ -3554,12 +3655,27 @@ def rev_on_close(addr, coin, old, mfills, full_close):
     """Викликається на кожен підтверджений батч закриттів, ДО того як
     fc_on_full_close зніме епізод (фічі dur/sum ще доступні)."""
     if not STRAT2_ENABLED or not mfills: return
-    # хард-фільтр: позиція < $50k — не сигнал і не статистика (кейс MET)
-    if (old.get("val") or 0) < MIN_POS_USD: return
+    # ratio-гейт (аудит v2.10 №3): сигнал = позиція, ВЕЛИКА відносно
+    # ліквідності — те саме правило, що v1.3 тримає для алертів. Пара,
+    # що пережила у watchlist падіння ratio нижче 2 (carry), більше не
+    # відкриває paper-позиції і не пише outcome-рядки. ratio у записі
+    # свіжий: часткові закриття тепер оновлюють його (№4).
+    if (old.get("ratio") or 0) < 2.0: return
+    # хард-фільтр: позиція < $50k — не сигнал і не статистика (кейс
+    # MET). Аудит v2.10 №1: при ПОВНОМУ закритті old["val"] — це
+    # залишок перед ФІНАЛЬНИМ батчем ($5k хвоста після зливу $195k),
+    # а розмір ПОДІЇ — позиція на старті епізоду продажу (ep["val"]).
+    with fc_lock:
+        _ep_gate = fc_episodes.get((addr, coin))
+        _ep_gate_val = (_ep_gate or {}).get("val") or 0
+    _event_val = old.get("val") or 0
+    if full_close:
+        _event_val = max(_event_val, _ep_gate_val)
+    if _event_val < MIN_POS_USD: return
     base_sz = old.get("size") or 1e-12
     # шматок волта: >=5% позиції І >= $5k (той самий доларовий поріг,
     # що в алертах і follow — рев'ю v2.5 п.6: 5% від $60k = $3k пил)
-    big_any = any(f["sz"] >= base_sz * VAULT_PART_PCT
+    big_any = any(f["sz"] >= (f.get("sp") or base_sz) * VAULT_PART_PCT
                   and f["px"] * f["sz"] >= MIN_TX_USD for f in mfills)
     # ЧАСТКОВЕ закриття >=30% позиції: лише ТІНЬОВА outcome-стрічка
     # (src=partial, стратегії не відкриваються) — інакше ми ніколи не
@@ -3633,29 +3749,31 @@ def rev_on_close(addr, coin, old, mfills, full_close):
     _sig_seq[0] += 1
     sig_id = f"{int(now * 1000)}-{coin}-{addr[2:8]}-{_txh}-{_sig_seq[0]}"
     # «одним пострілом» (ТЗ 04.09 п.2): повне закриття, у якому ОДНА
-    # маркет-транзакція (hash-група; батч може нести ще пил) закрила
-    # ≥95% позиції і коштувала ≥$100k. mfills уже згруповані по hash у
-    # get_recent_market_fills, фліп-розмір клампнутий викликачем.
-    # Рев'ю v2.9 S1: «позиція» — це НЕ залишок перед поточним батчем
-    # (при живому WS кожна tx серії підтверджується окремим батчем, і
-    # остання завжди закривала б «100% залишку»), а позиція на СТАРТІ
-    # епізоду продажу: звіряємо нотіонал tx з ep["val"] (вартість на
-    # момент першої tx серії; fc_on_txs уже поглинув поточний батч).
-    # Свідома межа: пауза >5 хв ресетить епізод — «доїв рештки одним
-    # маркетом після довгої паузи» рахується новою позицією.
-    # Рев'ю v2.9 S2: ліквідація — не рішення кита, R7 не відкриває
-    # (як у профілі швидкості; R1-R6 ліквідації включають, як раніше).
+    # маркет-транзакція закрила ≥95% позиції і коштувала ≥$100k.
+    # Аудит v2.10 №2: звіряємось із ЕПІЗОДОМ, а не з поточним батчем —
+    # fc_on_txs (викликаний перед нами) веде start_size (токени на
+    # старті серії) і найбільшу tx усього епізоду (max_sz/max_usd):
+    # (а) велика tx у попередньому батчі + пил у фінальному — R7 бачить
+    #     її через ep, хоч у mfills її вже немає;
+    # (б) частка рахується в ТОКЕНАХ (max_sz/start_size) — рух ціни під
+    #     час зливу не дає ні хибних спрацювань, ні пропусків;
+    # (в) $100k — окремий абсолютний поріг по нотіоналу самої tx.
+    # Ліквідація — не рішення кита, R7 не відкриває (рев'ю v2.9 S2).
+    # Фолбек без епізоду (рестарт посеред зливу): чесна перевірка по
+    # поточному батчу проти old (свідомо гірша, але не мовчання).
     one_shot = 0
-    if full_close and mfills:
-        _big_tx = max(mfills, key=lambda f: f["sz"])
-        _big_usd = _big_tx["px"] * _big_tx["sz"]
-        _ep_val = (ep["val"] if ep and ep.get("val") else 0) \
-                  or old.get("val") or 0
-        if _big_tx["sz"] >= base_sz * F4_FULL_PCT \
-           and _big_usd >= R7_MIN_TX_USD \
-           and _big_usd >= F4_FULL_PCT * _ep_val \
-           and not _big_tx.get("liq"):
-            one_shot = 1
+    if full_close:
+        if ep and ep.get("start_size"):
+            one_shot = int(
+                ep.get("max_sz", 0) >= ep["start_size"] * F4_FULL_PCT
+                and ep.get("max_usd", 0) >= R7_MIN_TX_USD
+                and not ep.get("max_liq"))
+        elif mfills:
+            _big_tx = max(mfills, key=lambda f: f["sz"])
+            if _big_tx["sz"] >= base_sz * F4_FULL_PCT \
+               and _big_tx["px"] * _big_tx["sz"] >= R7_MIN_TX_USD \
+               and not _big_tx.get("liq"):
+                one_shot = 1
     if below_threshold or src == "partial":
         strats = []   # 0.5-1% або часткове закриття: лише outcome-стрічка
     elif src == "vault":
@@ -3811,13 +3929,23 @@ def follow_on_txs(addr, coin, old, mfills, full_close):
     # хард-фільтри (кейс MET: позиція $17k, шматки по $1k, ratio 0.15 —
     # 12 сміттєвих угод): дрібна позиція/транзакція — не сигнал
     if (old.get("val") or 0) < MIN_POS_USD: return
+    # ratio-гейт (аудит v2.10 №3): як у rev і в алертах — позиція, що
+    # більше не є великою відносно ліквідності, не відкриває F-стратегій
+    if (old.get("ratio") or 0) < 2.0: return
     base_sz = old.get("size") or 1e-12
-    big = [f for f in mfills if f["sz"] >= base_sz * FOLLOW_TX_PCT
+    # база відсотка — startPosition самої tx (аудит v2.10 №7)
+    big = [f for f in mfills if f["sz"] >= (f.get("sp") or base_sz) * FOLLOW_TX_PCT
            and f["px"] * f["sz"] >= MIN_TX_USD]
     if not big: return
     px = _px_now(coin)
     if not px: return
     tx = max(big, key=lambda f: f["sz"])
+    # «перший постріл» — властивість ТРАНЗАКЦІЇ, не батча (аудит v2.10
+    # №6): якщо в цьому ж батчі БУЛА старша транзакція (навіть дрібна,
+    # нижче порога), вона вже використала перший постріл пари
+    if first_shot and any((f.get("ts") or 0) < (tx.get("ts") or 0)
+                          for f in mfills):
+        first_shot = 0
     our = "SHORT" if old.get("side") == "LONG" else "LONG"
     vault = is_vault(addr)
     hour = time.localtime().tm_hour
@@ -3827,7 +3955,7 @@ def follow_on_txs(addr, coin, old, mfills, full_close):
     depth = _sim_depth(coin, old.get("side"))
     base = {"key": key, "coin": coin, "our_side": our, "addr": addr,
             "open_ts": now, "entry_px": px, "peak": -999.0, "trough": 999.0,
-            "tx_pct": tx["sz"] / base_sz * 100.0,
+            "tx_pct": tx["sz"] / (tx.get("sp") or base_sz) * 100.0,
             "tx_usd": tx["px"] * tx["sz"],
             "ratio": old.get("ratio", 0) or 0,
             "pos_usd": old.get("val", 0) or 0,
@@ -4152,9 +4280,13 @@ def _build_profile(fills, now_ms=None, depth_fn=None):
         # (продаж у bid), "Close Short" / "Short > Long" — шорт (купівля
         # з ask); у ліквідації без слова в dir — знак startPosition;
         # глибина для ratio береться по цій стороні, як у watchlist
-        if d.startswith("Close Long") or d.startswith("Long") or "Long" in d:
+        # "Short > Long" містить слово "Long", і стара перша гілка
+        # хапала його як LONG — а закривається ШОРТ, глибина для ratio
+        # бралась не з того боку стакану (аудит v2.10 №8). Матчимо
+        # точно, як у live-детекторі (Close X / X > Y)
+        if d.startswith("Close Long") or d.startswith("Long >"):
             side = "LONG"
-        elif d.startswith("Close Short") or d.startswith("Short") or "Short" in d:
+        elif d.startswith("Close Short") or d.startswith("Short >"):
             side = "SHORT"
         else:
             side = "LONG" if sp_signed > 0 else "SHORT"
