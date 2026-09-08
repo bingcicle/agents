@@ -16,6 +16,9 @@ import calendar
 import datetime as _dtmod
 import html as _htmlmod
 import re
+import hashlib
+import signal
+import atexit
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 
@@ -1234,12 +1237,17 @@ def should_skip(addr_lower, scan_num):
     with stats_lock:
         s = wallet_stats.get(addr_lower, {})
         streak = s.get("empty_streak", 0)
-        last_checked = s.get("last_checked", 0)
 
         if streak < SKIP_AFTER:
             return False
-        # Перевіряємо раз на CHECK_EVERY сканів
-        return (scan_num - last_checked) < CHECK_EVERY
+        # Перевіряємо раз на CHECK_EVERY сканів, але РОЗПОДІЛЕНО: слот
+        # гаманця = хеш адреси mod CHECK_EVERY, тож кожен скан
+        # перевіряє свою п'яту частину хронічно порожніх, а не всі
+        # 40k разом кожен п'ятий скан (v2.12, з рев'ю CH: той «п'ятий»
+        # скан тривав удвічі довше і забивав бюджет проксі)
+        slot = int(hashlib.sha256(addr_lower.encode()).hexdigest()[:8], 16) \
+            % CHECK_EVERY
+        return scan_num % CHECK_EVERY != slot
 
 def update_stats(addr_lower, had_positions, scan_num):
     with stats_lock:
@@ -1503,6 +1511,9 @@ def update_watchlist(result, depth_snap, scan_start=0, failed_addrs=None,
         _live_hi = {(_a, _c): (_p.get("ratio_hi_ts") or 0)
                     for _a, _cs in watchlist.items()
                     for _c, _p in _cs.items()}
+        _live_big = {(_a, _c): float(_p.get("big_val") or 0)
+                     for _a, _cs in watchlist.items()
+                     for _c, _p in _cs.items()}
     new_wl = {}
     for coin, positions in result.items():
         if coin.upper() in COIN_BLACKLIST:
@@ -1518,17 +1529,19 @@ def update_watchlist(result, depth_snap, scan_start=0, failed_addrs=None,
                 # старт скану (він може бути на 20+ хв раніше і з'їдав
                 # би грейс наперед)
                 hi_ts = (fetch_times or {}).get(addr, scan_start) or _now_wl
+                big_val = pos["val"]
             else:
                 hi_ts = _live_hi.get((addr, coin), 0)
                 if _now_wl - hi_ts >= RATIO_GRACE_S:
                     continue  # watchlist: ratio >= 2 або грейс після нього
+                big_val = _live_big.get((addr, coin), 0)
             if addr not in new_wl: new_wl[addr] = {}
             new_wl[addr][coin] = {
                 "size":  pos["size"],
                 "val":   pos["val"],
                 "side":  pos["side"],
                 "ratio": ratio,
-                "ratio_hi_ts": hi_ts,
+                "ratio_hi_ts": hi_ts, "big_val": big_val,
                 "entry": pos["entry"],
                 "liq":   pos.get("liq", 0),
             }
@@ -1609,16 +1622,67 @@ def update_watchlist(result, depth_snap, scan_start=0, failed_addrs=None,
                 # позначити ratio≥2 уже після знімка скану)
                 _hi = max(_p.get("ratio_hi_ts") or 0,
                           lv.get("ratio_hi_ts") or 0)
+                _big = max(float(_p.get("big_val") or 0),
+                           float(lv.get("big_val") or 0))
                 _p["ratio_hi_ts"] = _hi
+                _p["big_val"] = _big
                 if lv.get("upd", 0) >= _ft and lv.get("upd", 0) >= scan_start > 0:
                     _coins[_c] = dict(lv)
                     _coins[_c]["ratio_hi_ts"] = _hi
+                    _coins[_c]["big_val"] = _big
         watchlist.clear()
         watchlist.update(new_wl)
     print(f"  [WATCH] Watchlist updated: {len(new_wl)} wallets, "
           f"{sum(len(v) for v in new_wl.values())} positions with ratio>=2x"
           + (f" | {carried_unscanned} пар carried (не скановані/помилки)"
              if carried_unscanned else ""))
+
+scan_metrics = {"next_scan_at": 0.0, "last_duration_s": 0.0, "new_pairs": 0}
+_scan_timer = None
+_scan_sched_lock = threading.Lock()
+
+def _discover_pairs(addr, positions, fetched_at):
+    """v2.12 (з рев'ю CH): нова велика пара гаманець:монета потрапляє у
+    watchlist одразу, як скан зчитав гаманець — раніше вона чекала
+    update_watchlist у кінці скану (до 90 хв сліпоти по щойно
+    відкритій позиції; prio-fetcher ловить лише тих, хто торгує через
+    WS у цей час). Наявних пар не чіпаємо (їх веде realtime/sweep і
+    злиття в кінці скану); tombstone після часу читання — не воскрешаємо.
+    Курсор філів — на момент знімка, як для нової пари у
+    update_watchlist."""
+    with cache_lock:
+        depth = cache["depth"] or cache.get("depth_prev", {})
+        depth = dict(depth) if depth else {}
+    if len(depth) < 10:
+        return 0
+    added = 0
+    for p in positions:
+        coin = p.get("coin")
+        if not coin or not p.get("size") or coin.upper() in COIN_BLACKLIST:
+            continue
+        ds = depth_for_side(depth.get(coin), p["side"])
+        ratio = p["val"] / ds if ds else 0
+        if ratio < 2.0:
+            continue
+        k = f"{addr}:{coin}"
+        with watchlist_lock:
+            if coin in watchlist.get(addr, {}):
+                continue
+            if scan_tombstones.get(k, 0) >= fetched_at:
+                continue
+            watchlist.setdefault(addr, {})[coin] = {
+                "size": p["size"], "val": p["val"], "side": p["side"],
+                "ratio": ratio, "ratio_hi_ts": fetched_at, "big_val": p["val"],
+                "entry": p.get("entry", 0), "liq": p.get("liq", 0),
+                "upd": fetched_at}
+            sent_alerts.discard(k)
+            close_episodes.pop(k, None)
+            delta_seen.pop(k, None)
+            fill_cursor[k] = max(fill_cursor.get(k, 0), int(fetched_at * 1000))
+        added += 1
+    if added:
+        scan_metrics["new_pairs"] += added
+    return added
 
 def check_one_wallet(addr, post=None):
     """
@@ -1744,7 +1808,7 @@ def run_prio_fetcher():
                     watchlist.setdefault(addr, {})[c] = {
                         "size": p["size"], "val": p["val"],
                         "side": p["side"], "ratio": ratio,
-                        "ratio_hi_ts": time.time(),
+                        "ratio_hi_ts": time.time(), "big_val": p["val"],
                         "entry": p["entry"], "liq": p.get("liq", 0),
                         "upd": time.time()}
                     k = f"{addr}:{c}"
@@ -1981,18 +2045,43 @@ RATIO_GRACE_S = 1800
 
 def _mark_ratio(p, r, now=None):
     """Єдина точка запису ratio у запис пари: ≥2 оновлює мітку
-    ratio_hi_ts (востаннє бачили велику). Усі місця, де ratio пишеться
-    у watchlist, ідуть сюди — інакше грейс не знав би, коли пара
-    востаннє була великою."""
+    ratio_hi_ts (востаннє бачили велику) і big_val — вартість позиції в
+    той момент («якір» для порогу $50k у грейсі: залишок $30k після
+    зливу $200k — та сама подія, не пил; v2.12 з рев'ю CH). Усі місця,
+    де ratio пишеться у watchlist, ідуть сюди — інакше грейс не знав би,
+    коли пара востаннє була великою."""
     p["ratio"] = r
     if r >= 2.0:
         p["ratio_hi_ts"] = now if now is not None else time.time()
+        p["big_val"] = float(p.get("val") or 0)
     return p
 
+def _mark_close(p, ts=None):
+    """v2.12 (рішення користувача 08.09): грейс рахується від ОСТАННЬОГО
+    великого закриття (≥5% позиції маркетом), а не від останнього
+    спостереження ratio≥2. Кожне підтверджене велике закриття пари, що
+    на той момент проходила гейт, зсуває мітку вперед: серія «злив 50%
+    → ratio 1.3 → через 25 хв ще 10%» лишається живою від останнього
+    шматка. Мітка лише рухається вперед."""
+    t = ts if ts is not None else time.time()
+    if t > (p.get("ratio_hi_ts") or 0):
+        p["ratio_hi_ts"] = t
+    return p
+
+def _grace_val(p):
+    """Розмір події для порогу MIN_POS_USD: у грейсі (ratio<2) — не
+    залишок, а найбільше з залишку і «якоря» big_val (вартість, коли
+    пара востаннє була ≥2)."""
+    v = float(p.get("val") or 0)
+    if (p.get("ratio") or 0) < 2.0:
+        v = max(v, float(p.get("big_val") or 0))
+    return v
+
 def _ratio_ok(p, now=None):
-    """Гейт «велика відносно ліквідності»: ratio ≥2 АБО була ≥2 менш
-    як RATIO_GRACE_S тому. Це ЄДИНИЙ гейт для алертів (обидва шляхи),
-    rev і follow — раніше в кожному стояв голий `ratio < 2`."""
+    """Гейт «велика відносно ліквідності»: ratio ≥2 АБО мітка ratio_hi_ts
+    (останнє спостереження ≥2 чи останнє велике закриття) молодша за
+    RATIO_GRACE_S. Це ЄДИНИЙ гейт для алертів (обидва шляхи), rev і
+    follow — раніше в кожному стояв голий `ratio < 2`."""
     if (p.get("ratio") or 0) >= 2.0:
         return True
     return ((now if now is not None else time.time())
@@ -2015,7 +2104,7 @@ def _insert_flipped(addr, coin, pos, alert_key, snap_ms=None):
             "val":   pos["val"],
             "side":  pos["side"],
             "ratio": ratio,
-            "ratio_hi_ts": time.time(),
+            "ratio_hi_ts": time.time(), "big_val": pos["val"],
             "entry": pos.get("entry", 0),
             "liq":   pos.get("liq", 0),
             "upd":   time.time(),
@@ -2123,6 +2212,15 @@ def run_realtime_monitor():
                             _en = new_pos.get("entry", 0)
                             if _eo and _en and abs(_en - _eo) / _eo > 1e-4:
                                 close_episodes.pop(alert_key, None)
+                                # v2.12 (з рев'ю CH): перевідкрита позиція
+                                # — нова історія, старий грейс/якір їй не
+                                # належать: мітка лише якщо ЗАРАЗ ≥2
+                                with watchlist_lock:
+                                    _wr = watchlist.get(addr, {}).get(coin)
+                                    if _wr is not None:
+                                        _wr.pop("ratio_hi_ts", None)
+                                        _wr.pop("big_val", None)
+                                        _mark_ratio(_wr, _wr.get("ratio") or 0)
                         # Позиція звірена зі знімком — і при доливі, і при
                         # НУЛЬОВІЙ дельті ("закрив 10 і перевідкрив рівно
                         # 10"): усе до знімка вже враховане в базі, старий
@@ -2251,7 +2349,9 @@ def run_realtime_monitor():
                 # зніме епізод: при повному закритті це позиція на старті
                 # серії, а не $5k-хвіст перед фінальним батчем (v2.11 п.1,
                 # дзеркало фікса rev v2.10 №1)
-                _ev_val = old.get("val") or 0
+                # v2.12: у грейсі — ще й «якір» big_val (вартість, коли
+                # пара востаннє була ≥2), а не лише $30k-залишок
+                _ev_val = _grace_val(old)
                 if full_close:
                     with fc_lock:
                         _ep_a = fc_episodes.get((addr, coin))
@@ -2294,6 +2394,16 @@ def run_realtime_monitor():
                 big_txs = [f for f in mfills
                            if f["sz"] >= (f.get("sp") or _base) * MIN_CLOSE_PCT
                            and f["px"] * f["sz"] >= MIN_TX_USD]
+                # v2.12: велике закриття пари, що проходить гейт, зсуває
+                # мітку грейсу на час ОСТАННЬОЇ великої транзакції —
+                # наступні пів години пара лишається «великою» навіть
+                # якщо після цього шматка ratio впав нижче 2
+                if big_txs and _ratio_ok(old) and not full_close:
+                    _ts_close = max((f.get("ts") or 0) for f in big_txs) / 1000.0
+                    with watchlist_lock:
+                        _wc = watchlist.get(addr, {}).get(coin)
+                        if _wc is not None:
+                            _mark_close(_wc, _ts_close or time.time())
 
                 # Пара могла пережити у watchlist падіння ratio нижче 2
                 # (carry живої серії з оновленими метаданими): закриття
@@ -2418,7 +2528,7 @@ def run_realtime_monitor():
                         "val":   _np["val"],
                         "side":  _np["side"],
                         "ratio": _r,
-                        "ratio_hi_ts": time.time(),
+                        "ratio_hi_ts": time.time(), "big_val": _np["val"],
                         "entry": _np.get("entry", 0),
                         "liq":   _np.get("liq", 0),
                         "upd":   time.time(),
@@ -2511,6 +2621,9 @@ def check_position_changes(new_result, depth_snap):
         _wl_hi = {(_a, _c): (_p.get("ratio_hi_ts") or 0)
                   for _a, _cs in watchlist.items()
                   for _c, _p in _cs.items()}
+        _wl_big = {(_a, _c): float(_p.get("big_val") or 0)
+                   for _a, _cs in watchlist.items()
+                   for _c, _p in _cs.items()}
     for coin, positions in new_result.items():
         if coin.upper() in COIN_BLACKLIST: continue
         d = depth_snap.get(coin)
@@ -2531,13 +2644,15 @@ def check_position_changes(new_result, depth_snap):
                 _pp.get("ratio_hi_ts") or 0, _wl_hi.get((addr, coin), 0))
             if ratio < 2.0 and _now - hi_ts >= RATIO_GRACE_S:
                 continue
+            big_val = pos["val"] if ratio >= 2.0 else max(
+                float(_pp.get("big_val") or 0), _wl_big.get((addr, coin), 0))
             if addr not in new_by_addr: new_by_addr[addr] = {}
             new_by_addr[addr][coin] = {
                 "size":  pos["size"],
                 "val":   pos["val"],
                 "side":  pos["side"],
                 "ratio": ratio,
-                "ratio_hi_ts": hi_ts,
+                "ratio_hi_ts": hi_ts, "big_val": big_val,
                 "entry": pos["entry"],
             }
 
@@ -2621,8 +2736,16 @@ def check_position_changes(new_result, depth_snap):
             # годинної давнини — v1.3 вимагає "на момент алерту"
             # (рев'ю v2.7 №5б); розмір ПОДІЇ гейтиться старою позицією
             if not big_txs or not _ratio_ok(new_pos, _now) \
-               or (old.get("val") or 0) < MIN_POS_USD:
+               or max(old.get("val") or 0, _grace_val(new_pos)) < MIN_POS_USD:
                 continue
+            # v2.12: велике закриття зсуває мітку грейсу (і в базі діфу,
+            # і в живому watchlist, якщо пара там є)
+            _ts_close = max((f.get("ts") or 0) for f in big_txs) / 1000.0 or _now
+            _mark_close(new_pos, _ts_close)
+            with watchlist_lock:
+                _wc = watchlist.get(addr, {}).get(coin)
+                if _wc is not None:
+                    _mark_close(_wc, _ts_close)
 
             # окреме повідомлення на кожну достатню транзакцію;
             # дублі з realtime знімає LRU за hash транзакції
@@ -3205,31 +3328,38 @@ def load_state():
     except Exception as e:
         print(f"  [STATE] load err: {e}"); return
     age = time.time() - snap.get("saved_at", 0)
-    if age > STATE_MAX_AGE_S:
-        print(f"  [STATE] стан старіший за годину ({age/60:.0f} хв), пропускаю")
-        return
+    stale = age > STATE_MAX_AGE_S
+    if stale:
+        # v2.12 (з рев'ю CH): застарілий РИНКОВИЙ знімок (watchlist,
+        # курсори, епізоди, сим) не відновлюємо — але відкриті paper-
+        # трекери стратегій і TWAP-реєстр повертаємо: цикл трекерів сам
+        # пише "" у пропущені хвилини, тож година простою — чесні
+        # прогалини в рядку, а не втрачена угода
+        print(f"  [STATE] стан старіший за годину ({age/60:.0f} хв): ринковий "
+              f"знімок пропускаю, трекери стратегій відновлюю")
     try:
-        with watchlist_lock:
-            watchlist.clear()
-            watchlist.update(snap.get("watchlist", {}))
-        with sim_lock:
-            for a, c, p in snap.get("sim_positions", []):
-                sim_positions[(a, c)] = p
-            for a, c, t in snap.get("sim_trackers", []):
-                t["seen"] = set(t.get("seen", []))
-                sim_trackers[(a, c)] = t
-            sim_closed.extend(snap.get("sim_closed", [])[:100])
-        with alerts_lock:
-            recent_alerts.extend(snap.get("recent_alerts", [])[:50])
-        sent_alerts.update(snap.get("sent_alerts", []))
-        fill_cursor.update(snap.get("fill_cursor", {}))
-        close_episodes.update(snap.get("close_episodes", {}))
-        with fc_lock:
-            for a, c, p in snap.get("fc_positions", []):
-                fc_positions[(a, c)] = p
-            for a, c, e in snap.get("fc_episodes", []):
-                e["seen"] = set(e.get("seen") or [])
-                fc_episodes[(a, c)] = e
+        if not stale:
+            with watchlist_lock:
+                watchlist.clear()
+                watchlist.update(snap.get("watchlist", {}))
+            with sim_lock:
+                for a, c, p in snap.get("sim_positions", []):
+                    sim_positions[(a, c)] = p
+                for a, c, t in snap.get("sim_trackers", []):
+                    t["seen"] = set(t.get("seen", []))
+                    sim_trackers[(a, c)] = t
+                sim_closed.extend(snap.get("sim_closed", [])[:100])
+            with alerts_lock:
+                recent_alerts.extend(snap.get("recent_alerts", [])[:50])
+            sent_alerts.update(snap.get("sent_alerts", []))
+            fill_cursor.update(snap.get("fill_cursor", {}))
+            close_episodes.update(snap.get("close_episodes", {}))
+            with fc_lock:
+                for a, c, p in snap.get("fc_positions", []):
+                    fc_positions[(a, c)] = p
+                for a, c, e in snap.get("fc_episodes", []):
+                    e["seen"] = set(e.get("seen") or [])
+                    fc_episodes[(a, c)] = e
         with strat2_lock:
             rev_open.update(snap.get("rev_open", {}))
             follow_open.update(snap.get("follow_open", {}))
@@ -3577,9 +3707,11 @@ R7_NAME          = "R7_одним"       # реверс «одним постр�
                                     # ≥$100k, рух ≥1% — вхід одразу
 R7_MIN_TX_USD    = 100_000.0
 # ── ТЗ 08.09 п.4 ──
-F8_NAME          = "F8_ratio35"     # F5 (швидкі гаманці · перший
-                                    # постріл) + ratio пари ≥3.5 на
-                                    # момент входу
+F8_NAME          = "F8_ratio35"     # v2.12 (рішення користувача 08.09):
+                                    # копія F6 (тиша 1 хв · перший
+                                    # постріл, БЕЗ профілю) + ratio пари
+                                    # ≥3.5 на момент входу. У v2.11 була
+                                    # F5-родина — since піднято до 2.12
 F8_MIN_RATIO     = 3.5
 F9_NAME          = "F9_без_ратіо_90" # F7 (nr-гілка, лише ≥$100k), але
                                     # ≥90% швидких замість 70%
@@ -3615,7 +3747,10 @@ STRAT_SINCE = {
     "F1_1хв": "2.10", "F2_2хв": "2.10", "F3_3хв": "2.10",
     "F6_1хв_перший": "2.10", "F4_розумний": "2.10", "F5_перший": "2.10",
     "F7_без_ратіо": "2.10",
-    F8_NAME: "2.11", F9_NAME: "2.11", T1_NAME: "2.11", T2_NAME: "2.11",
+    # F8: у 2.12 стала F6-копією (інша популяція); T1/T2: у 2.12 вид
+    # твапу — зі startPosition першого слайсу (доливи більше не T1),
+    # ціни P0/P1 — зі свічок біржі
+    F8_NAME: "2.12", F9_NAME: "2.11", T1_NAME: "2.12", T2_NAME: "2.12",
 }
 TAPE_SINCE = "2.10"
 # ── ПРОФІЛЬ ШВИДКИХ ГАМАНЦІВ (ТЗ 01.09 п.2) ──
@@ -3653,7 +3788,7 @@ PROFILE_ALGO_V   = 9      # версія алгоритму профілів: с
                           # (лише ≥$100k) — кваліфікація F7, ТЗ 04.09;
                           # v9: бік "Short > Long" — SHORT, глибина з
                           # правильної сторони (аудит v2.10 №8))
-DATA_ALGO_V      = "2.11" # версія логіки збору: трекер отримує її при
+DATA_ALGO_V      = "2.12" # версія логіки збору: трекер отримує її при
                           # СТВОРЕННІ і несе у рядок; API рахує лише
                           # поточну версію (аудит v2.2: рестарт підписував
                           # старі трекери новою версією). При зміні
@@ -3686,7 +3821,7 @@ STRAT2_TITLES = {
     "F6_1хв_перший": "За китом · тиша 1 хв · перший постріл",
     "F4_розумний":  "За китом · швидкі гаманці",
     "F5_перший":    "За китом · швидкі гаманці · перший постріл",
-    "F8_ratio35":   "За китом · перший постріл · ratio ≥3.5",
+    "F8_ratio35":   "За китом · тиша 1 хв · перший постріл · ratio ≥3.5",
     "F7_без_ратіо": "За китом · перший постріл · без ratio",
     "F9_без_ратіо_90": "За китом · перший постріл · без ratio · 90% швидких",
     "T1_твап_відкриття":  "TWAP-реверс · відкриття позиції",
@@ -3721,15 +3856,21 @@ STRAT2_DESC = {
     "F7_без_ратіо": "Як «перший постріл», але кваліфікація гаманця БЕЗ "
                     "фільтра ratio: великий епізод = лише ≥$100k "
                     "(≥5 швидких за 3 міс і ≥70% швидких)",
-    "F8_ratio35":   "Як «швидкі гаманці · перший постріл», але позиція "
-                    "кита на момент входу має ratio ≥3.5 (не 2)",
+    "F8_ratio35":   "Як «тиша 1 хв · перший постріл» (профіль гаманця не "
+                    "вимагається), але позиція кита на момент входу має "
+                    "ratio ≥3.5 (не 2)",
     "F9_без_ратіо_90": "Як «перший постріл · без ratio», але гаманець "
                     "має ≥90% швидких розвантажень (замість 70%)",
-    "T1_твап_відкриття": "TWAP ≤15 хв, яким кит ВІДКРИВАЄ/нарощує позицію, "
-                    "дійшов до кінця (не скасований), ціна за час TWAP "
-                    "пройшла ≥1% у його бік — в останню хвилину входимо "
-                    "ПРОТИ, тримаємо 1 год; крива 120 хв; когорти ≥1.5% і ≥2%",
-    "T2_твап_скорочення": "Те саме, але TWAP СКОРОЧУЄ наявну позицію кита",
+    "T1_твап_відкриття": "TWAP 2–15 хв, яким кит ВІДКРИВАЄ НОВУ позицію "
+                    "(до твапу позиції в монеті не було — startPosition "
+                    "першого слайсу на біржі = 0; доливи й перевороти не "
+                    "рахуються), не скасований, ціна за час TWAP пройшла "
+                    "≥1% у його бік (закриття хвилинних свічок біржі перед "
+                    "стартом і перед останньою хвилиною) — в останню "
+                    "хвилину входимо ПРОТИ, тримаємо 1 год; крива 120 хв; "
+                    "когорти ≥1.5% і ≥2%",
+    "T2_твап_скорочення": "Те саме, але TWAP СКОРОЧУЄ наявну позицію кита "
+                    "(протилежний бік, розмір твапу ≤ позиції)",
 }
 
 REV_SIG_HEADERS = ["sig_id", "date", "coin", "fade_side", "whale_addr", "src",
@@ -3981,7 +4122,7 @@ def rev_on_close(addr, coin, old, mfills, full_close):
     with fc_lock:
         _ep_gate = fc_episodes.get((addr, coin))
         _ep_gate_val = (_ep_gate or {}).get("val") or 0
-    _event_val = old.get("val") or 0
+    _event_val = _grace_val(old)   # v2.12: у грейсі — якір big_val
     if full_close:
         _event_val = max(_event_val, _ep_gate_val)
     if _event_val < MIN_POS_USD: return
@@ -4240,8 +4381,9 @@ def follow_on_txs(addr, coin, old, mfills, full_close):
     pair_gap = (now - prev_close) if prev_close else None
     first_shot = int(pair_gap is None or pair_gap >= F5_FIRST_SHOT_S)
     # хард-фільтри (кейс MET: позиція $17k, шматки по $1k, ratio 0.15 —
-    # 12 сміттєвих угод): дрібна позиція/транзакція — не сигнал
-    if (old.get("val") or 0) < MIN_POS_USD: return
+    # 12 сміттєвих угод): дрібна позиція/транзакція — не сигнал;
+    # v2.12: у грейсі розмір події — по якорю big_val
+    if _grace_val(old) < MIN_POS_USD: return
     # ratio-гейт (аудит v2.10 №3): як у rev і в алертах — позиція, що
     # більше не є великою відносно ліквідності, не відкриває F-стратегій;
     # v2.11: з грейс-вікном пів години після падіння нижче 2
@@ -4328,9 +4470,13 @@ def follow_on_txs(addr, coin, old, mfills, full_close):
         _timers = list(FOLLOW_TIMERS.items())
         if first_shot:
             _timers.append((F6_NAME, F6_TIMER_S))
+            # F8 (v2.12, рішення користувача): копія F6 + ratio пари на
+            # момент входу ≥3.5; профіль гаманця не потрібен
+            if (old.get("ratio") or 0) >= F8_MIN_RATIO:
+                _timers.append((F8_NAME, F6_TIMER_S))
         for st, timer in _timers:
             if (st, coin) in busy:
-                if st == F6_NAME:
+                if st in (F6_NAME, F8_NAME):
                     # first-shot-когорта рідкісна: мовчазний скіп ховав
                     # би частку вибірки F6 проти F5/F7 (рев'ю v2.9 S3)
                     stats["follow_busy_skips"] = \
@@ -4350,11 +4496,7 @@ def follow_on_txs(addr, coin, old, mfills, full_close):
             gap2 = 2.0 * float(prof.get("avg_gap_s", 0) or 0)
             timer4 = min(max(gap2, F4_CLAMP[0]), F4_CLAMP[1])
             _prof_strats += [(F4_NAME, timer4, True, None),
-                             (F5_NAME, timer4, first_shot, None),
-                             # F8 (ТЗ 08.09 п.4): F5 + ratio пари ≥3.5
-                             (F8_NAME, timer4,
-                              first_shot and (old.get("ratio") or 0) >= F8_MIN_RATIO,
-                              None)]
+                             (F5_NAME, timer4, first_shot, None)]
         if f7_ok:
             gap7 = 2.0 * float(nr_prof.get("avg_gap_s", 0) or 0)
             timer7 = min(max(gap7, F4_CLAMP[0]), F4_CLAMP[1])
@@ -4362,8 +4504,12 @@ def follow_on_txs(addr, coin, old, mfills, full_close):
             # F9 (ТЗ 08.09 п.4): та сама nr-гілка, але ≥90% швидких —
             # рахується з nr.n_fast/fast_pct на льоту, бамп профілю не
             # потрібен (обидва поля є з v8)
-            _f9 = ((nr_prof.get("n_fast") or 0) >= F4_MIN_EPISODES
-                   and (nr_prof.get("fast_pct") or 0) >= F9_MIN_FAST_PCT)
+            # v2.12 (з рев'ю CH): поріг по ТОЧНИХ лічильниках, а не по
+            # округленому fast_pct (89.99% у профілі записано як 90.0)
+            _nf = int(nr_prof.get("n_fast") or 0)
+            _ns = int(nr_prof.get("n_slow") or 0)
+            _f9 = (_nf >= F4_MIN_EPISODES
+                   and 100.0 * _nf >= F9_MIN_FAST_PCT * (_nf + _ns))
             _prof_strats.append((F9_NAME, timer7, first_shot and _f9, nr_prof))
         for st_name, timer_x, allowed, prof_override in _prof_strats:
             if not allowed: continue
@@ -5564,6 +5710,7 @@ def strat2_api():
             # причини пропусків цієї когорти твапів (по сигнальній стрічці)
             "drops": {k: sum(1 for r in sig_rows if r.get("result") == k)
                       for k in ("move_small", "cancelled", "late",
+                                "not_new_or_reduce", "dup_twapid",
                                 "no_price", "kind_unknown", "busy")},
         })
     with twap_lock:
@@ -5738,17 +5885,32 @@ TWAP_TRACK_MIN   = 120            # крива після входу
 TWAP_ENTRY_LEAD  = 60.0           # вхід за хвилину до кінця твапу
 TWAP_LATE_S      = 90.0           # спізнились більше — пропуск (late)
 TWAP_BACKLOG_S   = 3600           # старт старший за годину — історія
+# v2.12 (з рев'ю CH): звірка з біржею. twapHistory дає twapId, стан
+# (activated/finished/terminated/error) і виконання; userTwapSliceFills
+# — startPosition ПЕРШОГО слайсу (позиція ДО твапу; слайс з'являється
+# через ~1-2с після створення): 0 → нова позиція (T1), протилежний бік
+# → скорочення (T2), той самий бік → долив, більше за позицію →
+# переворот — обидва НЕ сигнал. Ціни P0/P1 — закриття останньої повної
+# 1-хв свічки біржі перед стартом / перед останньою хвилиною
+# (відтворювано; фолбек — поллер, позначено p0_src/p1_src).
+TWAP_MIN_DUR_S   = 120            # коротший за 2 хв — немає передостанньої хвилини
+TWAP_VERIFY_S    = 30             # повтор звірки стану на біржі
+TWAP_CONFIRM_S   = 300            # після кінця: чекати finished/terminated до 5 хв
 TWAP_SIG_CSV     = os.path.join(DATA_DIR, "twap_signals.csv")
 TWAP_CSV         = os.path.join(DATA_DIR, "twap_trades.csv")
 TWAP_SIG_HEADERS = ["twap_id", "date", "src", "posts", "addr", "coin",
                     "twap_side", "usd", "dur_s", "start", "end", "kind",
+                    "kind_src", "exch_id", "start_pos",
                     "pos_usd", "eligible", "cancelled", "completed", "p0",
-                    "p1", "move_pct", "result", "strategy", "algo_v", "eol"]
+                    "p0_src", "p1", "p1_src", "move_pct", "result", "strategy",
+                    "algo_v", "eol"]
 TWAP_HEADERS     = (["twap_id", "strategy", "date_entry", "coin", "our_side",
                      "twap_side", "whale_addr", "src", "usd", "dur_s", "kind",
-                     "pos_usd", "move_pct", "p0", "p1", "entry_px",
-                     "net60_pct", "costs_pct", "peak_pct", "trough_pct",
-                     "cancel_after_entry", "btc_move_pct", "hour", "algo_v"]
+                     "kind_src", "exch_id", "start_pos",
+                     "pos_usd", "move_pct", "p0", "p0_src", "p1", "p1_src",
+                     "entry_px", "net60_pct", "costs_pct", "peak_pct",
+                     "trough_pct", "cancel_after_entry", "completed",
+                     "btc_move_pct", "hour", "algo_v"]
                     + [f"m{i}" for i in range(1, TWAP_TRACK_MIN + 1)]
                     + ["eol"])
 
@@ -5926,11 +6088,16 @@ def _tme_parse(page):
                        r'[^>]*>(.*?)</div>', b, re.S)
         rp = re.search(r'<div class="tgme_widget_message_text js-message_reply_text[^"]*"'
                        r'[^>]*>(.*?)</div>', b, re.S)
+        # v2.12: id поста, на який відповідають (точне зіставлення
+        # скасування зі стартом — без здогадок по сумі/монеті)
+        rl = re.search(r'<a class="tgme_widget_message_reply[^"]*"\s+href="https://t\.me/'
+                       r'[^/"]+/(\d+)"', b)
         tm = re.search(r'<time[^>]*datetime="([^"]+)"', b)
         if not (pid and tx):
             continue
         out.append((int(pid.group(1)), _iso_ts(tm.group(1)) if tm else time.time(),
-                    _tme_text(tx.group(1)), _tme_text(rp.group(1)) if rp else ""))
+                    _tme_text(tx.group(1)), _tme_text(rp.group(1)) if rp else "",
+                    int(rl.group(1)) if rl else 0))
     out.sort(key=lambda x: x[0])
     return out
 
@@ -6010,42 +6177,172 @@ def _twap_register(channel, pid, p, now):
                "usd": p["usd"], "start": p["start"], "end": p["end"],
                "dur": p["dur"], "px_msg": p["px_msg"],
                "eligible": int(bool(p["dur"]) and p["dur"] <= TWAP_MAX_DUR_S
-                               and bool(p["addr"])),
-               "kind": None, "pos_usd": None, "state": "watch",
+                               and p["dur"] >= TWAP_MIN_DUR_S and bool(p["addr"])),
+               "kind": None, "kind_src": "", "pos_usd": None, "state": "watch",
                "reason": "", "cancelled": 0, "completed": 0,
                "cancel_after_entry": 0, "p0": None, "p1": None,
-               "p0_src": "", "move": None, "entry_ts": None,
+               "p0_src": "", "p1_src": "", "move": None, "entry_ts": None,
                "entry_px": None, "strategy": "", "created": now,
+               # звірка з біржею (v2.12)
+               "twap_id": None, "exch": "", "exec_sz": None, "target_sz": None,
+               "sp": None, "verified_ts": 0.0, "verify_n": 0,
+               "exch_cancelled": 0, "exch_completed": 0, "confirm_done": 0,
                "sig_written": 0}
         if not rec["eligible"]:
             rec["state"] = "ineligible"
             rec["reason"] = ("dur>15m" if (p["dur"] or 0) > TWAP_MAX_DUR_S
-                             else ("no_addr" if not p["addr"] else "no_dur"))
+                             else ("dur<2m" if (p["dur"] or 0) and p["dur"] < TWAP_MIN_DUR_S
+                                   else ("no_addr" if not p["addr"] else "no_dur")))
         twap_reg[tid] = rec
     return rec, True
 
-def _twap_resolve_kind(rec):
-    """open — позиції в монеті немає або вона ТОГО Ж боку, що твап
-    (нарощує); reduce — протилежного (скорочує). Запит іде через
-    prio-канал (проксі, якщо є). Стійко до запізнення поста: перший
-    шматок твапу вже виконаний -> позиція того ж боку -> open."""
-    if not rec.get("addr"):
+def _twap_by_post(channel, pid):
+    """Запис реєстру, що містить пост channel/pid (для reply-зіставлення)."""
+    if not pid:
         return None
+    tag = f"{channel}/{pid}"
+    for r in twap_reg.values():
+        if tag in r.get("posts", ()):
+            return r
+    return None
+
+_twap_api_cache = {}   # json(body) -> (ts, відповідь); лише потік вотчера
+
+def _twap_api(body, ttl=10.0):
+    """Запит до біржі через prio-канал (проксі) з коротким кешем: кілька
+    твапів одного гаманця в одному тику не тягнуть історію повторно."""
+    key = json.dumps(body, sort_keys=True)
+    now = time.time()
+    c = _twap_api_cache.get(key)
+    if c is not None and now - c[0] < ttl:
+        return c[1]
+    data = (hl_post_prio if _prio_opener else _hl_post_prio_direct)(body)
+    _twap_api_cache[key] = (now, data)
+    if len(_twap_api_cache) > 400:
+        for k in [k for k, v in _twap_api_cache.items() if now - v[0] > 900]:
+            _twap_api_cache.pop(k, None)
+    return data
+
+def _twap_candle_close(coin, cutoff):
+    """Закриття останньої ПОВНІСТЮ закритої 1-хв свічки біржі перед
+    cutoff (v2.12, з рев'ю CH): відтворювана межа замість «що бачив
+    поллер у ту секунду». None — свічки (ще) немає."""
+    bar = (int(cutoff) // 60 - 1) * 60
     try:
-        pos = check_one_wallet(rec["addr"],
-                               post=(hl_post_prio if _prio_opener
-                                     else _hl_post_prio_direct))
+        rows = _twap_api({"type": "candleSnapshot",
+                          "req": {"coin": coin, "interval": "1m",
+                                  "startTime": bar * 1000,
+                                  "endTime": bar * 1000 + 59_999}}, ttl=3600)
     except Exception as e:
-        print(f"  [TWAP] позиція {rec['coin']} {rec['addr'][:10]}…: {e}")
+        print(f"  [TWAP] свічка {coin}: {e}")
         return None
-    p = pos.get(rec["coin"])
-    if not p:
-        rec["kind"], rec["pos_usd"] = "open", 0.0
+    if not isinstance(rows, list):
+        return None
+    for r in rows:
+        try:
+            if int(r.get("t", -1)) == bar * 1000 and int(r.get("T", 0)) < cutoff * 1000:
+                px = float(r.get("c") or 0)
+                return px if px > 0 else None
+        except (TypeError, ValueError):
+            continue
+    return None
+
+def _twap_verify(rec, now, slices=True):
+    """Звірка запису з біржею (v2.12, з рев'ю CH). twapHistory: запис
+    тієї ж монети/боку зі стартом ±10с → twapId, стан, виконання;
+    userTwapSliceFills: ПЕРШИЙ слайс цього twapId → startPosition
+    (позиція до твапу): 0 → open (нова позиція, T1); протилежний бік і
+    розмір твапу ≤ |позиції| → reduce (T2); той самий бік → increase;
+    більше за позицію → flip — два останні не сигнал. Повертає True,
+    коли twapId відомий (вид — коли slices=True і слайс уже є)."""
+    if not rec.get("addr"):
+        return False
+    rec["verify_n"] = rec.get("verify_n", 0) + 1
+    rec["verified_ts"] = now
+    try:
+        hist = _twap_api({"type": "twapHistory", "user": rec["addr"]}, ttl=10)
+    except Exception as e:
+        print(f"  [TWAP] twapHistory {rec['coin']} {rec['addr'][:10]}…: {e}")
+        return False
+    if not isinstance(hist, list):
+        return False
+    want = "B" if rec["side"] == "buy" else "A"
+    best, best_t = None, -1.0
+    for it in hist:
+        st = it.get("state") or {}
+        if (st.get("coin") or "") != rec["coin"] or st.get("side") != want:
+            continue
+        if rec.get("twap_id") is not None:
+            if it.get("twapId") != rec["twap_id"]:
+                continue
+        else:
+            try:
+                ts0 = float(st.get("timestamp") or 0) / 1000.0
+            except (TypeError, ValueError):
+                continue
+            if abs(ts0 - rec["start"]) > 10:
+                continue
+        t_rev = float(it.get("time") or 0)
+        if best is None or t_rev >= best_t:
+            best, best_t = it, t_rev   # найсвіжіша ревізія (activated→finished)
+    if best is None:
+        return False
+    st = best.get("state") or {}
+    status = best.get("status")
+    status = (status.get("status") if isinstance(status, dict) else status) or ""
+    rec["twap_id"] = best.get("twapId")
+    rec["exch"] = status
+    try:
+        rec["exec_sz"] = float(st.get("executedSz") or 0)
+        rec["target_sz"] = float(st.get("sz") or 0)
+    except (TypeError, ValueError):
+        rec["exec_sz"], rec["target_sz"] = None, None
+    if status in ("terminated", "error"):
+        rec["exch_cancelled"] = 1
+    elif (status == "finished" and rec["target_sz"]
+          and rec["exec_sz"] is not None
+          and rec["exec_sz"] >= rec["target_sz"] * (1 - 1e-6)):
+        rec["exch_completed"] = 1
+    if not slices or rec.get("kind_src") == "slice":
+        return True
+    try:
+        fills = _twap_api({"type": "userTwapSliceFills", "user": rec["addr"]}, ttl=10)
+    except Exception as e:
+        print(f"  [TWAP] slices {rec['coin']} {rec['addr'][:10]}…: {e}")
+        return True
+    if not isinstance(fills, list):
+        return True
+    mine = [w.get("fill") or {} for w in fills
+            if isinstance(w, dict) and w.get("twapId") == rec["twap_id"]]
+    if not mine:
+        return True   # перший слайс ще не в історії — наступний тик
+    try:
+        first = min(mine, key=lambda f: (float(f.get("time") or 0),
+                                         float(f.get("tid") or 0)))
+        sp = float(first.get("startPosition") or 0)
+        px0 = float(first.get("px") or 0)
+    except (TypeError, ValueError):
+        return True
+    qty = rec["target_sz"] or 0
+    sign = 1 if rec["side"] == "buy" else -1
+    if abs(sp) <= 1e-12:
+        kind = "open"
+    elif sp * sign < 0 and qty <= abs(sp) + 1e-9:
+        kind = "reduce"
+    elif sp * sign < 0:
+        kind = "flip"
     else:
-        same = (p["side"] == "LONG") == (rec["side"] == "buy")
-        rec["kind"] = "open" if same else "reduce"
-        rec["pos_usd"] = p["val"]
-    return rec["kind"]
+        kind = "increase"
+    rec["kind"], rec["kind_src"], rec["sp"] = kind, "slice", sp
+    rec["pos_usd"] = abs(sp) * px0
+    return True
+
+def _twap_resolve_kind(rec):
+    """Сумісна обгортка: вид твапу лише зі звірки з біржею (v2.12).
+    Стара евристика по поточній позиції (clearinghouseState) прибрана:
+    вона не відрізняла «нову позицію» від «доливу» — обидва йшли в T1."""
+    _twap_verify(rec, time.time(), slices=True)
+    return rec.get("kind") if rec.get("kind_src") == "slice" else None
 
 def _twap_sig_write(rec, result):
     if rec.get("sig_written"):
@@ -6057,8 +6354,10 @@ def _twap_sig_write(rec, result):
            rec["addr"] or "", rec["coin"], rec["side"] or "",
            _n(rec["usd"], 0), _n(rec["dur"], 0), _dt(rec["start"]),
            (_dt(rec["end"]) if rec["end"] else ""), rec["kind"] or "",
+           rec.get("kind_src") or "", _n(rec.get("twap_id")), _n(rec.get("sp")),
            _n(rec["pos_usd"], 0), rec["eligible"], rec["cancelled"],
-           rec["completed"], _n(rec["p0"]), _n(rec["p1"]), _n(rec["move"], 4),
+           rec["completed"], _n(rec["p0"]), rec.get("p0_src") or "",
+           _n(rec["p1"]), rec.get("p1_src") or "", _n(rec["move"], 4),
            result, rec["strategy"], DATA_ALGO_V]
     if _strat_csv_append(TWAP_SIG_CSV, TWAP_SIG_HEADERS, row):
         rec["sig_written"] = 1
@@ -6086,8 +6385,12 @@ def _twap_enter(rec, now, px):
           "hour": time.localtime().tm_hour, "algo_v": DATA_ALGO_V,
           "twap": {"src": rec["src"], "twap_side": rec["side"],
                    "usd": rec["usd"], "dur": rec["dur"], "kind": rec["kind"],
+                   "kind_src": rec.get("kind_src") or "",
+                   "twap_id": rec.get("twap_id"), "sp": rec.get("sp"),
                    "pos_usd": rec["pos_usd"], "move": rec["move"],
-                   "p0": rec["p0"], "p1": rec["p1"], "cancel_after_entry": 0},
+                   "p0": rec["p0"], "p0_src": rec.get("p0_src") or "",
+                   "p1": rec["p1"], "p1_src": rec.get("p1_src") or "",
+                   "cancel_after_entry": 0, "completed": 0},
           "samples": [], "peak": -999.0, "trough": 999.0}
     with strat2_lock:
         busy = any(p.get("row_kind") == "twap" and p["strategy"] == strat
@@ -6106,24 +6409,92 @@ def _twap_enter(rec, now, px):
           f"рух {rec['move']:+.2f}% | тримаю {TWAP_HOLD_MIN} хв, крива {TWAP_TRACK_MIN}")
     threading.Thread(target=save_state, daemon=True).start()
 
+def _twap_apply_exchange(rec):
+    """Стан з біржі -> запис реєстру (і трекер, якщо вже увійшли)."""
+    if rec.get("exch_completed") and not rec["completed"]:
+        rec["completed"] = 1
+    if rec.get("exch_cancelled") and not rec["cancelled"]:
+        rec["cancelled"] = 1
+        twap_stats["cancelled"] += 1
+        if rec["state"] == "watch":
+            _twap_drop(rec, "cancelled")
+        elif rec["state"] == "entered":
+            rec["cancel_after_entry"] = 1
+    if rec["state"] == "entered" and rec.get("strategy"):
+        with strat2_lock:
+            tr = rev_open.get(f"{rec['id']}|{rec['strategy']}")
+            if tr and tr.get("twap") is not None:
+                tr["twap"]["completed"] = rec["completed"]
+                tr["twap"]["cancel_after_entry"] = rec["cancel_after_entry"]
+
+def _twap_dedup_by_id(rec):
+    """Два записи з одним twapId (той самий твап у двох каналах, старт
+    розійшовся понад ±2 хв або різні пости) — лишається старший."""
+    if rec.get("twap_id") is None:
+        return False
+    with twap_lock:
+        for other in twap_reg.values():
+            if (other is not rec and other.get("twap_id") == rec["twap_id"]
+                    and other["state"] != "dropped"
+                    and other.get("created", 0) <= rec.get("created", 0)):
+                other["posts"] = list(dict.fromkeys(other["posts"] + rec["posts"]))
+                for ch in rec["src"].split("+"):
+                    if ch not in other["src"].split("+"):
+                        other["src"] += "+" + ch
+                break
+        else:
+            return False
+    _twap_drop(rec, "dup_twapid")
+    return True
+
 def _twap_tick(now):
-    """Стан-машина активних твапів: вхід в останню хвилину або пропуск."""
+    """Стан-машина твапів (v2.12): звірка з біржею (twapId, вид зі
+    startPosition, стан), ціни зі свічок, вхід в останню хвилину або
+    пропуск; після кінця — підтвердження завершення/скасування."""
     with twap_lock:
         recs = [r for r in twap_reg.values() if r["state"] == "watch"]
+        ent = [r for r in twap_reg.values()
+               if r["state"] == "entered" and not r.get("confirm_done")]
     for rec in recs:
         if rec["end"] is None:
             continue
+        # 1) звірка: до появи першого слайсу — кожен тик (кеш 10с), далі
+        #    раз на TWAP_VERIFY_S (стан activated→terminated)
+        if now >= rec["start"] - 5 and (
+                rec.get("kind_src") != "slice"
+                or now - rec.get("verified_ts", 0) >= TWAP_VERIFY_S):
+            _twap_verify(rec, now, slices=True)
+            if _twap_dedup_by_id(rec):
+                continue
+            _twap_apply_exchange(rec)
+            if rec["state"] != "watch":
+                continue
+        if rec.get("kind") in ("increase", "flip"):
+            _twap_drop(rec, "not_new_or_reduce"); continue
+        # 2) P0 — свічка, що закрилась перед стартом (раз; після старту)
+        if rec.get("p0") is None and now >= rec["start"] + 3:
+            _c0 = _twap_candle_close(rec["coin"], rec["start"])
+            if _c0:
+                rec["p0"], rec["p0_src"] = _c0, "candle"
         t_entry = rec["end"] - TWAP_ENTRY_LEAD
         if now < t_entry:
             continue
         if now > rec["end"] + TWAP_LATE_S:
             _twap_drop(rec, "late"); continue
-        # p0 — за хвилину ДО старту (хвилинна історія); фолбек — ціна з
-        # самого поста (момент створення твапу), позначається у p0_src
-        p0 = _px_at(rec["coin"], rec["start"] - 60.0)
-        rec["p0_src"] = "hist" if p0 else ("msg" if rec.get("px_msg") else "")
-        p0 = p0 or rec.get("px_msg")
-        p1 = _px_now(rec["coin"])   # передостання хвилина = зараз
+        # 3) P1 — свічка, що закрилась на початку останньої хвилини
+        if rec.get("p1") is None:
+            _c1 = _twap_candle_close(rec["coin"], rec["end"] - 60.0)
+            if _c1:
+                rec["p1"], rec["p1_src"] = _c1, "candle"
+        p0 = rec.get("p0")
+        if not p0:
+            p0 = _px_at(rec["coin"], rec["start"] - 60.0)
+            rec["p0_src"] = "hist" if p0 else ("msg" if rec.get("px_msg") else "")
+            p0 = p0 or rec.get("px_msg")
+        p1 = rec.get("p1")
+        if not p1:
+            p1 = _px_now(rec["coin"])   # фолбек: зараз (остання хвилина)
+            rec["p1_src"] = "live" if p1 else ""
         if not p0 or not p1:
             if now < rec["end"] - 20:
                 continue   # ще є час дочекатись ціни
@@ -6134,16 +6505,40 @@ def _twap_tick(now):
         rec["p0"], rec["p1"], rec["move"] = p0, p1, round(move, 4)
         if move < TWAP_MIN_MOVE:
             _twap_drop(rec, "move_small"); continue
-        if rec["kind"] is None:
-            _twap_resolve_kind(rec)
-        if rec["kind"] is None:
+        if rec.get("kind_src") != "slice":
+            _twap_verify(rec, now, slices=True)
+        if rec.get("kind") in ("increase", "flip"):
+            _twap_drop(rec, "not_new_or_reduce"); continue
+        # вид — ЛИШЕ зі звірки з біржею (startPosition першого слайсу)
+        if rec.get("kind_src") != "slice" or rec.get("kind") not in ("open", "reduce"):
+            if now < rec["end"] - 15:
+                continue   # слайс/історія ще можуть з'явитись
             _twap_drop(rec, "kind_unknown"); continue
-        _twap_enter(rec, now, p1)
+        # ціна paper-входу — жива ціна зараз (свічка P1 закрилась до
+        # хвилини тому і потрібна лише для руху)
+        _twap_enter(rec, now, _px_now(rec["coin"]) or p1)
+    # 4) після кінця: finished (executed ≥ sz) → completed; terminated →
+    #    cancel_after_entry. Історія — легкий запит (без слайсів)
+    for rec in ent:
+        if rec["end"] is None or now < rec["end"] + 20:
+            continue
+        if now > rec["end"] + TWAP_CONFIRM_S:
+            rec["confirm_done"] = 1
+            continue
+        if now - rec.get("verified_ts", 0) < TWAP_VERIFY_S:
+            continue
+        _twap_verify(rec, now, slices=False)
+        _twap_apply_exchange(rec)
+        if rec.get("exch_completed") or rec.get("exch_cancelled"):
+            rec["confirm_done"] = 1
 
-def _twap_ingest(channel, pid, ts, text, now, reply="", seen=False):
+def _twap_ingest(channel, pid, ts, text, now, reply="", seen=False,
+                 reply_pid=0):
     """seen=True — пост уже оброблявся (той самий pid): HL редагує
     стартовий пост у «cancelled»/«successful completed» замість нового
-    поста, тому вже бачені пости перечитуємо ЛИШЕ як cancel/done."""
+    поста, тому вже бачені пости перечитуємо ЛИШЕ як cancel/done.
+    reply_pid — id поста, на який відповідає цей (v2.12): скасування
+    зіставляється зі стартом ТОЧНО, а не по сумі/монеті."""
     p = twap_parse(channel, text, ts, reply)
     if p is None:
         return
@@ -6172,13 +6567,20 @@ def _twap_ingest(channel, pid, ts, text, now, reply="", seen=False):
         else:
             _twap_sig_write(rec, "ineligible")
         return
-    # cancel / done
+    # cancel / done: спершу точно — по посту, на який відповідають, або
+    # по самому посту (HL редагує старт у cancelled); далі — евристика
     with twap_lock:
-        if p["start"] is not None and p.get("exact", True):
-            rec = _twap_find(p["addr"], p["coin"], p["side"], p["start"],
-                             p["usd"])
-        else:
-            rec = _twap_find(p["addr"], p["coin"], p["side"], usd=p["usd"])
+        rec = _twap_by_post(channel, reply_pid) if reply_pid else None
+        if rec is None and seen:
+            rec = _twap_by_post(channel, pid)
+        if rec is not None and rec["state"] not in ("watch", "entered"):
+            rec = None
+        if rec is None:
+            if p["start"] is not None and p.get("exact", True):
+                rec = _twap_find(p["addr"], p["coin"], p["side"], p["start"],
+                                 p["usd"])
+            else:
+                rec = _twap_find(p["addr"], p["coin"], p["side"], usd=p["usd"])
     if rec is None:
         return
     if p["kind"] == "done":
@@ -6212,13 +6614,16 @@ def _twap_row(p):
     return ([p["sig_id"], p["strategy"], _dt(p["entry_ts"]), p["coin"],
              p["side"], tw.get("twap_side", ""), p.get("addr") or "",
              tw.get("src", ""), _n(tw.get("usd"), 0), _n(tw.get("dur"), 0),
-             tw.get("kind", ""), _n(tw.get("pos_usd"), 0), _n(tw.get("move"), 4),
-             _n(tw.get("p0")), _n(tw.get("p1")), round(p["entry_px"], 8),
+             tw.get("kind", ""), tw.get("kind_src", ""), _n(tw.get("twap_id")),
+             _n(tw.get("sp")),
+             _n(tw.get("pos_usd"), 0), _n(tw.get("move"), 4),
+             _n(tw.get("p0")), tw.get("p0_src", ""), _n(tw.get("p1")),
+             tw.get("p1_src", ""), round(p["entry_px"], 8),
              (round(m60 - costs, 4) if m60 is not None else ""),
              round(costs, 4),
              (round(p["peak"], 4) if p["peak"] > -999 else ""),
              (round(p["trough"], 4) if p["trough"] < 999 else ""),
-             tw.get("cancel_after_entry", 0),
+             tw.get("cancel_after_entry", 0), tw.get("completed", 0),
              (round(bm, 3) if bm is not None else ""), p.get("hour", ""),
              p.get("algo_v", "")]
             + [("" if x == "" else round(x, 4)) for x in s[:TWAP_TRACK_MIN]]
@@ -6250,17 +6655,17 @@ def run_twap_watcher():
             if not last and posts:
                 # перший запуск: усе старше за годину — історія, не сигнал
                 cutoff = time.time() - TWAP_BACKLOG_S
-                last = max((pid for pid, ts, _, _ in posts if ts < cutoff),
+                last = max((pid for pid, ts, *_ in posts if ts < cutoff),
                            default=0)
             now = time.time()
             last0 = last
-            for pid, ts, text, reply in posts:
+            for pid, ts, text, reply, reply_pid in posts:
                 try:
                     # pid <= last0 — уже бачений пост: HL редагує старт у
                     # cancelled/completed без нового поста, тож
                     # перечитуємо його лише як cancel/done (ідемпотентно)
                     _twap_ingest(ch, pid, ts, text, now, reply,
-                                 seen=(pid <= last0))
+                                 seen=(pid <= last0), reply_pid=reply_pid)
                 except Exception as e:
                     twap_stats["parse_err"] += 1
                     print(f"  [TWAP] {ch}/{pid}: помилка обробки: {e}")
@@ -6381,6 +6786,13 @@ def run_scan():
                 return
             fetch_times[k] = _t_fetch
             update_stats(k, bool(positions), sn)
+            # v2.12 (з рев'ю CH): нові великі пари — у watchlist ОДРАЗУ
+            # після читання гаманця, а не в кінці 90-хвилинного скану
+            if positions:
+                try:
+                    _discover_pairs(k, positions, _t_fetch)
+                except Exception as _de:
+                    print(f"  [SCAN #{sn}] discover {k[:10]}…: {_de}")
             with cache_lock:
                 if positions:
                     for pos in positions:
@@ -6477,9 +6889,26 @@ def run_scan():
     finally:
         with cache_lock:
             cache["scanning"] = False
+        scan_metrics["last_duration_s"] = round(time.time() - scan_start, 1)
 
-    threading.Timer(REFRESH_S, lambda: threading.Thread(
-        target=run_scan, daemon=True).start()).start()
+    # v2.12 (з рев'ю CH): наступний скан — через REFRESH_S від СТАРТУ
+    # цього, а не від його кінця: 90-хвилинний скан + 30 хв паузи давав
+    # 2-годинний цикл; тепер довгий скан переходить у наступний майже
+    # одразу (5с), короткий — чекає решту 30 хв
+    _schedule_scan(max(5.0, REFRESH_S - (time.time() - scan_start)))
+
+def _schedule_scan(delay):
+    """Один таймер на наступний скан; повторний виклик замінює попередній
+    (захист від двох паралельних сканів — плюс cache["scanning"])."""
+    global _scan_timer
+    with _scan_sched_lock:
+        if _scan_timer is not None:
+            _scan_timer.cancel()
+        scan_metrics["next_scan_at"] = time.time() + delay
+        _scan_timer = threading.Timer(delay, lambda: threading.Thread(
+            target=run_scan, daemon=True).start())
+        _scan_timer.daemon = True
+        _scan_timer.start()
 
 # ── HTTP ─────────────────────────────────────────────────
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -6603,6 +7032,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "scan_proxy_err": _scan_state["err"],
                 "scan_proxy_429": _scan_state["rl"],
                 "scan_proxy_fallbacks": _scan_state["fallback"],
+                # v2.12: планувальник скану і інкрементальне відкриття пар
+                "scan_next_in_s": round(max(0.0, scan_metrics["next_scan_at"] - time.time()), 0),
+                "scan_last_duration_s": scan_metrics["last_duration_s"],
+                "scan_new_pairs_live": scan_metrics["new_pairs"],
                 # TWAP-вотчер (v2.11 п.5)
                 **{f"twap_{k}": v for k, v in twap_stats.items()},
                 "twap_active": _twap_active,
@@ -6652,28 +7085,46 @@ class Handler(http.server.BaseHTTPRequestHandler):
         else:
             self.send_response(404); self.end_headers()
 
-est = SCAN_TOP * DELAY / WORKERS
-print(f"\n  HL TERMINAL  →  http://localhost:{PORT}")
-print(f"  Full leaderboard scan (up to {SCAN_TOP}) | {WORKERS} workers | {DELAY}s delay")
-print(f"  First scan ETA: ~{est:.0f}s | After warmup: much faster (empty-skip)")
-print(f"  Skip logic: {SKIP_AFTER} empty scans → check every {CHECK_EVERY} "
-      f"scans | VIP top-{VIP_TOP_N} за екваті — без скіпу\n")
+def _on_stop(signum, frame):
+    """SIGTERM/SIGINT (systemctl restart/stop): зберегти стан ДО виходу
+    (v2.12, з рев'ю CH) — інакше рестарт губив до 60с трекерів/watchlist
+    між періодичними записами. daemon-потоки помирають разом із
+    процесом; SystemExit запускає atexit."""
+    print(f"  [STATE] сигнал {signum}: зберігаю стан і виходжу")
+    try:
+        save_state()
+    finally:
+        raise SystemExit(0)
 
-# Depth — запускаємо ПЕРШИМ, паралельно зі скануванням
-load_state()   # відновлюємо watchlist і сим-позиції з минулого запуску
-threading.Thread(target=run_alert_sender, daemon=True).start()
-threading.Thread(target=run_state_saver,  daemon=True).start()
-threading.Thread(target=run_depth_loop,   daemon=True).start()
-threading.Thread(target=run_scan,         daemon=True).start()
-threading.Thread(target=run_websocket,    daemon=True).start()
-threading.Thread(target=tg_poll_updates,     daemon=True).start()
-threading.Thread(target=run_realtime_monitor, daemon=True).start()
-threading.Thread(target=run_sim_loop,        daemon=True).start()
-threading.Thread(target=run_fc_loop,         daemon=True).start()
-threading.Thread(target=run_px_poller,       daemon=True).start()
-threading.Thread(target=run_strat2_loop,     daemon=True).start()
-threading.Thread(target=run_prio_fetcher,    daemon=True).start()
-threading.Thread(target=_prio_probe,         daemon=True).start()
-threading.Thread(target=_scan_probe,         daemon=True).start()
-threading.Thread(target=run_twap_watcher,    daemon=True).start()
-http.server.ThreadingHTTPServer(("", PORT), Handler).serve_forever()
+def main():
+    est = SCAN_TOP * DELAY / WORKERS
+    print(f"\n  HL TERMINAL  →  http://localhost:{PORT}")
+    print(f"  Full leaderboard scan (up to {SCAN_TOP}) | {WORKERS} workers | {DELAY}s delay")
+    print(f"  First scan ETA: ~{est:.0f}s | After warmup: much faster (empty-skip)")
+    print(f"  Skip logic: {SKIP_AFTER} empty scans → check every {CHECK_EVERY} "
+          f"scans | VIP top-{VIP_TOP_N} за екваті — без скіпу\n")
+
+    # Depth — запускаємо ПЕРШИМ, паралельно зі скануванням
+    load_state()   # відновлюємо watchlist і сим-позиції з минулого запуску
+    signal.signal(signal.SIGTERM, _on_stop)
+    signal.signal(signal.SIGINT, _on_stop)
+    atexit.register(save_state)
+    threading.Thread(target=run_alert_sender, daemon=True).start()
+    threading.Thread(target=run_state_saver,  daemon=True).start()
+    threading.Thread(target=run_depth_loop,   daemon=True).start()
+    threading.Thread(target=run_scan,         daemon=True).start()
+    threading.Thread(target=run_websocket,    daemon=True).start()
+    threading.Thread(target=tg_poll_updates,     daemon=True).start()
+    threading.Thread(target=run_realtime_monitor, daemon=True).start()
+    threading.Thread(target=run_sim_loop,        daemon=True).start()
+    threading.Thread(target=run_fc_loop,         daemon=True).start()
+    threading.Thread(target=run_px_poller,       daemon=True).start()
+    threading.Thread(target=run_strat2_loop,     daemon=True).start()
+    threading.Thread(target=run_prio_fetcher,    daemon=True).start()
+    threading.Thread(target=_prio_probe,         daemon=True).start()
+    threading.Thread(target=_scan_probe,         daemon=True).start()
+    threading.Thread(target=run_twap_watcher,    daemon=True).start()
+    http.server.ThreadingHTTPServer(("", PORT), Handler).serve_forever()
+
+if __name__ == "__main__":
+    main()
