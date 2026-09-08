@@ -545,7 +545,7 @@ if REST_PROXY:
         urllib.request.ProxyHandler({"https": "http://" + REST_PROXY,
                                      "http":  "http://" + REST_PROXY}))
 
-def hl_post_prio(body, retries=2, direct=False, max_wait=65.0):
+def hl_post_prio(body, retries=2, direct=False, max_wait=65.0, w_next=None):
     """hl_post пріоритетного каналу: через REST_PROXY, щоб перевірки
     невідомих китів не їли ліміт основної IP. direct=True (або без
     проксі) — прямий запит; викликач тоді сам тримає жорсткіший кап
@@ -562,7 +562,9 @@ def hl_post_prio(body, retries=2, direct=False, max_wait=65.0):
     via_proxy = not (direct or not _prio_opener)
     opener = _prio_opener.open if via_proxy else urllib.request.urlopen
     via = "proxy" if via_proxy else "direct"
-    w_ = _hl_weight(body)
+    # резерв до запиту: очікувана вага (профіль передає повну сторінку
+    # 120 — рев'ю v2.14: інакше шість сторінок поспіль проходили стелю)
+    w_ = w_next if w_next is not None else _hl_weight(body)
     if w_ <= 2:
         max_wait = min(max_wait, 3.0)   # легкий запит prio-воркера: не клінчити
     last_was_429 = False
@@ -5147,8 +5149,9 @@ def _profile_post(body):
             via = "proxy"
     if via == "proxy":
         try:
-            # бюджет проксі (очікування + облік) — усередині hl_post_prio
-            return hl_post_prio(body, retries=1)
+            # бюджет проксі (очікування + облік) — усередині hl_post_prio;
+            # резерв — повна сторінка історії (20 + 2000/20)
+            return hl_post_prio(body, retries=1, w_next=120)
         except RateLimited:
             raise
         except Exception as e:
@@ -6054,7 +6057,7 @@ def strat2_api():
             "drops": {k: sum(1 for r in sig_rows if r.get("result") == k)
                       for k in ("move_small", "cancelled", "late",
                                 "not_new_or_reduce", "dup_twapid",
-                                "kind_unproven",
+                                "kind_unproven", "no_verify",
                                 "no_price", "kind_unknown", "busy")},
         })
     with twap_lock:
@@ -6593,7 +6596,10 @@ def _twap_register(channel, pid, p, now):
             if (r_["coin"] != p["coin"] or r_["addr"] != p["addr"]
                     or r_["side"] != p["side"]
                     or channel in r_["src"].split("+")
-                    or r_["state"] == "dropped"
+                    # dropped БЕЗ id біржі — не зливаємо (нова заявка дістане
+                    # власну звірку); dropped З id — той самий твап, дубль
+                    # поста не має рахуватись другим сигналом (рев'ю v2.14)
+                    or (r_["state"] == "dropped" and r_.get("twap_id") is None)
                     or abs(r_["start"] - p["start"]) > TWAP_XCH_START_S
                     or abs((r_.get("dur") or 0) - (p.get("dur") or 0)) > TWAP_XCH_DUR_S):
                 continue
@@ -6890,9 +6896,15 @@ def _twap_close_min(tr):
 
 def _twap_trade_closed(tr, now):
     """Угода закрита (монета вільна, результат відомий), хоч трекер ще
-    веде криву до TWAP_TRACK_MIN."""
+    веде криву до TWAP_TRACK_MIN: семпл хвилини виходу вже записаний або
+    минув і 30-с допуск ціни (рев'ю v2.14: інакше на самій межі 60-ї
+    хвилини pending-рядок був порожнім)."""
     et = tr.get("entry_ts") or 0
-    return bool(et) and now - et >= _twap_close_min(tr) * 60.0
+    if not et:
+        return False
+    cm = _twap_close_min(tr)
+    return (len(tr.get("samples") or ()) >= cm
+            or now - et >= cm * 60.0 + 35.0)
 
 def _twap_trackers(rec):
     """Ключі трекерів запису (когорти); старі записи — один ключ."""
@@ -7244,11 +7256,13 @@ def _twap_ingest(channel, pid, ts, text, now, reply="", seen=False,
                     p["start"] if (p["start"] is not None and p.get("exact", True)) else None,
                     p["usd"])
                 if len(found) > 1 and p.get("usd"):
-                    # сума в пості — 3 значущі цифри ($5.11m): ЄДИНИЙ запис
-                    # з тією ж сумою (<0.1%) — це він; два з тією ж — не
-                    # вгадуємо
+                    # сума в пості — 3 значущі цифри ($5.11m, $1.00m): збіг
+                    # = у межах ПІВОДИНИЦІ третьої цифри (5.11m: ±5k;
+                    # 1.00m: ±5k, тобто 1.004m теж «збігається»); ЄДИНИЙ
+                    # такий запис — це він; два — не вгадуємо
+                    _tol = 0.5 * 10 ** (math.floor(math.log10(p["usd"])) - 2)
                     exact_usd = [r_ for r_ in found if r_.get("usd")
-                                 and abs(r_["usd"] - p["usd"]) / p["usd"] < 1e-3]
+                                 and abs(r_["usd"] - p["usd"]) <= _tol]
                     if len(exact_usd) == 1:
                         found = exact_usd
                 if len(found) == 1:
@@ -7281,9 +7295,12 @@ def _twap_ingest(channel, pid, ts, text, now, reply="", seen=False,
         rec["twap_id"] = tid
     if p.get("target_sz") and not rec.get("target_sz"):
         rec["exec_sz"], rec["target_sz"] = (p.get("exec_sz") or 0.0), p["target_sz"]
+    if p.get("status"):
+        rec["tg_status"] = p["status"]
     if (p.get("status") and (rec.get("exch") or "") in ("", "activated", "ambiguous")
-            and (p["status"] != "finished" or p.get("target_sz"))):
-        # «finished» без цифр виконання — не статус біржі, а слово каналу
+            and p.get("target_sz")):
+        # статус із поста — лише разом із цифрами виконання (дані біржі у
+        # пості); слово каналу без цифр — tg_status, не exch
         rec["exch"] = p["status"]
     full = bool(p.get("target_sz") and p.get("exec_sz") is not None
                 and p["exec_sz"] >= p["target_sz"] * (1 - 1e-6))
