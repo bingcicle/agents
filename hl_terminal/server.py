@@ -2474,6 +2474,7 @@ def run_realtime_monitor():
                         "old_size":  old["size"],
                         "close_pct": _pct,
                         "ratio":     (_ep_ratio if (_fc and _ep_ratio) else old["ratio"]),
+                        "ratio_src": ("episode" if (_fc and _ep_ratio) else "live"),
                         "live_ratio": old["ratio"],
                         "entry":     old["entry"],
                         "full_close": _fc,
@@ -2770,6 +2771,7 @@ def check_position_changes(new_result, depth_snap):
                     "old_size":  old["size"],
                     "close_pct": min(_f["sz"] / _base, 1.0),
                     "ratio":     new_pos.get("ratio", old["ratio"]),
+                    "ratio_src": "live",   # скан-діф: ratio епізоду тут невідомий
                     "entry":     old["entry"],
                     "full_close": full_close,
                     "fills":     [_f],
@@ -2866,7 +2868,7 @@ def send_close_alert(a):
     msg = (
         f"{side_emoji} <b>#{a['coin']} — {a['side']} position closing</b>\n"
         f"\n"
-        f"📊 <b>Ratio{' на старті епізоду' if a.get('full_close') else ''}:</b> {a['ratio']:.2f}x"
+        f"📊 <b>Ratio{' на старті епізоду' if a.get('ratio_src') == 'episode' else ''}:</b> {a['ratio']:.2f}x"
         + (f" (зараз {a['live_ratio']:.2f}x)"
            if a.get('live_ratio') is not None and abs(a['live_ratio'] - a['ratio']) > 0.005
            else "") + "\n"
@@ -6373,6 +6375,8 @@ def _twap_by_post(channel, pid):
     return None
 
 _twap_api_cache = {}   # json(body) -> (ts, відповідь); лише потік вотчера
+_twap_candle_miss = {}   # json(body) -> (n порожніх відповідей, ts першої)
+TWAP_CANDLE_TRIES = 3    # порожня свічка: ще 2 повтори на наступних тиках, далі — ні
 
 def _twap_api(body, ttl=10.0):
     """Запит до біржі через prio-канал (проксі) з коротким кешем: кілька
@@ -6393,11 +6397,17 @@ def _twap_candle_close(coin, cutoff):
     """Закриття останньої ПОВНІСТЮ закритої 1-хв свічки біржі перед
     cutoff (v2.12, з рев'ю CH): відтворювана межа замість «що бачив
     поллер у ту секунду». None — свічки (ще) немає; порожня відповідь НЕ
-    кешується (рев'ю v2.12 №5e: свічка може з'явитись за секунду)."""
+    кешується (рев'ю v2.12 №5e: свічка може з'явитись за секунду), але
+    після TWAP_CANDLE_TRIES порожніх — більше не запитується (рев'ю v2.13
+    №4: монета без свічок тягнула вагу 20 щотику все життя твапу)."""
     bar = (int(cutoff) // 60 - 1) * 60
     body = {"type": "candleSnapshot",
             "req": {"coin": coin, "interval": "1m",
                     "startTime": bar * 1000, "endTime": bar * 1000 + 59_999}}
+    key = json.dumps(body, sort_keys=True)
+    miss = _twap_candle_miss.get(key)
+    if miss and miss[0] >= TWAP_CANDLE_TRIES:
+        return None
     try:
         rows = _twap_api(body, ttl=3600)
     except Exception as e:
@@ -6415,7 +6425,15 @@ def _twap_candle_close(coin, cutoff):
             except (TypeError, ValueError):
                 continue
     if px is None:
-        _twap_api_cache.pop(json.dumps(body, sort_keys=True), None)
+        _twap_api_cache.pop(key, None)
+        _twap_candle_miss[key] = ((miss[0] + 1) if miss else 1,
+                                  (miss[1] if miss else time.time()))
+        if len(_twap_candle_miss) > 400:
+            _t = time.time()
+            for k in [k for k, v in _twap_candle_miss.items() if _t - v[1] > 3600]:
+                _twap_candle_miss.pop(k, None)
+    else:
+        _twap_candle_miss.pop(key, None)
     return px
 
 def _twap_verify(rec, now, slices=True):
@@ -6479,14 +6497,17 @@ def _twap_verify(rec, now, slices=True):
         if ranked[1][2] - ranked[0][2] < 3.0:
             rec["exch"] = "ambiguous"
             return False
-        best = ranked[0][0]
+        best, best_t = ranked[0][0], ranked[0][1]
     else:
-        best = min(by_id.values(), key=lambda x: x[2])[0]
+        best, best_t, _ = min(by_id.values(), key=lambda x: x[2])
     st = best.get("state") or {}
     status = best.get("status")
     status = (status.get("status") if isinstance(status, dict) else status) or ""
     rec["twap_id"] = best.get("twapId")
     rec["exch"] = status
+    # час останньої ревізії статусу (поле time — у СЕКУНДАХ, на відміну від
+    # state.timestamp у мс): точна хвилина скасування для виходу трекера
+    rec["exch_ts"] = best_t if best_t and best_t < 1e11 else (best_t / 1000.0 if best_t else None)
     try:
         rec["exec_sz"] = float(st.get("executedSz") or 0)
         rec["target_sz"] = float(st.get("sz") or 0)
@@ -6599,9 +6620,22 @@ def _twap_sync_trackers(rec):
             tw["cancel_after_entry"] = rec["cancel_after_entry"]
             tw["exch_status"] = rec.get("exch") or ""
             tw["exec_pct"] = exec_pct
-            if rec["cancel_after_entry"] and not tw.get("exit_min"):
-                tw["exit_min"] = min(len(tr["samples"]) + 1, TWAP_TRACK_MIN)
-                tw["exit_reason"] = "cancelled"
+            if rec["cancel_after_entry"]:
+                # хвилина виходу — з часу ревізії біржі, коли він відомий
+                # (рев'ю v2.13 №3: після рестарту «хвилина, коли дізнались»
+                # була пізніша за фактичне скасування); інакше — наступна
+                # хвилина після поточного семплу
+                xm = None
+                if (rec.get("exch_cancelled") and rec.get("exch_ts")
+                        and tr.get("entry_ts")
+                        and rec["exch_ts"] > tr["entry_ts"]):   # ревізія до входу — не час скасування
+                    xm = int(math.ceil((rec["exch_ts"] - tr["entry_ts"]) / 60.0))
+                    xm = max(1, min(xm, TWAP_TRACK_MIN))
+                if not tw.get("exit_min"):
+                    tw["exit_min"] = xm or min(len(tr["samples"]) + 1, TWAP_TRACK_MIN)
+                    tw["exit_reason"] = "cancelled"
+                elif xm and xm < tw["exit_min"]:
+                    tw["exit_min"] = xm   # біржа знає точніший (раніший) час
 
 def _twap_cancel_after_entry(rec):
     rec["cancel_after_entry"] = 1
@@ -6851,12 +6885,22 @@ def _twap_ingest(channel, pid, ts, text, now, reply="", seen=False,
         if rec is None and seen:
             rec = _twap_by_post(channel, pid)
         exact_hit = rec is not None
-        if rec is None:
+        if rec is None and not seen:
+            # евристика — лише при ПЕРШОМУ читанні поста без прив'язки.
+            # Перечитуваний (кожні 30с) пост без прив'язки — старт
+            # відредаговано у «cancelled» ще до нашого першого читання,
+            # старт старший за годинний зріз, запис уже вичищено — інакше
+            # щопоолу зіставлявся б із НОВИМ твапом того ж кита (рев'ю
+            # v2.13 №1: HYPE «closed by user» гасив наступний твап)
             if p["start"] is not None and p.get("exact", True):
                 rec = _twap_find(p["addr"], p["coin"], p["side"], p["start"],
                                  p["usd"])
             else:
                 rec = _twap_find(p["addr"], p["coin"], p["side"], usd=p["usd"])
+            if rec is not None:
+                tag = f"{channel}/{pid}"
+                if tag not in rec["posts"]:
+                    rec["posts"].append(tag)   # далі цей пост — точна прив'язка
     if rec is None:
         return
     if exact_hit and rec["state"] not in ("watch", "entered"):
