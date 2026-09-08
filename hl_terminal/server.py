@@ -575,7 +575,7 @@ if SCAN_PROXY:
         urllib.request.ProxyHandler({"https": "http://" + SCAN_PROXY,
                                      "http":  "http://" + SCAN_PROXY}))
 _scan_state = {"dead_until": 0.0, "streak": 0, "req": 0, "err": 0,
-               "rl": 0, "fallback": 0}
+               "rl": 0, "fallback": 0, "last_ok": 0.0}
 _scan_w      = deque()          # (ts, вага) за останні 60с на проксі
 _scan_w_lock = threading.Lock()
 
@@ -620,6 +620,7 @@ def hl_post_scan(body, retries=2):
                 out = json.loads(r.read())
             _scan_state["req"] += 1
             _scan_state["streak"] = 0
+            _scan_state["last_ok"] = time.time()
             return out
         except urllib.error.HTTPError as e:
             last_err = f"HTTP {e.code}"
@@ -638,9 +639,18 @@ def hl_post_scan(body, retries=2):
     _scan_state["err"] += 1
     if last_was_429:
         raise RateLimited("scan-proxy 429 after retries")
+    now_ = time.time()
+    if now_ < _scan_state["dead_until"]:
+        # воркери, що вже були в польоті, коли проксі визнали мертвою —
+        # не накручуємо streak/fallback повторно
+        raise APIError(f"scan-proxy dead ({last_err})")
     _scan_state["streak"] += 1
-    if _scan_state["streak"] >= 3 and time.time() >= _scan_state["dead_until"]:
-        _scan_state["dead_until"] = time.time() + SCAN_DEAD_S
+    # смерть — лише коли 3 збої поспіль І понад 20с без жодної успішної
+    # відповіді: паралельні воркери падають пачкою за одну мить, і без
+    # цієї умови один мережевий чих ховав проксі на пів години
+    if (_scan_state["streak"] >= 3
+            and now_ - _scan_state["last_ok"] > 20):
+        _scan_state["dead_until"] = now_ + SCAN_DEAD_S
         _scan_state["fallback"] += 1
         _scan_state["streak"] = 0
         print(f"  [SCAN] проксі скану мертва ({last_err}) — {SCAN_DEAD_S // 60} хв "
@@ -1175,9 +1185,9 @@ def run_websocket():
 def fetch_one(addr_str):
     try:
         if _scan_via_proxy():
-            # своя IP: пейсер бюджету замість DELAY і без поступання
-            # fast-перевіркам (вони на іншій IP; v2.11 п.7)
-            _scan_budget_wait(2)
+            # своя IP: без DELAY і без поступання fast-перевіркам (вони на
+            # іншій IP; v2.11 п.7). Пейсер бюджету — у process() ДО
+            # знімка часу, інакше _t_fetch випереджав би запит на ~хвилину
             data = hl_post_scan({"type": "clearinghouseState",
                                  "user": addr_str})
         else:
@@ -1484,6 +1494,15 @@ def update_watchlist(result, depth_snap, scan_start=0, failed_addrs=None,
         print(f"  [WATCH] depth-знімок неповний ({len(depth_snap)} монет) "
               f"— watchlist НЕ перезаписується")
         return
+    # Грейс (v2.11 п.1): мітка «коли востаннє ratio≥2» живих пар — щоб
+    # пара, яка просіла нижче 2 менш як пів години тому, НЕ випадала зі
+    # скану, а лишалась у watchlist із успадкованою міткою. Без цього
+    # повний скан обнуляв грейс, який sweep/realtime щойно дали.
+    _now_wl = time.time()
+    with watchlist_lock:
+        _live_hi = {(_a, _c): (_p.get("ratio_hi_ts") or 0)
+                    for _a, _cs in watchlist.items()
+                    for _c, _p in _cs.items()}
     new_wl = {}
     for coin, positions in result.items():
         if coin.upper() in COIN_BLACKLIST:
@@ -1493,15 +1512,23 @@ def update_watchlist(result, depth_snap, scan_start=0, failed_addrs=None,
             if not pos.get("size"): continue
             ds = depth_for_side(d, pos["side"])
             ratio = pos["val"] / ds if ds else 0
-            if ratio < 2.0: continue  # watchlist тільки ratio >= 2
             addr = pos["addr"].lower()
+            if ratio >= 2.0:
+                # мітка = момент, коли скан РЕАЛЬНО зчитав гаманець, а не
+                # старт скану (він може бути на 20+ хв раніше і з'їдав
+                # би грейс наперед)
+                hi_ts = (fetch_times or {}).get(addr, scan_start) or _now_wl
+            else:
+                hi_ts = _live_hi.get((addr, coin), 0)
+                if _now_wl - hi_ts >= RATIO_GRACE_S:
+                    continue  # watchlist: ratio >= 2 або грейс після нього
             if addr not in new_wl: new_wl[addr] = {}
             new_wl[addr][coin] = {
                 "size":  pos["size"],
                 "val":   pos["val"],
                 "side":  pos["side"],
                 "ratio": ratio,
-                "ratio_hi_ts": scan_start or time.time(),   # грейс v2.11
+                "ratio_hi_ts": hi_ts,
                 "entry": pos["entry"],
                 "liq":   pos.get("liq", 0),
             }
@@ -1578,8 +1605,14 @@ def update_watchlist(result, depth_snap, scan_start=0, failed_addrs=None,
                     fill_cursor[_k] = max(fill_cursor.get(_k, 0),
                                           int(_ft * 1000))
                     continue
+                # мітка грейсу — свіжіша з двох джерел (realtime міг
+                # позначити ratio≥2 уже після знімка скану)
+                _hi = max(_p.get("ratio_hi_ts") or 0,
+                          lv.get("ratio_hi_ts") or 0)
+                _p["ratio_hi_ts"] = _hi
                 if lv.get("upd", 0) >= _ft and lv.get("upd", 0) >= scan_start > 0:
                     _coins[_c] = dict(lv)
+                    _coins[_c]["ratio_hi_ts"] = _hi
         watchlist.clear()
         watchlist.update(new_wl)
     print(f"  [WATCH] Watchlist updated: {len(new_wl)} wallets, "
@@ -2471,6 +2504,13 @@ def check_position_changes(new_result, depth_snap):
     failed_keep = {}  # addr -> {coin -> СТАРА позиція}: пари, чиє
                       # підтвердження впало — база НЕ рухається
     _now = time.time()
+    # мітки грейсу з живого watchlist: sweep/realtime бачать ratio≥2
+    # частіше за скан, і без них база діфу губила грейс, який watchlist
+    # уже дав (рев'ю v2.11)
+    with watchlist_lock:
+        _wl_hi = {(_a, _c): (_p.get("ratio_hi_ts") or 0)
+                  for _a, _cs in watchlist.items()
+                  for _c, _p in _cs.items()}
     for coin, positions in new_result.items():
         if coin.upper() in COIN_BLACKLIST: continue
         d = depth_snap.get(coin)
@@ -2487,7 +2527,8 @@ def check_position_changes(new_result, depth_snap):
             # розрослась би на всі 10k позицій із запитами філів на
             # кожну дельту
             _pp = prev.get(addr, {}).get(coin) or {}
-            hi_ts = _now if ratio >= 2.0 else (_pp.get("ratio_hi_ts") or 0)
+            hi_ts = _now if ratio >= 2.0 else max(
+                _pp.get("ratio_hi_ts") or 0, _wl_hi.get((addr, coin), 0))
             if ratio < 2.0 and _now - hi_ts >= RATIO_GRACE_S:
                 continue
             if addr not in new_by_addr: new_by_addr[addr] = {}
@@ -5174,14 +5215,25 @@ def strat2_api():
             print(f"  [STRAT] read {os.path.basename(path)}: {e}")
             return []
 
+    legacy_q, legacy_err, legacy_old = [0], [0], [0]
+    # найнижчий поріг версії серед усіх стратегій/стрічок: рядок legacy
+    # нижче нього не пройде ЖОДЕН фільтр — не тримаємо його в пам'яті,
+    # лише рахуємо (рев'ю v2.11: legacy-файли ростуть роками)
+    _min_since = min([_vt(TAPE_SINCE)] + [_vt(v) for v in STRAT_SINCE.values()])
+
     def read(path):
-        """Поточний файл + УСІ його .legacy-<ts>.csv (v2.11 п.2): зміна
+        """УСІ .legacy-<ts>.csv файла + поточний (v2.11 п.2): зміна
         заголовків ротує файл, але рядки в ньому — та сама статистика
         стратегій, логіка яких не мінялась; фільтр версії нижче вирішує,
-        що показувати. Legacy-файли незмінні — кешуються по (mtime,
-        size), карантин/збої додаються з кешу."""
-        rows = _read_file(path)
+        що показувати. Порядок «legacy, потім поточний» — щоб у dedup
+        (останній виграє) поточний файл перемагав. Legacy-файли незмінні
+        — кешуються по (mtime, size); їхні карантин/збої рахуються
+        ОКРЕМО від поточних файлів, щоб не лякати лічильником битих
+        рядків, які насправді давно в архіві."""
+        rows = []
+        present = set()
         for lp in sorted(glob.glob(path + ".legacy-*.csv")):
+            present.add(lp)
             try:
                 st_ = os.stat(lp)
                 key_ = (st_.st_mtime, st_.st_size)
@@ -5191,12 +5243,19 @@ def strat2_api():
             if c is None or c[0] != key_:
                 q0, e0 = quarantined[0], read_errors[0]
                 lrows = _read_file(lp)
-                c = (key_, lrows, quarantined[0] - q0, read_errors[0] - e0)
+                dq, de = quarantined[0] - q0, read_errors[0] - e0
+                quarantined[0], read_errors[0] = q0, e0
+                keep = [r for r in lrows if _vt(r.get("algo_v")) >= _min_since]
+                c = (key_, keep, dq, de, len(lrows) - len(keep))
                 _legacy_csv_cache[lp] = c
-            else:
-                quarantined[0] += c[2]
-                read_errors[0] += c[3]
-            rows = rows + c[1]
+            legacy_q[0] += c[2]
+            legacy_err[0] += c[3]
+            legacy_old[0] += c[4]
+            rows.extend(c[1])
+        for lp in [k for k in _legacy_csv_cache
+                   if k.startswith(path + ".legacy-") and k not in present]:
+            _legacy_csv_cache.pop(lp, None)   # файл видалили — кеш геть
+        rows.extend(_read_file(path))
         return rows
 
     def fnum(x, d=None):
@@ -5257,8 +5316,9 @@ def strat2_api():
                                    since_strat(fol), since_tape(outs_all),
                                    since_tape(fouts_all))
     tw, tws = since_strat(tw_all), since_tape(tws_all)
-    legacy_rows = n_before - (len(rev) + len(sigs) + len(fol)
-                              + len(outs) + len(fouts) + len(tw) + len(tws))
+    legacy_rows = (n_before - (len(rev) + len(sigs) + len(fol)
+                               + len(outs) + len(fouts) + len(tw) + len(tws))
+                   + legacy_old[0])
     def _rate(rows, key):
         """Швидкість стратегії (v2.11 п.3): угод на день = n / дні від
         ПЕРШОГО рядка стратегії до зараз (мінімум 1 день — інакше 3
@@ -5275,7 +5335,11 @@ def strat2_api():
     out = {"updated": now, "strategies": {}, "desc": STRAT2_DESC,
            "titles": STRAT2_TITLES,
            "legacy_rows": legacy_rows, "quarantined": quarantined[0],
-           "read_errors": read_errors[0]}
+           "read_errors": read_errors[0],
+           # архівні (.legacy) файли — окремо: їхні биті рядки давно
+           # в історії і не сигналять про стан диска ЗАРАЗ
+           "legacy_quarantined": legacy_q[0], "legacy_read_errors": legacy_err[0],
+           "legacy_files": len(_legacy_csv_cache)}
 
     for st in ("R1_загальний", "R2_breakout", "R3_великі", "R4_великий",
                "R5_дуже", "R6_волт", R7_NAME):
@@ -5326,6 +5390,7 @@ def strat2_api():
         cum, acc = [], 0.0
         for v in nets30:
             acc += v; cum.append(round(acc, 3))
+        _days_st = _rate(rows, "date")[1]
         out["strategies"][st] = {
             "kind": "rev", "signals": len(rows), "entered": n_entered,
             "n": len(nets30),
@@ -5350,10 +5415,11 @@ def strat2_api():
                              if complete else None),
             "curve_common_n": len(complete),
             "trades": trades[-120:],
-            # швидкість (v2.11 п.3): відкритих позицій на день і горизонт
-            "per_day": _rate([r for r in rows
-                              if fnum(r.get("entered"), 0) == 1], "date")[0],
-            "days": _rate(rows, "date")[1],
+            # швидкість (v2.11 п.3): відкритих позицій на день; горизонт
+            # — від ПЕРШОГО сигналу стратегії, а не першого входу
+            # (інакше 1 вхід через 9 днів після старту давав «1/день»)
+            "per_day": (round(n_entered / _days_st, 2) if _days_st else None),
+            "days": _days_st,
             "since": STRAT_SINCE.get(st, DATA_ALGO_V),
         }
 
@@ -5712,6 +5778,9 @@ def _twap_hl_dt(s, off_h):
 _HL_START  = re.compile(r"\$\s*(\d[\d,]*\.?\d*)\s*([KkMmBb])?\s+(selling|buying)"
                         r"\s+([A-Za-z0-9]+)", re.I)
 _HL_USER   = re.compile(r"User:\s*(0x[0-9a-fA-F]{40})")
+# у reply-цитаті t.me адреса ОБРІЗАНА (~25 символів) — беремо префікс,
+# _twap_find звіряє за startswith
+_HL_USER_PFX = re.compile(r"User:\s*(0x[0-9a-fA-F]{8,40})")
 _HL_PERIOD = re.compile(r"Period:\s*(\d{1,2}\s+[A-Za-z]{3}\s+\d{4}\s+\d{2}:\d{2}:\d{2})"
                         r"\s*-\s*(\d{1,2}\s+[A-Za-z]{3}\s+\d{4}\s+\d{2}:\d{2}:\d{2})"
                         r"\s*UTC\s*([+-]\d{1,2})")
@@ -5720,20 +5789,24 @@ _HL_PRICE  = re.compile(r"Price:\s*\$\s*(\d[\d,]*\.?\d*)")
 _HL_CLOSED = re.compile(r"\$\s*(\d[\d,]*\.?\d*)\s*([KkMmBb])?\s+TWAP\s+with\s+"
                         r"([A-Za-z0-9]+)\s+closed", re.I)
 _X_START   = re.compile(r"\$\s*(\d[\d,]*\.?\d*)\s*([KkMmBb])?\s+(продажа|покупка)"
-                        r"\s+([A-Za-z0-9]+)\s+в\s+течени[ия]\s+(\d+(?:[.,]\d+)?)"
+                        r"\s+([A-Za-z0-9]+)\s+в\s+течени[ияе]\s+(\d+(?:[.,]\d+)?)"
                         r"\s*(минут|мин|час)", re.I)
 _X_ADDR    = re.compile(r"Субъект:\s*(0x[0-9a-fA-F]{40})")
 _X_PRICE   = re.compile(r"Цена:\s*\$\s*(\d[\d,]*\.?\d*)")
 _X_CREATED = re.compile(r"Создан\s+в:\s*(\d{2}):(\d{2}):(\d{2})\s*\(UTC\)")
 _X_SIZE    = re.compile(r"Размер:\s*[\d.,]+\s*/\s*[\d.,]+\s*([A-Za-z0-9]+)")
 
-def twap_parse(channel, text, msg_ts):
+def twap_parse(channel, text, msg_ts, reply=""):
     """Повідомлення каналу -> dict або None (не про твап).
-    kind: start | cancel | done. Поля: addr (None у cancel-варіанті
-    HL без адреси), coin, side buy/sell, usd, start, end, dur, px_msg.
-    Прев'ю t.me інколи «сплющує» пост в один рядок — регекси не
-    спираються на переноси. Перевірено на живих постах 08.09."""
+    kind: start | cancel | done. Поля: addr (у HL «closed by user» —
+    лише ПРЕФІКС адреси з reply-цитати), coin (як у пості; канонічну
+    назву дає _coin_canon при прийомі), side buy/sell, usd, start, end,
+    dur, px_msg. reply — текст цитованого поста (t.me показує його над
+    відповіддю): HL-скасування посилається на стартовий пост і саме там
+    бік/адреса. Прев'ю t.me інколи «сплющує» пост в один рядок —
+    регекси не спираються на переноси. Перевірено на живих постах 08.09."""
     t = " ".join(text.split())
+    rq = " ".join((reply or "").split())
     if channel == "HL_TWAP":
         low = t.lower()
         if ("is cancelled" in low or "closed by user" in low
@@ -5747,15 +5820,21 @@ def twap_parse(channel, text, msg_ts):
         if not m:
             mc = _HL_CLOSED.search(t)
             if kind == "cancel" and mc:
-                return {"kind": "cancel", "addr": None,
-                        "coin": mc.group(3).upper(), "side": None,
+                # «$5.10m TWAP with HYPE closed by user» — деталі у цитаті
+                mr = _HL_START.search(rq)
+                mu = _HL_USER_PFX.search(rq)
+                return {"kind": "cancel",
+                        "addr": mu.group(1).lower() if mu else None,
+                        "coin": mc.group(3),
+                        "side": (("sell" if mr.group(3).lower() == "selling"
+                                  else "buy") if mr else None),
                         "usd": _twap_usd(mc.group(1), mc.group(2)),
                         "start": None, "end": None, "dur": None,
-                        "px_msg": None}
+                        "exact": False, "px_msg": None}
             return None
         usd = _twap_usd(m.group(1), m.group(2))
         side = "sell" if m.group(3).lower() == "selling" else "buy"
-        coin = m.group(4).upper()
+        coin = m.group(4)
         mu = _HL_USER.search(t)
         addr = mu.group(1).lower() if mu else None
         mp = _HL_PERIOD.search(t)
@@ -5780,19 +5859,28 @@ def twap_parse(channel, text, msg_ts):
                            if mpx else None)}
     if channel == "TWAPx":
         low = t.lower()
+        fin = None
         if "twap отмен" in low or t.startswith("❌"):
+            fin = "cancel"
+        elif "twap заверш" in low or t.startswith("✅"):
+            fin = "done"
+        if fin:
             ma = _X_ADDR.search(t); ms = _X_SIZE.search(t)
-            return {"kind": "cancel",
+            # бік — із цитати стартового поста (у фіналі його немає)
+            mr = _X_START.search(rq)
+            return {"kind": fin,
                     "addr": ma.group(1).lower() if ma else None,
-                    "coin": ms.group(1).upper() if ms else None,
-                    "side": None, "usd": None, "start": None, "end": None,
+                    "coin": ms.group(1) if ms else None,
+                    "side": (("sell" if mr.group(3).lower().startswith("прод")
+                              else "buy") if mr else None),
+                    "usd": None, "start": None, "end": None,
                     "dur": None, "px_msg": None}
         m = _X_START.search(t)
         if not m:
             return None
         usd = _twap_usd(m.group(1), m.group(2))
         side = "sell" if m.group(3).lower().startswith("прод") else "buy"
-        coin = m.group(4).upper()
+        coin = m.group(4)
         n = float(m.group(5).replace(",", "."))
         dur = n * (60.0 if m.group(6).lower().startswith("мин") else 3600.0)
         ma = _X_ADDR.search(t)
@@ -5819,27 +5907,38 @@ def _iso_ts(s):
     except Exception:
         return time.time()
 
+def _tme_text(fragment):
+    txt = re.sub(r"<br\s*/?>", "\n", fragment)
+    return _htmlmod.unescape(re.sub(r"<[^>]+>", "", txt))
+
 def _tme_parse(page):
-    """HTML прев'ю t.me/s/<канал> -> [(post_id, ts, text)] за зростанням
-    id. Текст: <br> -> перенос, теги геть, HTML-сутності розкодовані."""
+    """HTML прев'ю t.me/s/<канал> -> [(post_id, ts, text, reply)] за
+    зростанням id. text — сам пост (js-message_text), reply — цитата
+    поста, на який він відповідає (js-message_reply_text; порожньо,
+    якщо не відповідь). Обидва класи починаються з tgme_widget_message_text,
+    і цитата стоїть у розмітці ПЕРШОЮ — регекс без js-суфікса брав її
+    замість тексту поста (рев'ю v2.11: усі скасування читались як
+    старти). <br> -> перенос, теги геть, HTML-сутності розкодовані."""
     out = []
     for b in re.split(r'<div class="tgme_widget_message_wrap', page)[1:]:
         pid = re.search(r'data-post="[^"/]+/(\d+)"', b)
-        tx = re.search(r'<div class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>',
-                       b, re.S)
+        tx = re.search(r'<div class="tgme_widget_message_text js-message_text[^"]*"'
+                       r'[^>]*>(.*?)</div>', b, re.S)
+        rp = re.search(r'<div class="tgme_widget_message_text js-message_reply_text[^"]*"'
+                       r'[^>]*>(.*?)</div>', b, re.S)
         tm = re.search(r'<time[^>]*datetime="([^"]+)"', b)
         if not (pid and tx):
             continue
-        txt = re.sub(r"<br\s*/?>", "\n", tx.group(1))
-        txt = _htmlmod.unescape(re.sub(r"<[^>]+>", "", txt))
         out.append((int(pid.group(1)), _iso_ts(tm.group(1)) if tm else time.time(),
-                    txt))
+                    _tme_text(tx.group(1)), _tme_text(rp.group(1)) if rp else ""))
     out.sort(key=lambda x: x[0])
     return out
 
 def _tme_fetch(channel):
     """Сторінка каналу. Напряму; після 3 збоїв поспіль — через
-    REST-проксі, якщо вона є (t.me може бути закритий на IP сервера)."""
+    REST-проксі, якщо вона є (t.me може бути закритий на IP сервера).
+    Сторінка без жодного поста (заглушка/капча/редирект) — це збій, а
+    не «тиша в каналі»: інакше st.err не ріс і фолбек не вмикався."""
     req = urllib.request.Request(
         f"https://t.me/s/{channel}",
         headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) "
@@ -5850,41 +5949,62 @@ def _tme_fetch(channel):
               else urllib.request.urlopen)
     with opener(req, timeout=20) as r:
         page = r.read().decode("utf-8", "replace")
-    return _tme_parse(page)
+    posts = _tme_parse(page)
+    if not posts:
+        raise APIError(f"no messages in page ({len(page)} bytes)")
+    return posts
+
+def _coin_canon(c):
+    """Назва монети з поста -> як у Hyperliquid (kPEPE, а не KPEPE):
+    звіряємо без регістру з монетами поллера цін; невідому лишаємо."""
+    if not c:
+        return c
+    cu = c.upper()
+    with px_lock:
+        for k in px_hist:
+            if k.upper() == cu:
+                return k
+    return c
 
 def _twap_find(addr, coin, side=None, near_ts=None, usd=None,
                states=("watch", "entered")):
-    """Запис реєстру по монеті (+гаманець, +бік, +старт ±2 хв, +сума
-    ±15% для cancel без адреси); серед кількох — найсвіжіший."""
-    best = None
+    """Запис реєстру по монеті (+гаманець або його ПРЕФІКС, +бік, +старт
+    ±2 хв, +сума ±15% для cancel без повної адреси); серед кількох —
+    найближчий за сумою, далі найсвіжіший."""
+    best, best_k = None, None
     for r in twap_reg.values():
         if r["coin"] != coin or r["state"] not in states:
             continue
-        if addr and r["addr"] != addr:
+        if addr and not (r["addr"] or "").startswith(addr):
             continue
         if side and r["side"] != side:
             continue
         if near_ts is not None and abs(r["start"] - near_ts) > 120:
             continue
-        if (addr is None and usd is not None and r.get("usd")
-                and abs(r["usd"] - usd) > 0.15 * r["usd"]):
+        du = (abs(r["usd"] - usd) / r["usd"]
+              if (usd is not None and r.get("usd")) else None)
+        if du is not None and du > 0.15 and (not addr or len(addr) < 42):
             continue
-        if best is None or r["start"] > best["start"]:
-            best = r
+        k = (-(du if du is not None else 1.0), r["start"])
+        if best is None or k > best_k:
+            best, best_k = r, k
     return best
 
 def _twap_register(channel, pid, p, now):
-    """Старт твапу -> запис реєстру. Повтор того самого твапу (другий
-    канал, репост — обидва канали дублюють пости) лише додає пост."""
+    """Старт твапу -> запис реєстру. Той самий твап з ДРУГОГО каналу
+    (обидва дублюють одні події) лише додає пост; новий пост ТОГО Ж
+    каналу — завжди новий твап: кит скасував і одразу перестворив
+    (HYPE $5.10m/$5.11m за 8с — два різні твапи, рев'ю v2.11)."""
     with twap_lock:
         ex = _twap_find(p["addr"], p["coin"], p["side"], p["start"],
                         states=("watch", "entered", "ineligible", "dropped"))
-        if ex is not None:
+        if ex is not None and channel not in ex["src"].split("+"):
             ex["posts"].append(f"{channel}/{pid}")
-            if channel not in ex["src"]:
-                ex["src"] = ex["src"] + "+" + channel
+            ex["src"] = ex["src"] + "+" + channel
             return ex, False
         tid = f"tw-{int(p['start'])}-{p['coin']}-{(p['addr'] or '0xnone')[2:8]}"
+        if tid in twap_reg:
+            tid = f"{tid}-{pid}"
         rec = {"id": tid, "src": channel, "posts": [f"{channel}/{pid}"],
                "addr": p["addr"], "coin": p["coin"], "side": p["side"],
                "usd": p["usd"], "start": p["start"], "end": p["end"],
@@ -6020,11 +6140,18 @@ def _twap_tick(now):
             _twap_drop(rec, "kind_unknown"); continue
         _twap_enter(rec, now, p1)
 
-def _twap_ingest(channel, pid, ts, text, now):
-    p = twap_parse(channel, text, ts)
+def _twap_ingest(channel, pid, ts, text, now, reply="", seen=False):
+    """seen=True — пост уже оброблявся (той самий pid): HL редагує
+    стартовий пост у «cancelled»/«successful completed» замість нового
+    поста, тому вже бачені пости перечитуємо ЛИШЕ як cancel/done."""
+    p = twap_parse(channel, text, ts, reply)
     if p is None:
         return
-    twap_stats["posts"] += 1
+    p["coin"] = _coin_canon(p["coin"])
+    if seen and p["kind"] == "start":
+        return
+    if not seen:
+        twap_stats["posts"] += 1
     if p["kind"] == "start":
         if not p.get("exact", True):
             return   # HL-репост без Period: старт невідомий — не сигнал
@@ -6057,6 +6184,8 @@ def _twap_ingest(channel, pid, ts, text, now):
     if p["kind"] == "done":
         rec["completed"] = 1
         return
+    if rec["cancelled"]:
+        return   # повторне читання того самого скасування
     rec["cancelled"] = 1
     twap_stats["cancelled"] += 1
     if rec["state"] == "watch":
@@ -6121,14 +6250,17 @@ def run_twap_watcher():
             if not last and posts:
                 # перший запуск: усе старше за годину — історія, не сигнал
                 cutoff = time.time() - TWAP_BACKLOG_S
-                last = max((pid for pid, ts, _ in posts if ts < cutoff),
+                last = max((pid for pid, ts, _, _ in posts if ts < cutoff),
                            default=0)
             now = time.time()
-            for pid, ts, text in posts:
-                if pid <= last:
-                    continue
+            last0 = last
+            for pid, ts, text, reply in posts:
                 try:
-                    _twap_ingest(ch, pid, ts, text, now)
+                    # pid <= last0 — уже бачений пост: HL редагує старт у
+                    # cancelled/completed без нового поста, тож
+                    # перечитуємо його лише як cancel/done (ідемпотентно)
+                    _twap_ingest(ch, pid, ts, text, now, reply,
+                                 seen=(pid <= last0))
                 except Exception as e:
                     twap_stats["parse_err"] += 1
                     print(f"  [TWAP] {ch}/{pid}: помилка обробки: {e}")
@@ -6230,11 +6362,14 @@ def run_scan():
             # врахований у базі філ міг роздути епізод.
             # УВАГА: не t0 — зовнішній t0 це старт усього скану (ETA).
             # Стеля 10с: безперервні трейди не мають морозити скан вічно.
-            # На проксі скану (v2.11) hold не потрібен — інша IP
-            _hd = time.time() + 10
-            while not _scan_via_proxy() and time.time() < fast_hold[0] \
-                  and time.time() < _hd:
-                time.sleep(0.2)
+            # На проксі скану (v2.11) hold не потрібен — інша IP, але
+            # пейсер бюджету теж має відпрацювати ДО знімка часу
+            if _scan_via_proxy():
+                _scan_budget_wait(2)
+            else:
+                _hd = time.time() + 10
+                while time.time() < fast_hold[0] and time.time() < _hd:
+                    time.sleep(0.2)
             _t_fetch = time.time()
             positions = fetch_one(w["addr"])
             if positions is None:
@@ -6431,6 +6566,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     stats.get(f"ws_stale_reconnects_{lb}", 0)
                 per_conn[f"ws_{lb}_stale_streak"] = \
                     stats.get(f"ws_stale_streak_{lb}", 0)
+            with twap_lock:
+                _twap_active = sum(1 for r in twap_reg.values()
+                                   if r.get("state") == "watch")
             self.send_json({
                 "uptime_min":     round((time.time() - stats["started"]) / 60, 1),
                 "ws_alive":       ws_age < 60,   # свіжий ТРЕЙД, не pong
@@ -6467,8 +6605,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "scan_proxy_fallbacks": _scan_state["fallback"],
                 # TWAP-вотчер (v2.11 п.5)
                 **{f"twap_{k}": v for k, v in twap_stats.items()},
-                "twap_active": sum(1 for r in twap_reg.values()
-                                   if r.get("state") == "watch"),
+                "twap_active": _twap_active,
             })
         elif self.path == "/sim":
             with sim_lock:

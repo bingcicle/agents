@@ -256,7 +256,9 @@ footer .fr{margin-left:auto;display:flex;gap:20px}
     gap:6px;padding-top:6px;border-top:1px solid var(--line)}
   .hstat b{font-size:13px}
   .clock{display:none}
-  main#termView{display:grid;grid-template-columns:1fr;grid-auto-rows:auto;
+  /* minmax(0,1fr), не 1fr: інакше min-width:auto у ґрід-комірці дорівнює
+     ширині таблиці (660px), і вся сторінка скролиться вбік */
+  main#termView{display:grid;grid-template-columns:minmax(0,1fr);grid-auto-rows:auto;
     overflow:visible}
   .coins{border-right:0;border-bottom:1px solid var(--line)}
   .coins-head{padding:8px 12px}
@@ -264,6 +266,10 @@ footer .fr{margin-left:auto;display:flex;gap:20px}
     -webkit-overflow-scrolling:touch;scroll-snap-type:x proximity}
   .coin{min-width:138px;flex:0 0 auto;border-bottom:0;
     border-right:1px solid var(--line);padding:9px 11px;scroll-snap-align:start}
+  /* стани «завантаження/помилка/порожньо» в горизонтальній стрічці
+     монет — на всю ширину, а не стиснуті у flex-елемент */
+  .coin-scroll>.loadbox,.coin-scroll>.errbox,.coin-scroll>.empty-note{flex:1 0 100%}
+  .tabbtn,#sortBy{min-height:36px}
   .coin.on::before{width:100%;height:2px;bottom:auto;top:0}
   .center{overflow:visible}
   .center-head{flex-wrap:wrap;gap:6px 12px;padding:10px 12px}
@@ -704,7 +710,7 @@ function curveSvg(curve,curveN,w=680,h=180,maxM=60){
   if(!vals.length) return '<div class="empty-note">Ще немає завершених угод</div>';
   const ys=vals.map(p=>p[1]);
   const mn=Math.min(0,...ys), mx=Math.max(0,...ys), rng=(mx-mn)||1;
-  const L=34,R=8,T=10,B=18;
+  const L=34,R=16,T=10,B=18;   // R=16: підпис останньої хвилини не зрізається
   const X=m=>L+(m-1)/(maxM-1)*(w-L-R);
   const Y=v=>T+(mx-v)/rng*(h-T-B);
   // "найкраща хвилина" — лише серед хвилин із достатнім покриттям:
@@ -718,11 +724,13 @@ function curveSvg(curve,curveN,w=680,h=180,maxM=60){
   const step=maxM>60?20:10;
   for(let m=step;m<=maxM;m+=step)
     grid+=`<line x1="${X(m)}" y1="${T}" x2="${X(m)}" y2="${h-B}" stroke="var(--line)" stroke-width="1"/>
-           <text x="${X(m)}" y="${h-5}" fill="var(--ink3)" font-size="9" text-anchor="middle">${m}хв</text>`;
+           <text x="${X(m)}" y="${h-5}" fill="var(--ink3)" font-size="9" text-anchor="${m===maxM?'end':'middle'}">${m}хв</text>`;
   const late=maxM*0.87, early=maxM*0.08;
-  return `<svg id="curveSvg" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" style="max-width:100%;height:auto;touch-action:none"
+  // touch-action:pan-y — вертикальний скрол сторінки лишається за
+  // браузером, горизонтальний рух пальця веде курсор кривої
+  return `<svg id="curveSvg" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" style="max-width:100%;height:auto;touch-action:pan-y"
       onmousemove="curveTip(event,${w},${L},${R},${maxM})" onmouseleave="hideTip()"
-      ontouchstart="curveTouch(event,${w},${L},${R},${maxM})" ontouchmove="curveTouch(event,${w},${L},${R},${maxM})" ontouchend="hideTip()">
+      ontouchstart="curveTouch(event,${w},${L},${R},${maxM})" ontouchmove="curveTouch(event,${w},${L},${R},${maxM})" ontouchend="hideTip()" ontouchcancel="hideTip()">
     ${grid}
     <line x1="${L}" y1="${Y(0)}" x2="${w-R}" y2="${Y(0)}" stroke="var(--line2)" stroke-width="1" stroke-dasharray="4,3"/>
     <text x="${L-4}" y="${Y(0)+3}" fill="var(--ink3)" font-size="9" text-anchor="end">0%</text>
@@ -744,16 +752,20 @@ function curveTip(ev,w,L,R,maxM=60){
   const tip=document.getElementById('cTip'); if(!tip) return;
   if(v==null){tip.style.display='none';return;}
   tip.style.display='block';
-  tip.style.left=(ev.clientX-box.left+12)+'px';
-  tip.style.top=(ev.clientY-box.top-24)+'px';
   // n обов'язково: після чесних пропусків хвилини мають різне покриття
   tip.textContent='вихід m'+m+' · медіана '+pctTxt(v)+(n!=null?' · n='+n:'');
+  // у правій половині підказка йде ліворуч від курсора — інакше на
+  // вузькому екрані вилазить за край графіка
+  const px=ev.clientX-box.left;
+  if(px>box.width/2){tip.style.left='';tip.style.right=(box.width-px+12)+'px';}
+  else{tip.style.right='';tip.style.left=(px+12)+'px';}
+  tip.style.top=(ev.clientY-box.top-24)+'px';
 }
 function curveTouch(ev,w,L,R,maxM){
-  // тач замість ховера (мобільна версія): перший палець = курсор
+  // тач замість ховера (мобільна версія): перший палець = курсор;
+  // без preventDefault — вертикальний скрол сторінки має працювати
   const t=ev.touches&&ev.touches[0]; if(!t) return;
   curveTip({currentTarget:ev.currentTarget,clientX:t.clientX,clientY:t.clientY},w,L,R,maxM);
-  if(ev.cancelable) ev.preventDefault();
 }
 function hideTip(){const t=document.getElementById('cTip');if(t)t.style.display='none';}
 
@@ -787,9 +799,9 @@ function renderStrat(){
         +(sData.read_errors?' · ⚠️ ЗБОЇВ ЧИТАННЯ ФАЙЛІВ: '+sData.read_errors:'');
     } else if(legacy||sData.read_errors){
       rEl.style.display='';
-      rEl.textContent=(legacy?'Статистика рахується з нуля для нової версії логіки. '
-        +'Рядків попередніх версій приховано: '+legacy
-        +' (дані на місці: файли зі старим заголовком перейменовано у *.legacy-<ts>.csv)':'')
+      rEl.textContent=(legacy?'Стратегії зі зміненою логікою рахуються з нуля від своєї since-версії; '
+        +'рядків, старіших за since-версію своєї стратегії, приховано: '+legacy
+        +' (дані на місці, у файлах і *.legacy-<ts>.csv)':'')
         +(sData.read_errors?' ⚠️ ЗБОЇВ ЧИТАННЯ ФАЙЛІВ: '+sData.read_errors
           +' — нуль угод може бути битим файлом, а не відсутністю даних':'');
     } else rEl.style.display='none';
@@ -974,7 +986,11 @@ function renderSDetail(){
         :(useFirst?'лише перші постріли пари (когорта F5–F9) · ':'усі follow-сигнали, НЕ лише входи цієї стратегії · ')))
         +(useC?('спільна когорта (усі '+maxM+' хв у кожній угоді) · n='+src.curve_common_n)
               :'вся вибірка · увага: різні хвилини = різні набори угод');
-      return `<div class="sd-chart"><h4>Медіана net за хвилиною виходу (1–${maxM}) · ${lbl}</h4>${curveSvg(s._dispCurve,s._dispN,680,180,maxM)}<div class="ctip" id="cTip"></div></div>`;
+      // ширина від контейнера: 680 у viewBox на екрані 360px робить
+      // 9px-підписи нечитабельними (масштаб ~0.5)
+      const box=document.querySelector('.sdetail')||document.querySelector('.stratmain');
+      const cw=Math.min(680,Math.max(320,(box?box.clientWidth:680)-20));
+      return `<div class="sd-chart"><h4>Медіана net за хвилиною виходу (1–${maxM}) · ${lbl}</h4>${curveSvg(s._dispCurve,s._dispN,cw,180,maxM)}<div class="ctip" id="cTip"></div></div>`;
     })()}
     <div class="sfilters">
       ${isRev?fb('sht','all','всі')+fb('sht','y','штанга')+fb('sht','n','середина')+'<span style="width:10px"></span>':''}
