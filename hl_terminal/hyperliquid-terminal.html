@@ -862,7 +862,7 @@ function renderStrat(){
       <div class="scard-halves">швидкість: <b>${s.per_day==null?'—':s.per_day.toFixed(1)}</b> угод/день${s.days?' · за '+Math.round(s.days)+' д':''} · логіка з v${s.since||'?'}</div>
       ${(S_PROF.has(name)&&s.prof&&s.prof.wallets)?`<div class="scard-halves">гаманців ${s.prof.wallets} · швидких/повільних епізодів ${s.prof.n_fast}/${s.prof.n_slow} · частка швидких (мед.) ${s.prof.fast_pct_med==null?'—':s.prof.fast_pct_med.toFixed(0)+'%'} · злив від 1-ї tx: мед. ${secTxt(s.prof.unload_med_s)}, сер. ${secTxt(s.prof.unload_mean_s)}</div>`:''}
       ${(s.kind==='follow'&&!S_FIRST.has(name)&&s.n)?`<div class="scard-halves">перших пострілів пари: ${s.first_shot_n||0} з ${s.n}${name==='F4_розумний'?' (стільки ж «є» F5)':''}</div>`:''}
-      ${(s.kind==='twap'&&s.cohorts)?`<div class="scard-halves">когорти: ≥1.5% ${cohTxt(s.cohorts['1.5'])} · ≥2% ${cohTxt(s.cohorts['2.0'])}${(()=>{const d=s.drops||{};const parts=[];if(d.move_small)parts.push('рух<1%: '+d.move_small);if(d.cancelled)parts.push('скасовано: '+d.cancelled);if(d.late||d.no_price)parts.push('пропущено: '+((d.late||0)+(d.no_price||0)));return parts.length?' · без входу — '+parts.join(', '):'';})()}</div>`:''}
+      ${(s.kind==='twap'&&s.cohorts)?`<div class="scard-halves">підтверджено завершені: n=${s.n_confirmed||0} ${pctTxt(s.median_confirmed)} · окремі стратегії ≥1.5% ${cohTxt(s.cohorts['1.5'])} · ≥2% ${cohTxt(s.cohorts['2.0'])}${(()=>{const d=s.drops||{};const parts=[];if(d.move_small)parts.push('рух<1%: '+d.move_small);if(d.cancelled)parts.push('скасовано: '+d.cancelled);if(d.late||d.no_price)parts.push('пропущено: '+((d.late||0)+(d.no_price||0)));return parts.length?' · без входу — '+parts.join(', '):'';})()}</div>`:''}
     </div>`;
   }
   document.getElementById('sCards').innerHTML=html||'<div class="empty-note">Немає даних</div>';
@@ -918,7 +918,8 @@ function renderSDetail(){
               C('usd','TWAP',t=>(t.twap_side==='buy'?'купівля ':'продаж ')+usdTxt(t.usd)),
               C('dur','Трив.',t=>t.dur!=null?(t.dur/60).toFixed(0)+' хв':'—'),
               C('kind','Тип',t=>t.kind==='open'?'відкриття':(t.kind==='reduce'?'скорочення':'—')),
-              C('cancel_after','Скас. після входу',t=>t.cancel_after?'так':'ні'));
+              C('confirm','TWAP',t=>t.cancel_after?'скас. m'+(t.exit_min||'?'):(t.completed?'завершено':(t.confirm==='finished'?'частково':(t.confirm||'—')))),
+              C('px_src','Ціни',t=>t.px_src||'—'));
     if(sMore) cols.push(C('pos_usd','Позиція кита $',t=>usdTxt(t.pos_usd)),
                         C('src','Джерело',t=>t.src||'—'),
                         C('wallet','Гаманець',t=>t.wallet||'—'));
@@ -975,7 +976,7 @@ function renderSDetail(){
     <h3>${(sData.titles||{})[sSel]||sSel.replace(/_/g,' ')} <span class="dim" style="font-size:11px">${sSel}</span></h3>
     <div class="sub">${(sData.desc||{})[sSel]||''} · показано ${Math.min(trades.length,150)} з ${trades.length}${s.per_day!=null?' · швидкість '+s.per_day.toFixed(1)+' угод/день':''}</div>
     <div class="sd-stats">
-      <div class="snum"><i>Вибірка</i><b>${isTw?'когорта рух ≥'+tCoh+'%':'вся'}</b></div>
+      <div class="snum"><i>Вибірка</i><b>${isTw?'стратегія рух ≥'+tCoh+'% · усі paper-входи':'вся'}</b></div>
       <div class="snum"><i>Угод</i><b>${cs.n}</b></div>
       <div class="snum"><i>${isTw?'TWAP ≤15 хв':'Сигналів'}</i><b>${s.signals}</b></div>
       <div class="snum"><i>Медіана</i><b class="${pctCls(cs.median)}">${pctTxt(cs.median)}</b></div>
@@ -983,6 +984,10 @@ function renderSDetail(){
       <div class="snum"><i>Win</i><b>${cs.win==null?'—':cs.win.toFixed(0)+'%'}</b></div>
       <div class="snum"><i>PnL ($1k/угода)</i><b class="${pctCls(cs.pnl_usd)}">${cs.pnl_usd>=0?'+':''}$${Math.abs(cs.pnl_usd||0).toFixed(0)}</b></div>
       <div class="snum"><i>Половини</i><b><span class="${pctCls(cs.half1)}">${pctTxt(cs.half1)}</span> / <span class="${pctCls(cs.half2)}">${pctTxt(cs.half2)}</span></b></div>
+      ${isTw?`<div class="snum"><i>Підтверджено завершені · окрема вибірка</i><b>n=${cs.n_confirmed||0} · <span class="${pctCls(cs.median_confirmed)}">${pctTxt(cs.median_confirmed)}</span>${cs.win_confirmed!=null?' · win '+cs.win_confirmed.toFixed(0)+'%':''}</b></div>
+      <div class="snum"><i>Скас. після входу / частково / непідтв.</i><b>${cs.n_cancelled||0} / ${cs.n_partial||0} / ${cs.n_unconfirmed||0}</b></div>
+      <div class="snum"><i>Ціни зі свічок біржі</i><b>${cs.n_candle||0} з ${cs.n||0}</b></div>
+      <div class="snum"><i>Швидкість</i><b>${cs.per_day==null?'—':cs.per_day.toFixed(2)+' / день'}${cs.open_now?' · у ринку '+cs.open_now:''}</b></div>`:''}
     </div>
     ${filtersOn?`<div class="sd-stats" style="border-top:1px solid var(--line);padding-top:10px">
       <div class="snum"><i>Вибірка</i><b style="color:var(--amber)">зріз (по показаних)</b></div>
