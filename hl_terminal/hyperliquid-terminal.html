@@ -237,6 +237,70 @@ footer .fr{margin-left:auto;display:flex;gap:20px}
 .lphase{font-size:10px;color:var(--ink3)}
 .errbox{padding:20px;text-align:center;font-size:11px;line-height:2;color:var(--ink3)}
 .errbox code{color:var(--amber);background:var(--raised);padding:2px 8px;border-radius:3px}
+
+/* ═══ МОБІЛЬНА ВЕРСІЯ (≤900px, v2.11 п.6) ═══
+   Одна колонка замість трьох: монети — горизонтальна стрічка чипів,
+   таблиця позицій скролиться по X у своєму контейнері, watch/події
+   під нею. Вкладка стратегій — картки в один стовпчик, таблиця угод
+   скролиться в контейнері, крива ловить тач. Кнопки ≥36px. */
+@media (max-width:900px){
+  html,body{overflow:auto;height:auto}
+  .app{display:flex;flex-direction:column;height:auto;min-height:100vh}
+  header{height:auto;flex-wrap:wrap;padding:8px 12px;gap:8px 12px}
+  .brand h1{font-size:15px}
+  .brand span{display:none}
+  .tabs{margin-left:auto}
+  .tabbtn{padding:9px 12px;font-size:11px}
+  .live{width:100%;order:5}
+  .hstats{order:6;width:100%;margin-left:0;justify-content:space-between;
+    gap:6px;padding-top:6px;border-top:1px solid var(--line)}
+  .hstat b{font-size:13px}
+  .clock{display:none}
+  main#termView{display:grid;grid-template-columns:1fr;grid-auto-rows:auto;
+    overflow:visible}
+  .coins{border-right:0;border-bottom:1px solid var(--line)}
+  .coins-head{padding:8px 12px}
+  .coin-scroll{display:flex;overflow-x:auto;overflow-y:hidden;
+    -webkit-overflow-scrolling:touch;scroll-snap-type:x proximity}
+  .coin{min-width:138px;flex:0 0 auto;border-bottom:0;
+    border-right:1px solid var(--line);padding:9px 11px;scroll-snap-align:start}
+  .coin.on::before{width:100%;height:2px;bottom:auto;top:0}
+  .center{overflow:visible}
+  .center-head{flex-wrap:wrap;gap:6px 12px;padding:10px 12px}
+  .center-head h2{font-size:16px}
+  .chead-meta{margin-left:0;width:100%;flex-wrap:wrap;gap:8px 12px}
+  .tbl-wrap{overflow:auto;max-height:64vh;-webkit-overflow-scrolling:touch}
+  .tbl-wrap table{min-width:660px}
+  thead th:first-child,tbody td:first-child{padding-left:12px}
+  tbody td{padding:11px 8px}
+  .right{border-left:0;border-top:1px solid var(--line);display:flex;
+    flex-direction:column;overflow:visible}
+  .rblock{max-height:46vh}
+  .rblock+.rblock{border-top:1px solid var(--line)}
+  .witem,.aitem{padding:11px 12px}
+  .stratmain{padding:10px 10px 48px;overflow:visible}
+  .stov{gap:10px 16px;padding:10px 12px}
+  .stov .note{margin-left:0;width:100%}
+  .scards{grid-template-columns:1fr}
+  .scard{padding:12px}
+  .scard-nums{flex-wrap:wrap;gap:8px 16px}
+  .scard-desc{min-height:0}
+  .sdetail{padding:12px 10px}
+  .sdetail h3{font-size:14px}
+  .sd-stats{gap:10px 16px}
+  .sfilters{gap:6px}
+  .fbtn{padding:8px 11px;font-size:11px;min-height:36px}
+  .sd-tbl{overflow:auto;-webkit-overflow-scrolling:touch}
+  .sd-tbl table{min-width:760px}
+  footer{height:auto;flex-wrap:wrap;padding:8px 12px;gap:6px 14px}
+  footer .fr{margin-left:0;flex-wrap:wrap;gap:6px 14px}
+}
+@media (max-width:480px){
+  .hstat i{font-size:8px}
+  .hstat b{font-size:12px}
+  .scard-nums .snum b{font-size:12px}
+  .center-head h2{font-size:15px}
+}
 </style>
 </head>
 <body>
@@ -314,6 +378,7 @@ footer .fr{margin-left:auto;display:flex;gap:20px}
     <div class="hstat"><i>Чекають breakout</i><b id="svArmed">—</b></div>
     <div class="hstat"><i>Тіней (outcome)</i><b id="svShadow">—</b></div>
     <div class="hstat"><i>Профілів F4·F7</i><b id="svProf">—</b></div>
+    <div class="hstat"><i>TWAP ≤15 хв</i><b id="svTwap">—</b></div>
     <div class="note">paper trading · $1000/угода · net після витрат · клік по картці — деталі</div>
     <div class="note" id="svResearch" style="display:none"></div>
   </div>
@@ -589,15 +654,20 @@ function setSort(k){if(sSortK===k){sSortD=-sSortD;}else{sSortK=k;sSortD=-1;}
   renderSDetail();}
 const S_ORDER=['R1_загальний','R2_breakout','R3_великі','R4_великий','R5_дуже',
                'R6_волт','R7_одним','F1_1хв','F2_2хв','F3_3хв','F6_1хв_перший',
-               'F4_розумний','F5_перший','F7_без_ратіо'];
-const S_PROF=new Set(['F4_розумний','F5_перший','F7_без_ратіо']);   // стратегії з профілем швидкості
-const S_FIRST=new Set(['F5_перший','F6_1хв_перший','F7_без_ратіо']); // вхід лише на 1-му пострілі пари
+               'F4_розумний','F5_перший','F8_ratio35','F7_без_ратіо','F9_без_ратіо_90',
+               'T1_твап_відкриття','T2_твап_скорочення'];
+const S_PROF=new Set(['F4_розумний','F5_перший','F8_ratio35','F7_без_ратіо','F9_без_ратіо_90']);   // стратегії з профілем швидкості
+const S_FIRST=new Set(['F5_перший','F6_1хв_перший','F8_ratio35','F7_без_ратіо','F9_без_ратіо_90']); // вхід лише на 1-му пострілі пари
+let tCoh='1.0';   // когорта TWAP-стратегій (рух за час твапу ≥ X%)
+function setCoh(c){tCoh=c;renderSDetail();}
 function secTxt(v){if(v==null)return '—';return v>=120?(v/60).toFixed(1)+' хв':v.toFixed(0)+' с';}
+function cohTxt(c){return (c&&c.n)?pctTxt(c.median)+' (n='+c.n+', win '+(c.win==null?'—':c.win.toFixed(0)+'%')+')':'—';}
 
 function switchView(v){
   view=v;
-  document.getElementById('termView').style.display=v==='term'?'grid':'none';
-  document.getElementById('stratView').style.display=v==='strat'?'flex':'none';
+  // '' замість 'grid'/'flex': display вирішує CSS (на мобільному — інший)
+  document.getElementById('termView').style.display=v==='term'?'':'none';
+  document.getElementById('stratView').style.display=v==='strat'?'':'none';
   document.getElementById('tabTerm').className='tabbtn'+(v==='term'?' on':'');
   document.getElementById('tabStrat').className='tabbtn'+(v==='strat'?' on':'');
   if(v==='strat') pollStrat();
@@ -622,19 +692,20 @@ function sparkSvg(cum,w=260,h=32){
   const Y=v=>h-3-(v-mn)/rng*(h-6);
   const pts=cum.map((v,i)=>X(i).toFixed(1)+','+Y(v).toFixed(1)).join(' ');
   const col=cum[cum.length-1]>=0?'var(--long)':'var(--short)';
-  return `<svg width="${w}" height="${h}" style="max-width:100%">
+  return `<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" style="max-width:100%;height:auto">
     <line x1="2" y1="${Y(0)}" x2="${w-2}" y2="${Y(0)}" stroke="var(--line2)" stroke-width="1" stroke-dasharray="3,3"/>
     <polyline points="${pts}" fill="none" stroke="${col}" stroke-width="2" stroke-linejoin="round"/>
   </svg>`;
 }
 
-function curveSvg(curve,curveN,w=680,h=180){
+function curveSvg(curve,curveN,w=680,h=180,maxM=60){
+  // maxM — горизонт хвилин (60 для R/F, 120 для TWAP-реверсу)
   const vals=curve.map((v,i)=>[i+1,v,(curveN||[])[i]??0]).filter(p=>p[1]!=null);
   if(!vals.length) return '<div class="empty-note">Ще немає завершених угод</div>';
   const ys=vals.map(p=>p[1]);
   const mn=Math.min(0,...ys), mx=Math.max(0,...ys), rng=(mx-mn)||1;
   const L=34,R=8,T=10,B=18;
-  const X=m=>L+(m-1)/59*(w-L-R);
+  const X=m=>L+(m-1)/(maxM-1)*(w-L-R);
   const Y=v=>T+(mx-v)/rng*(h-T-B);
   // "найкраща хвилина" — лише серед хвилин із достатнім покриттям:
   // одна щаслива угода на m2 не має перемагати 30 угод на m30
@@ -644,11 +715,14 @@ function curveSvg(curve,curveN,w=680,h=180){
   for(const p of vals) if(p[2]>=minN&&(best==null||p[1]>best[1])) best=p;
   const pts=vals.map(p=>X(p[0]).toFixed(1)+','+Y(p[1]).toFixed(1)).join(' ');
   let grid='';
-  for(const m of [10,20,30,40,50,60])
+  const step=maxM>60?20:10;
+  for(let m=step;m<=maxM;m+=step)
     grid+=`<line x1="${X(m)}" y1="${T}" x2="${X(m)}" y2="${h-B}" stroke="var(--line)" stroke-width="1"/>
            <text x="${X(m)}" y="${h-5}" fill="var(--ink3)" font-size="9" text-anchor="middle">${m}хв</text>`;
-  return `<svg id="curveSvg" width="${w}" height="${h}" style="max-width:100%"
-      onmousemove="curveTip(event,${w},${L},${R})" onmouseleave="hideTip()">
+  const late=maxM*0.87, early=maxM*0.08;
+  return `<svg id="curveSvg" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" style="max-width:100%;height:auto;touch-action:none"
+      onmousemove="curveTip(event,${w},${L},${R},${maxM})" onmouseleave="hideTip()"
+      ontouchstart="curveTouch(event,${w},${L},${R},${maxM})" ontouchmove="curveTouch(event,${w},${L},${R},${maxM})" ontouchend="hideTip()">
     ${grid}
     <line x1="${L}" y1="${Y(0)}" x2="${w-R}" y2="${Y(0)}" stroke="var(--line2)" stroke-width="1" stroke-dasharray="4,3"/>
     <text x="${L-4}" y="${Y(0)+3}" fill="var(--ink3)" font-size="9" text-anchor="end">0%</text>
@@ -656,15 +730,15 @@ function curveSvg(curve,curveN,w=680,h=180){
     ${mn<0?`<text x="${L-4}" y="${Y(mn)+3}" fill="var(--ink3)" font-size="9" text-anchor="end">${pctTxt(mn,1)}</text>`:''}
     <polyline points="${pts}" fill="none" stroke="var(--signal)" stroke-width="2" stroke-linejoin="round"/>
     ${best?`<circle cx="${X(best[0])}" cy="${Y(best[1])}" r="3.5" fill="var(--signal)" stroke="var(--bg)" stroke-width="1.5"/>
-    <text x="${best[0]>52?X(best[0])-6:X(best[0])}" y="${Math.max(Y(best[1])-8,11)}" fill="var(--ink)" font-size="10" font-weight="600" text-anchor="${best[0]>52?'end':(best[0]<5?'start':'middle')}">m${best[0]} ${pctTxt(best[1])} · n=${best[2]}</text>`:''}
+    <text x="${best[0]>late?X(best[0])-6:X(best[0])}" y="${Math.max(Y(best[1])-8,11)}" fill="var(--ink)" font-size="10" font-weight="600" text-anchor="${best[0]>late?'end':(best[0]<early?'start':'middle')}">m${best[0]} ${pctTxt(best[1])} · n=${best[2]}</text>`:''}
   </svg>`;
 }
-function curveTip(ev,w,L,R){
+function curveTip(ev,w,L,R,maxM=60){
   const st=sData&&sData.strategies[sSel];
   if(!st||!(st._dispCurve||st.curve)) return;
   const box=ev.currentTarget.getBoundingClientRect();
   const x=(ev.clientX-box.left)*(w/box.width);
-  let m=Math.round((x-L)/(w-L-R)*59)+1; m=Math.max(1,Math.min(60,m));
+  let m=Math.round((x-L)/(w-L-R)*(maxM-1))+1; m=Math.max(1,Math.min(maxM,m));
   const v=(st._dispCurve||st.curve||[])[m-1];
   const n=(st._dispN||st.curve_n||[])[m-1];
   const tip=document.getElementById('cTip'); if(!tip) return;
@@ -674,6 +748,12 @@ function curveTip(ev,w,L,R){
   tip.style.top=(ev.clientY-box.top-24)+'px';
   // n обов'язково: після чесних пропусків хвилини мають різне покриття
   tip.textContent='вихід m'+m+' · медіана '+pctTxt(v)+(n!=null?' · n='+n:'');
+}
+function curveTouch(ev,w,L,R,maxM){
+  // тач замість ховера (мобільна версія): перший палець = курсор
+  const t=ev.touches&&ev.touches[0]; if(!t) return;
+  curveTip({currentTarget:ev.currentTarget,clientX:t.clientX,clientY:t.clientY},w,L,R,maxM);
+  if(ev.cancelable) ev.preventDefault();
 }
 function hideTip(){const t=document.getElementById('cTip');if(t)t.style.display='none';}
 
@@ -717,6 +797,13 @@ function renderStrat(){
   const pr=sData.profiles||{};
   // ok = придатні для F4/F5 (з ratio-гейтом); ok_nr = для F7 (без ratio)
   document.getElementById('svProf').textContent=(pr.ok??0)+'·'+(pr.ok_nr??0)+'/'+(pr.total??0);
+  const tw=sData.twap||{};
+  const twEl=document.getElementById('svTwap');
+  if(twEl){
+    const chErr=Object.values(tw.channels||{}).some(c=>c&&c.err>=3);
+    twEl.textContent=((tw.watching||[]).length)+' стежу · '+(tw.entered||0)+' вх.'+(chErr?' ⚠️':'');
+    twEl.title='TWAP ≤15 хв: постів '+(tw.posts||0)+', стартів '+(tw.starts||0)+', придатних '+(tw.eligible||0)+', скасовано '+(tw.cancelled||0)+', входів '+(tw.entered||0)+(chErr?' · канал t.me не читається':'');
+  }
   const openBy={};
   (sData.open||[]).forEach(o=>{openBy[o.strategy]=(openBy[o.strategy]||0)+1;});
   let html='';
@@ -735,9 +822,11 @@ function renderStrat(){
         <div class="snum"><i>PnL</i><b class="${pctCls(s.pnl_usd)}">${s.pnl_usd>=0?'+':''}$${Math.abs(s.pnl_usd).toFixed(0)}</b></div>
       </div>
       <div class="scard-spark">${sparkSvg(s.cum)}</div>
-      <div class="scard-halves">половини: <b class="${pctCls(s.half1)}">${pctTxt(s.half1)}</b> / <b class="${pctCls(s.half2)}">${pctTxt(s.half2)}</b>${s.kind==='rev'?' · метрика: вихід m30':''}</div>
+      <div class="scard-halves">половини: <b class="${pctCls(s.half1)}">${pctTxt(s.half1)}</b> / <b class="${pctCls(s.half2)}">${pctTxt(s.half2)}</b>${s.kind==='rev'?' · метрика: вихід m30':(s.kind==='twap'?' · метрика: вихід m60 (крива 120 хв)':'')}</div>
+      <div class="scard-halves">швидкість: <b>${s.per_day==null?'—':s.per_day.toFixed(1)}</b> угод/день${s.days?' · за '+Math.round(s.days)+' д':''} · логіка з v${s.since||'?'}</div>
       ${(S_PROF.has(name)&&s.prof&&s.prof.wallets)?`<div class="scard-halves">гаманців ${s.prof.wallets} · швидких/повільних епізодів ${s.prof.n_fast}/${s.prof.n_slow} · частка швидких (мед.) ${s.prof.fast_pct_med==null?'—':s.prof.fast_pct_med.toFixed(0)+'%'} · злив від 1-ї tx: мед. ${secTxt(s.prof.unload_med_s)}, сер. ${secTxt(s.prof.unload_mean_s)}</div>`:''}
       ${(s.kind==='follow'&&!S_FIRST.has(name)&&s.n)?`<div class="scard-halves">перших пострілів пари: ${s.first_shot_n||0} з ${s.n}${name==='F4_розумний'?' (стільки ж «є» F5)':''}</div>`:''}
+      ${(s.kind==='twap'&&s.cohorts)?`<div class="scard-halves">когорти: ≥1.5% ${cohTxt(s.cohorts['1.5'])} · ≥2% ${cohTxt(s.cohorts['2.0'])}${(()=>{const d=s.drops||{};const parts=[];if(d.move_small)parts.push('рух<1%: '+d.move_small);if(d.cancelled)parts.push('скасовано: '+d.cancelled);if(d.late||d.no_price)parts.push('пропущено: '+((d.late||0)+(d.no_price||0)));return parts.length?' · без входу — '+parts.join(', '):'';})()}</div>`:''}
     </div>`;
   }
   document.getElementById('sCards').innerHTML=html||'<div class="empty-note">Немає даних</div>';
@@ -750,14 +839,18 @@ function renderSDetail(){
   const box=document.getElementById('sDetail');
   if(!sSel||!sData.strategies[sSel]){box.style.display='none';return;}
   const s=sData.strategies[sSel];
+  const isRev=s.kind==='rev', isTw=s.kind==='twap';
+  // TWAP-реверс: метрики/крива — з обраної когорти (рух ≥1/1.5/2%),
+  // таблиця — ті самі угоди, відфільтровані по руху
+  const cs=isTw?(((s.cohorts||{})[tCoh])||s):s;
   let trades=(s.trades||[]).slice().reverse();
+  if(isTw) trades=trades.filter(t=>(t.move??0)>=parseFloat(tCoh));
   // follow-угоди не мають поля shtanga: фільтр лише для реверсів,
   // інакше залишковий вибір зі R-картки спустошував F-таблицю
-  if(fSht!=='all'&&s.kind==='rev')
+  if(fSht!=='all'&&isRev)
     trades=trades.filter(t=>(t.shtanga??null)===(fSht==='y'?1:0));
-  if(fVault!=='all') trades=trades.filter(t=>(t.vault??0)===(fVault==='y'?1:0));
+  if(fVault!=='all'&&!isTw) trades=trades.filter(t=>(t.vault??0)===(fVault==='y'?1:0));
   const fb=(k,v,lbl)=>`<button class="fbtn${(k==='sht'?fSht:fVault)===v?' on':''}" onclick="setF('${k}','${v}')">${lbl}</button>`;
-  const isRev=s.kind==='rev';
   // колонки як дані: спільний механізм для сортування і "детальніше"
   const C=(k,l,f,cls)=>({k,l,f,cls});
   const fmt={pct:v=>v!=null?pctTxt(v):'—',
@@ -768,7 +861,7 @@ function renderSDetail(){
   let cols=[
     C('date','Дата',t=>t.date||''),
     C('coin','Монета',t=>`<span class="side ${t.side==='LONG'?'L':'S'}">${t.side||''}</span> ${t.coin||''}${t.vault?' 🏦':''}`),
-    C('net30','Net'+(isRev?' m30':''),
+    C('net30','Net'+(isRev?' m30':(isTw?' m60':'')),
       t=>t.entered===0?'<span class="dim">пропуск</span>':pctTxt(t.net30),
       t=>t.entered===0?'':pctCls(t.net30)),
     C('peak','Peak',t=>fmt.pct(t.peak)),
@@ -782,6 +875,15 @@ function renderSDetail(){
                         C('sum_usd','Закрито $',t=>usdTxt(t.sum_usd)),
                         C('p3u','3хв ↑',t=>fmt.pct(t.p3u)),
                         C('p3d','3хв ↓',t=>fmt.pct(t.p3d)));
+  }else if(isTw){
+    cols.push(C('move','Рух TWAP',t=>fmt.p2(t.move)),
+              C('usd','TWAP',t=>(t.twap_side==='buy'?'купівля ':'продаж ')+usdTxt(t.usd)),
+              C('dur','Трив.',t=>t.dur!=null?(t.dur/60).toFixed(0)+' хв':'—'),
+              C('kind','Тип',t=>t.kind==='open'?'відкриття':(t.kind==='reduce'?'скорочення':'—')),
+              C('cancel_after','Скас. після входу',t=>t.cancel_after?'так':'ні'));
+    if(sMore) cols.push(C('pos_usd','Позиція кита $',t=>usdTxt(t.pos_usd)),
+                        C('src','Джерело',t=>t.src||'—'),
+                        C('wallet','Гаманець',t=>t.wallet||'—'));
   }else{
     cols.push(C('tx_pct','Шматок',t=>fmt.p1(t.tx_pct)),
               C('hold','Холд, с',t=>fmt.sec(t.hold)),
@@ -828,20 +930,20 @@ function renderSDetail(){
   const fMean=fNets.length?fNets.reduce((a,b)=>a+b,0)/fNets.length:null;
   const fWin=fNets.length?100*fNets.filter(v=>v>0).length/fNets.length:null;
   const fPnl=fNets.length?fNets.reduce((a,b)=>a+b,0)*10:null;
-  const filtersOn=fSht!=='all'||fVault!=='all';
+  const filtersOn=(fSht!=='all'&&isRev)||(fVault!=='all'&&!isTw);
   box.style.display='block';
   box.innerHTML=`
     <h3>${(sData.titles||{})[sSel]||sSel.replace(/_/g,' ')} <span class="dim" style="font-size:11px">${sSel}</span></h3>
-    <div class="sub">${(sData.desc||{})[sSel]||''} · показано ${Math.min(trades.length,150)} з ${trades.length}</div>
+    <div class="sub">${(sData.desc||{})[sSel]||''} · показано ${Math.min(trades.length,150)} з ${trades.length}${s.per_day!=null?' · швидкість '+s.per_day.toFixed(1)+' угод/день':''}</div>
     <div class="sd-stats">
-      <div class="snum"><i>Вибірка</i><b>вся</b></div>
-      <div class="snum"><i>Угод</i><b>${s.n}</b></div>
-      <div class="snum"><i>Сигналів</i><b>${s.signals}</b></div>
-      <div class="snum"><i>Медіана</i><b class="${pctCls(s.median)}">${pctTxt(s.median)}</b></div>
-      <div class="snum"><i>Середнє</i><b class="${pctCls(s.mean)}">${pctTxt(s.mean)}</b></div>
-      <div class="snum"><i>Win</i><b>${s.win==null?'—':s.win.toFixed(0)+'%'}</b></div>
-      <div class="snum"><i>PnL ($1k/угода)</i><b class="${pctCls(s.pnl_usd)}">${s.pnl_usd>=0?'+':''}$${Math.abs(s.pnl_usd).toFixed(0)}</b></div>
-      <div class="snum"><i>Половини</i><b><span class="${pctCls(s.half1)}">${pctTxt(s.half1)}</span> / <span class="${pctCls(s.half2)}">${pctTxt(s.half2)}</span></b></div>
+      <div class="snum"><i>Вибірка</i><b>${isTw?'когорта рух ≥'+tCoh+'%':'вся'}</b></div>
+      <div class="snum"><i>Угод</i><b>${cs.n}</b></div>
+      <div class="snum"><i>${isTw?'TWAP ≤15 хв':'Сигналів'}</i><b>${s.signals}</b></div>
+      <div class="snum"><i>Медіана</i><b class="${pctCls(cs.median)}">${pctTxt(cs.median)}</b></div>
+      <div class="snum"><i>Середнє</i><b class="${pctCls(cs.mean)}">${pctTxt(cs.mean)}</b></div>
+      <div class="snum"><i>Win</i><b>${cs.win==null?'—':cs.win.toFixed(0)+'%'}</b></div>
+      <div class="snum"><i>PnL ($1k/угода)</i><b class="${pctCls(cs.pnl_usd)}">${cs.pnl_usd>=0?'+':''}$${Math.abs(cs.pnl_usd||0).toFixed(0)}</b></div>
+      <div class="snum"><i>Половини</i><b><span class="${pctCls(cs.half1)}">${pctTxt(cs.half1)}</span> / <span class="${pctCls(cs.half2)}">${pctTxt(cs.half2)}</span></b></div>
     </div>
     ${filtersOn?`<div class="sd-stats" style="border-top:1px solid var(--line);padding-top:10px">
       <div class="snum"><i>Вибірка</i><b style="color:var(--amber)">зріз (по показаних)</b></div>
@@ -856,9 +958,10 @@ function renderSDetail(){
       // тіньова стрічка входів (одні сигнали на всі F-стратегії)
       // F5 — власна когорта: лише перші постріли пари (first_shot=1)
       const tf=sData.follow_tape_first;
-      const useFirst=S_FIRST.has(sSel)&&tf&&tf.n>0;   // F5/F6/F7 — когорта 1-х пострілів
-      const src=isRev?s:(useFirst?tf:(sData.follow_tape&&sData.follow_tape.n?sData.follow_tape:null));
+      const useFirst=S_FIRST.has(sSel)&&tf&&tf.n>0;   // F5–F9 — когорта 1-х пострілів
+      const src=isRev?s:(isTw?cs:(useFirst?tf:(sData.follow_tape&&sData.follow_tape.n?sData.follow_tape:null)));
       if(!src) return '';
+      const maxM=isTw?(s.track_min||120):60;
       // спільна когорта: кожна хвилина з ТИХ САМИХ угод — лише тоді
       // "найкраща хвилина" є порівнянням, а не збігом різних вибірок
       const useC=(src.curve_common_n||0)>=3&&src.curve_common;
@@ -867,15 +970,16 @@ function renderSDetail(){
       // ЧЕСНИЙ підпис для F: стрічка — ВСІ follow-сигнали, не входи
       // саме цієї стратегії (F4 відкривається на підмножині — його
       // власна вибірка інша; аудит v2.5 №3)
-      const lbl=(isRev?'':(useFirst?'лише перші постріли пари (когорта F5/F6/F7) · ':'усі follow-сигнали, НЕ лише входи цієї стратегії · '))
-        +(useC?('спільна когорта (усі 60 хв у кожній угоді) · n='+src.curve_common_n)
+      const lbl=(isRev?'':(isTw?('когорта рух ≥'+tCoh+'% · вхід за хвилину до кінця TWAP, вихід m60 · ')
+        :(useFirst?'лише перші постріли пари (когорта F5–F9) · ':'усі follow-сигнали, НЕ лише входи цієї стратегії · ')))
+        +(useC?('спільна когорта (усі '+maxM+' хв у кожній угоді) · n='+src.curve_common_n)
               :'вся вибірка · увага: різні хвилини = різні набори угод');
-      return `<div class="sd-chart"><h4>Медіана net за хвилиною виходу (1–60) · ${lbl}</h4>${curveSvg(s._dispCurve,s._dispN)}<div class="ctip" id="cTip"></div></div>`;
+      return `<div class="sd-chart"><h4>Медіана net за хвилиною виходу (1–${maxM}) · ${lbl}</h4>${curveSvg(s._dispCurve,s._dispN,680,180,maxM)}<div class="ctip" id="cTip"></div></div>`;
     })()}
     <div class="sfilters">
       ${isRev?fb('sht','all','всі')+fb('sht','y','штанга')+fb('sht','n','середина')+'<span style="width:10px"></span>':''}
-      ${fb('vault','all','всі')}${fb('vault','y','волти')}${fb('vault','n','без волтів')}
-      <span style="width:10px"></span>
+      ${isTw?['1.0','1.5','2.0'].map(c=>`<button class="fbtn${tCoh===c?' on':''}" onclick="setCoh('${c}')">рух ≥${c}%</button>`).join('')+'<span style="width:10px"></span>':''}
+      ${isTw?'':fb('vault','all','всі')+fb('vault','y','волти')+fb('vault','n','без волтів')+'<span style="width:10px"></span>'}
       <button class="fbtn${sMore?' on':''}" onclick="setMore()">детальніше</button>
     </div>
     <div class="sd-tbl"><h4>Угоди · клік по колонці — сортування</h4>

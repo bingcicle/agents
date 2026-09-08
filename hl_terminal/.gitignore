@@ -8,3 +8,4 @@ ws_proxy.txt
 rest_proxy.txt
 creds.json
 *.csv
+scan_proxy.txt
