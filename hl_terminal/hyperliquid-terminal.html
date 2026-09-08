@@ -878,11 +878,10 @@ function renderSDetail(){
   if(!sSel||!sData.strategies[sSel]){box.style.display='none';return;}
   const s=sData.strategies[sSel];
   const isRev=s.kind==='rev', isTw=s.kind==='twap';
-  // TWAP-реверс: метрики/крива — з обраної когорти (рух ≥1/1.5/2%),
-  // таблиця — ті самі угоди, відфільтровані по руху
+  // TWAP-реверс: метрики/крива І список угод — з обраної когорти-стратегії
+  // (≥1/1.5/2% — окремі входи, а не фільтр базової по руху; v2.14)
   const cs=isTw?(((s.cohorts||{})[tCoh])||s):s;
-  let trades=(s.trades||[]).slice().reverse();
-  if(isTw) trades=trades.filter(t=>(t.move??0)>=parseFloat(tCoh));
+  let trades=((isTw&&cs.trades)?cs.trades:(s.trades||[])).slice().reverse();
   // follow-угоди не мають поля shtanga: фільтр лише для реверсів,
   // інакше залишковий вибір зі R-картки спустошував F-таблицю
   if(fSht!=='all'&&isRev)
@@ -918,7 +917,7 @@ function renderSDetail(){
               C('usd','TWAP',t=>(t.twap_side==='buy'?'купівля ':'продаж ')+usdTxt(t.usd)),
               C('dur','Трив.',t=>t.dur!=null?(t.dur/60).toFixed(0)+' хв':'—'),
               C('kind','Тип',t=>t.kind==='open'?'відкриття':(t.kind==='reduce'?'скорочення':'—')),
-              C('confirm','TWAP',t=>t.cancel_after?'скас. m'+(t.exit_min||'?'):(t.completed?'завершено':(t.confirm==='finished'?'частково':(t.confirm||'—')))),
+              C('confirm','TWAP',t=>(t.cancel_after?'скас. m'+(t.exit_min||'?'):(t.completed?'завершено':(t.confirm==='finished'?'частково':(t.confirm==='tg_done'?'канал: заверш.':(t.confirm||'—')))))+(t.exit_reason==='timer_late'?' · вихід m'+t.exit_min:'')+(t.pending?' · ще крива':'')),
               C('px_src','Ціни',t=>t.px_src||'—'));
     if(sMore) cols.push(C('pos_usd','Позиція кита $',t=>usdTxt(t.pos_usd)),
                         C('src','Джерело',t=>t.src||'—'),
