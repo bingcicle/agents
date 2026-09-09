@@ -60,10 +60,43 @@ if DATA_DIR != DIR:
     for _fn in sorted(_mig):
         try:
             _src, _dst = os.path.join(DIR, _fn), os.path.join(DATA_DIR, _fn)
-            if os.path.exists(_src) and not os.path.exists(_dst):
+            if not os.path.exists(_src):
+                continue
+            if not os.path.exists(_dst):
                 os.replace(_src, _dst)
                 _moved += 1
                 print(f"  [DATA] {_fn} -> {DATA_DIR}")
+            elif _fn.endswith(".csv"):
+                # однойменний CSV уже є в DATA_DIR (робота в різних папках,
+                # аудит v2.14 №8c): рядки з папки коду не ховаємо — той самий
+                # заголовок → дописуємо у файл даних, інший → кладемо поруч як
+                # .legacy-migrated-<ts>.csv (читач legacy його підхопить);
+                # оригінал лишається в папці коду під .migrated-<ts>
+                with open(_src, "rb") as _fs:
+                    _s_hdr = _fs.readline()
+                    _s_rest = _fs.read()
+                with open(_dst, "rb") as _fd:
+                    _d_hdr = _fd.readline()
+                    _fd.seek(0, 2)
+                    _d_size = _fd.tell()
+                    _d_tail = b""
+                    if _d_size:
+                        _fd.seek(_d_size - 1)
+                        _d_tail = _fd.read(1)
+                _ts = int(time.time())
+                if _s_hdr.strip() == _d_hdr.strip() and _s_rest.strip():
+                    with open(_dst, "ab") as _fd:
+                        if _d_tail not in (b"\n", b""):
+                            _fd.write(b"\n")
+                        _fd.write(_s_rest)
+                    _n_rows = _s_rest.count(b"\n")
+                    print(f"  [DATA] {_fn}: дописано {_n_rows} рядк. з папки коду")
+                elif _s_rest.strip():
+                    _leg = os.path.join(DATA_DIR, f"{_fn}.legacy-migrated-{_ts}.csv")
+                    shutil.copy2(_src, _leg)
+                    print(f"  [DATA] {_fn}: інший заголовок -> {os.path.basename(_leg)}")
+                os.replace(_src, f"{_src}.migrated-{_ts}")
+                _moved += 1
         except Exception as _e:
             print(f"  [DATA] migrate {_fn}: {_e}")
     if _moved:
@@ -570,11 +603,14 @@ def hl_post_prio(body, retries=2, direct=False, max_wait=65.0, w_next=None):
     last_was_429 = False
     last_err = ""
     for attempt in range(retries):
-        _profile_budget_wait(via, w_, max_wait=max_wait)
+        if not _profile_budget_wait(via, w_, max_wait=max_wait):
+            # бюджет вікна вичерпано і за max_wait не звільнився: явна
+            # відмова, а не запит понад ліміт (аудит v2.14 №6)
+            raise RateLimited(f"prio budget ({via}) exhausted")
         try:
             with opener(req, timeout=10) as r:
                 out = json.loads(r.read())
-            _profile_budget_add(via, out, body)
+            _profile_budget_add(via, out, body, reserved=w_)
             return out
         except urllib.error.HTTPError as e:
             last_err = f"HTTP {e.code}"
@@ -1794,6 +1830,17 @@ def run_prio_fetcher():
                     if _prio_proxy_state["dead_since"]:
                         _prio_proxy_state["dead_since"] = 0.0
                         print("  [PRIO] проксі ожила — повертаюсь на неї")
+            except RateLimited as e:
+                # v2.15 (аудит v2.14 №6): бюджет вікна вичерпано (або 429
+                # після ретраїв) — запиту понад ліміт НЕ було. Це не «мертва
+                # проксі» і не 10-хв глухота: адреса у короткий кулдаун ~75с
+                # (вікно рефілу), як і при переповненні прямого каналу
+                prio_stats["dropped"] += 1
+                with _prio_lock:
+                    _prio_seen[addr] = time.time() - PRIO_COOLDOWN_S + 75
+                _prio_log(addr, coin0, pos_side, notional, depth0, thr,
+                          "budget", 0, "", via_proxy)
+                continue
             except Exception as e:
                 prio_stats["errors"] += 1
                 if via_proxy:
@@ -3373,6 +3420,7 @@ def _csv_written_keys():
     keys = set()
     specs = ((REV_CSV, "rev", ("sig_id", "strategy")),
              (TWAP_CSV, "twap", ("twap_id", "strategy")),
+             (TWAP_CURVE_CSV, "twapc", ("twap_id", "strategy")),
              (REV_OUT_CSV, "out", ("sig_id",)),
              (FOLLOW_OUT_CSV, "fo", ("fo_id",)),
              (FOLLOW_CSV, "fol", ("trade_id",)))
@@ -3428,6 +3476,21 @@ def load_state():
             # валідний JSON не тієї структури ([] тощо) — теж битий стан
             # (аудит v2.13 №8d: AttributeError поза захисним блоком)
             raise ValueError(f"state is {type(snap_).__name__}, not dict")
+        # структура полів (аудит v2.14 №8a-b): рядок замість saved_at чи
+        # список замість rev_open — битий стан, а не TypeError поза
+        # захистом; тоді пробуємо .bak
+        sa = snap_.get("saved_at", 0)
+        if isinstance(sa, bool) or not isinstance(sa, (int, float)):
+            raise ValueError(f"saved_at is {type(sa).__name__}")
+        for k in ("rev_open", "follow_open", "twap_reg", "twap_last_ids",
+                  "strat_activated", "watchlist", "follow_last_close",
+                  "vault_cache", "fill_cursor", "close_episodes"):
+            if k in snap_ and not isinstance(snap_[k], dict):
+                raise ValueError(f"{k} is {type(snap_[k]).__name__}, not dict")
+        for k in ("sim_positions", "sim_trackers", "sim_closed", "recent_alerts",
+                  "sent_alerts", "fc_positions", "fc_episodes"):
+            if k in snap_ and not isinstance(snap_[k], list):
+                raise ValueError(f"{k} is {type(snap_[k]).__name__}, not list")
         return snap_
     snap = None
     try:
@@ -3497,7 +3560,20 @@ def load_state():
                 for _pid, _p in _src.items():
                     if not isinstance(_p, dict):
                         continue
-                    if _tracker_csv_key(_cn, _pid, _p) in written:
+                    _key = _tracker_csv_key(_cn, _pid, _p)
+                    if _key[0] == "twap":
+                        # v2.15: угода записана — трекер відновлюється лише
+                        # для кривої (рядок угоди НЕ переписується); крива
+                        # теж записана — трекер завершений
+                        if ("twapc",) + _key[1:] in written:
+                            skipped.append(str(_pid))
+                            continue
+                        if _key in written:
+                            _p["trade_written"] = 1
+                            _p["trade_row"] = None
+                        _coll[_pid] = _p
+                        continue
+                    if _key in written:
                         skipped.append(str(_pid))
                         continue
                     _coll[_pid] = _p
@@ -3901,11 +3977,13 @@ STRAT_SINCE = {
     # слайсу — рядки T1/T2 з 2.12 не порівнянні
     # v2.14: completed лише за повним виконанням, вихід timer_late при
     # відсутній m60, закриття угоди ≠ спостереження, неокруглений рух
-    # когорт, вхід лише зі свіжою успішною звіркою — рядки T1/T2 з 2.13
-    # не порівнянні
-    F8_NAME: "2.12", F9_NAME: "2.11", T1_NAME: "2.14", T2_NAME: "2.14",
-    T1_NAME + "_15": "2.14", T1_NAME + "_20": "2.14",
-    T2_NAME + "_15": "2.14", T2_NAME + "_20": "2.14",
+    # когорт, вхід лише зі свіжою успішною звіркою.
+    # v2.15: рядок угоди у момент виходу (крива окремо), вихід при
+    # скасуванні — коли дізнались (не заднім числом), перший філ за
+    # ланцюгом позицій — рядки T1/T2 з 2.14 не порівнянні
+    F8_NAME: "2.12", F9_NAME: "2.11", T1_NAME: "2.15", T2_NAME: "2.15",
+    T1_NAME + "_15": "2.15", T1_NAME + "_20": "2.15",
+    T2_NAME + "_15": "2.15", T2_NAME + "_20": "2.15",
 }
 TAPE_SINCE = "2.10"
 # ── ПРОФІЛЬ ШВИДКИХ ГАМАНЦІВ (ТЗ 01.09 п.2) ──
@@ -3943,7 +4021,7 @@ PROFILE_ALGO_V   = 9      # версія алгоритму профілів: с
                           # (лише ≥$100k) — кваліфікація F7, ТЗ 04.09;
                           # v9: бік "Short > Long" — SHORT, глибина з
                           # правильної сторони (аудит v2.10 №8))
-DATA_ALGO_V      = "2.14" # версія логіки збору: трекер отримує її при
+DATA_ALGO_V      = "2.15" # версія логіки збору: трекер отримує її при
                           # СТВОРЕННІ і несе у рядок; API рахує лише
                           # поточну версію (аудит v2.2: рестарт підписував
                           # старі трекери новою версією). При зміні
@@ -5112,9 +5190,11 @@ def _hl_weight(body, resp=None):
     return 20 + (len(resp) // 20 if isinstance(resp, list) else 0)
 
 def _profile_budget_wait(via, w_next=120, max_wait=65.0):
-    """Спати, доки вага останніх 60с по каналу + очікувана вага запиту
-    не вкладеться у стелю. Стеля очікування max_wait (одне вікно для
-    профілів; TWAP перед входом — секунди)."""
+    """Резервує вагу w_next у вікні каналу АТОМАРНО — під локом, у момент
+    рішення — і повертає True; якщо за max_wait місце не звільнилось —
+    False, і викликач НЕ надсилає запит (аудит v2.14 №6: після стелі
+    очікування запит ішов понад ліміт, два паралельні запити бачили ті
+    самі вільні одиниці, спроба з 429 не рахувалась)."""
     cap = PROFILE_W_PER_MIN[via]
     deadline = time.time() + max_wait
     while True:
@@ -5124,15 +5204,22 @@ def _profile_budget_wait(via, w_next=120, max_wait=65.0):
             while dq and dq[0][0] < now_ - 60:
                 dq.popleft()
             used = sum(w for _, w in dq)
+            if used + w_next <= cap:
+                dq.append((now_, w_next))   # резерв — ДО запиту, на кожну спробу
+                return True
             oldest = dq[0][0] if dq else now_
-        if used + w_next <= cap or now_ >= deadline:
-            return
+        if now_ >= deadline:
+            return False
         time.sleep(min(5.0, max(0.5, min(oldest + 60 - now_, deadline - now_))))
 
-def _profile_budget_add(via, batch, body=None):
+def _profile_budget_add(via, batch, body=None, reserved=0):
+    """Фактична вага відповіді: перевищення над резервом дописується;
+    резерв при збої лишається (біржа могла зарахувати запит)."""
     w = _hl_weight(body if body is not None else {"type": "userFillsByTime"}, batch)
-    with _profile_w_lock:
-        _profile_w[via].append((time.time(), w))
+    extra = w - (reserved or 0)
+    if extra > 0:
+        with _profile_w_lock:
+            _profile_w[via].append((time.time(), extra))
 
 def _profile_post(body):
     """Сторінка історії: через REST-проксі (rest_proxy.txt), якщо вона
@@ -5157,9 +5244,10 @@ def _profile_post(body):
         except Exception as e:
             _profile_proxy["dead_until"] = time.time() + 1800
             print(f"  [F4] проксі історії: {e} — 30 хв напряму")
-    _profile_budget_wait("direct")
+    if not _profile_budget_wait("direct", 120):
+        raise RateLimited("profile budget (direct) exhausted")
     r = hl_post(body, retries=2)
-    _profile_budget_add("direct", r)
+    _profile_budget_add("direct", r, reserved=120)
     return r
 
 def _fetch_profile(addr):
@@ -5311,18 +5399,32 @@ def run_strat2_loop():
         # диска міняв exit/net завершеної угоди (аудит v2.2 п.1).
         # done не блокує busy; після WFAIL_CAP ретраїв — дроп із логом.
         # Дублі після краху знімає дедуп по sig_id/trade_id у strat2_api.
-        rev_rows, fol_rows = [], []
+        rev_rows, fol_rows, tw_rows = [], [], []
         with strat2_lock:
             for pid, p in list(rev_open.items()):
                 if p.get("done"):
+                    if p.get("row_kind") == "twap":
+                        # v2.15 (аудит v2.14 №1): угода TWAP пишеться ОКРЕМИМ
+                        # рядком у момент вирішеного виходу (нижче); тут —
+                        # лише крива (twap_curves.csv). Рядок угоди ще не
+                        # записаний (рестарт зі старого state, збій диска) —
+                        # спершу він, крива наступним тиком: трекер не
+                        # видаляється, доки не записані обидва
+                        if not p.get("trade_written"):
+                            if p.get("trade_row") is None:
+                                p["trade_closed_ts"] = p.get("trade_closed_ts") or now
+                                p["trade_row"] = _twap_row(p, now)
+                                _twap_freeze_exit(p)
+                            tw_rows.append((pid, p["trade_row"]))
+                            continue
+                        if (p.get("final_row") is None
+                                or len(p["final_row"]) != len(TWAP_CURVE_HEADERS) - 1):
+                            # заморожений рядок старої схеми (рестарт після
+                            # апдейту) — перебудувати з тих самих семплів
+                            p["final_row"] = _twap_curve_row(p)
+                        rev_rows.append((pid, "twapc", p["final_row"]))
+                        continue
                     if p.get("final_row") is not None:
-                        if (p.get("row_kind") == "twap"
-                                and len(p["final_row"]) != len(TWAP_HEADERS) - 1):
-                            # заморожений рядок СТАРОЇ схеми (рестарт після
-                            # апдейту з іншими заголовками): перебудувати з
-                            # тих самих заморожених семплів, а не дропати
-                            # після WFAIL_CAP відмов (рев'ю v2.12 №6b)
-                            p["final_row"] = _twap_row(p)
                         rev_rows.append((pid, p.get("row_kind", "rev"),
                                          p["final_row"]))
                     else:
@@ -5334,8 +5436,6 @@ def run_strat2_loop():
                         elif p["strategy"] == "_FOLLOW_OUT":
                             p["row_kind"] = "fo"
                             p["final_row"] = _fol_out_row(p)
-                        elif p.get("row_kind") == "twap":
-                            p["final_row"] = _twap_row(p)
                         else:
                             p["row_kind"] = "rev"
                             p["final_row"] = _rev_row(
@@ -5390,6 +5490,16 @@ def run_strat2_loop():
                         break
                     else:
                         p["samples"].append("")
+                # v2.15 (аудит v2.14 №1/№5): TWAP-угода закривається у момент
+                # ВИРІШЕНОГО виходу (_twap_exit) — рядок угоди заморожується
+                # і пишеться одразу; далі трекер веде лише криву
+                if p.get("row_kind") == "twap" and not p.get("trade_written"):
+                    if p.get("trade_row") is None and _twap_exit(p, now) is not None:
+                        p["trade_closed_ts"] = now
+                        p["trade_row"] = _twap_row(p, now)
+                        _twap_freeze_exit(p)
+                    if p.get("trade_row") is not None:
+                        tw_rows.append((pid, p["trade_row"]))
                 if len(p["samples"]) >= _tm:
                     p["done"] = 1
                     if p["strategy"] == "_OUTCOME":
@@ -5399,7 +5509,12 @@ def run_strat2_loop():
                         p["row_kind"] = "fo"
                         p["final_row"] = _fol_out_row(p)
                     elif p.get("row_kind") == "twap":
-                        p["final_row"] = _twap_row(p)
+                        p["final_row"] = _twap_curve_row(p)
+                        # криву пишемо лише після записаної угоди (порядок
+                        # гарантує done-гілка наступного тику)
+                        if p.get("trade_written"):
+                            rev_rows.append((pid, "twapc", p["final_row"]))
+                        continue
                     else:
                         p["row_kind"] = "rev"
                         p["final_row"] = _rev_row(p, 1)
@@ -5470,11 +5585,31 @@ def run_strat2_loop():
                 ok = _strat_csv_append(REV_OUT_CSV, REV_OUT_HEADERS, r)
             elif kind == "fo":
                 ok = _strat_csv_append(FOLLOW_OUT_CSV, FOLLOW_OUT_HEADERS, r)
+            elif kind == "twapc":
+                ok = _strat_csv_append(TWAP_CURVE_CSV, TWAP_CURVE_HEADERS, r)
             elif kind == "twap":
                 ok = _strat_csv_append(TWAP_CSV, TWAP_HEADERS, r)
             else:
                 ok = _strat_csv_append(REV_CSV, REV_HEADERS, r)
             (written_rev if ok else failed_rev).append(pid)
+        # рядки TWAP-угод у момент виходу (v2.15): трекер лишається (крива),
+        # але результат уже незмінний на диску
+        written_tw = []
+        for pid, r in tw_rows:
+            if _strat_csv_append(TWAP_CSV, TWAP_HEADERS, r):
+                written_tw.append(pid)
+        if tw_rows:
+            with strat2_lock:
+                for pid, _ in tw_rows:
+                    it = rev_open.get(pid)
+                    if it is None: continue
+                    if pid in written_tw:
+                        it["trade_written"] = 1
+                    else:
+                        it["twfail"] = it.get("twfail", 0) + 1
+                        if it["twfail"] in (1, 10, 100):
+                            print(f"  [STRAT] TWAP-угода {pid}: запис не вдався "
+                                  f"({it['twfail']}), повторю")
         for fid, r in fol_rows:
             ok = _strat_csv_append(FOLLOW_CSV, FOLLOW_HEADERS, r)
             (written_fol if ok else failed_fol).append(fid)
@@ -5494,7 +5629,7 @@ def run_strat2_loop():
                         coll.pop(pid, None)
                         print(f"  [STRAT] DROP незаписаний трекер {pid} "
                               f"після {WFAIL_CAP} спроб (диск?)")
-        if written_rev or written_fol:
+        if written_rev or written_fol or written_tw:
             # СИНХРОННО (v2.14, аудит v2.13 №1): вікно «рядок у CSV, а
             # трекер ще у state.json» — мілісекунди, а не «коли потік
             # добереться»; залишок вікна закриває звірка при load_state
@@ -5526,7 +5661,6 @@ def strat2_api():
     # криву до 120 хв, — не «відкрита»: її результат уже є (pending-рядок)
     with strat2_lock:
         _open_keys = {}
-        _tw_pending = []
         for _k, _p in rev_open.items():
             if _p.get("done") or _p.get("state", "open") != "open":
                 continue
@@ -5534,13 +5668,7 @@ def strat2_api():
             if not _v_ok(_p.get("algo_v"), STRAT_SINCE.get(_st, DATA_ALGO_V)):
                 continue
             if _p.get("row_kind") == "twap" and _twap_trade_closed(_p, now):
-                try:
-                    _row = dict(zip(TWAP_HEADERS[:-1], _twap_row(_p)))
-                    _row["pending"] = "1"
-                    _tw_pending.append(_row)
-                except Exception as _pe:
-                    print(f"  [STRAT] pending twap {_k}: {_pe}")
-                continue
+                continue   # угода закрита (рядок уже/от-от у CSV), триває лише крива
             _open_keys.setdefault(_st, set()).add(_tracker_csv_key("rev", _k, _p))
         for _k, _p in follow_open.items():
             if _p.get("done"):
@@ -5713,12 +5841,12 @@ def strat2_api():
     legacy_rows = (n_before - (len(rev) + len(sigs) + len(fol)
                                + len(outs) + len(fouts) + len(tw) + len(tws))
                    + legacy_old[0])
-    # pending TWAP-рядки (угода закрита, крива ще спостерігається): у
-    # вибірку, якщо такого ключа ще нема у CSV (v2.14, аудит v2.13 №5)
-    if _tw_pending:
-        _have = {(r.get("twap_id"), r.get("strategy")) for r in tw}
-        tw = tw + [r for r in since_strat(_tw_pending)
-                   if (r.get("twap_id"), r.get("strategy")) not in _have]
+    # v2.15: рядки угод пишуться у момент виходу (pending-синтез не
+    # потрібен); криві 120 хв — окремий файл, по ключу угоди
+    twc_all = dedup(read(TWAP_CURVE_CSV),
+                    lambda r: ((r.get("twap_id"), r.get("strategy"))
+                               if r.get("twap_id") and r.get("strategy") else None))
+    _tw_curves = {(r.get("twap_id"), r.get("strategy")): r for r in twc_all}
     # відкриті зараз входи — лише ті, яких ще НЕМА у CSV (унікальний
     # облік: аварійний дубль не дає «2 входи/день»; аудит v2.13 №8a)
     _csv_keys = ({("rev", r.get("sig_id"), r.get("strategy")) for r in rev}
@@ -5799,7 +5927,10 @@ def strat2_api():
                 # позначкою запізнення (v2.14, аудит v2.13 №6) — угода
                 # не випадає з PnL-вибірки, а аналіз бачить late_exit
                 late_exit = 0
-                if n30 is None:
+                # лише для рядків, зібраних із цим правилом (≥2.14): старі
+                # R-рядки не міняють інтерпретацію без зміни версії
+                # (аудит v2.14, методика)
+                if n30 is None and _vt(r.get("algo_v")) >= (2, 14):
                     for _j in (31, 32, 33):
                         n30 = fnum(r.get(f"m{_j}"))
                         if n30 is not None:
@@ -5957,7 +6088,11 @@ def strat2_api():
         complete = []
         for r in rs:
             costs = fnum(r.get("costs_pct"), 0.15) or 0.15
-            vals = [fnum(r.get(f"m{i + 1}")) for i in range(TWAP_TRACK_MIN)]
+            # v2.15: крива 120 хв — з twap_curves.csv (по ключу угоди); поки
+            # трекер її ще веде — перші 60 хв із рядка угоди
+            cr = _tw_curves.get((r.get("twap_id"), r.get("strategy")))
+            src_ = cr if cr is not None else r
+            vals = [fnum(src_.get(f"m{i + 1}")) for i in range(TWAP_TRACK_MIN)]
             for i, v in enumerate(vals):
                 if v is not None:
                     curve[i].append(v - costs)
@@ -6030,7 +6165,8 @@ def strat2_api():
                 "exit_reason": r.get("exit_reason") or "",
                 "exit_min": fnum(r.get("exit_min")),
                 "px_src": f"{r.get('p0_src') or '?'}/{r.get('p1_src') or '?'}",
-                "pending": fnum(r.get("pending"), 0),
+                "cancel_event_min": fnum(r.get("cancel_event_min")),
+                "exit_ts": r.get("exit_ts") or "",
                 "wallet": (r.get("whale_addr") or "")[:10], "entered": 1}
                 for r in rs]
         cohorts = {str(thr): _tw_block([r for r in fam
@@ -6044,7 +6180,10 @@ def strat2_api():
                 _cn, _crows, "date_entry", len(_crows) + _open_by_st.get(_cn, 0))
             cohorts[str(thr)]["open_now"] = _open_by_st.get(_cn, 0)
             cohorts[str(thr)]["trades"] = _tw_trades(_crows)[-120:]
-            cohorts[str(thr)]["n_pending"] = sum(1 for r in _crows if r.get("pending"))
+            cohorts[str(thr)]["n_late"] = sum(
+                1 for r in _crows if (r.get("exit_reason") or "").endswith("_late"))
+            cohorts[str(thr)]["n_no_price"] = sum(
+                1 for r in _crows if r.get("exit_reason") == "no_price")
         base = cohorts[str(TWAP_COHORTS[0])]
         trades = base["trades"]
         out["strategies"][st] = dict(base, **{
@@ -6077,7 +6216,8 @@ def strat2_api():
                        channels={ch: {"last_id": twap_last_ids.get(ch, 0),
                                       "ok_ago_s": (round(now - s["ok_ts"], 0)
                                                    if s["ok_ts"] else None),
-                                      "err": s["err"]}
+                                      "err": s["err"],
+                                      "gaps": len(s.get("gaps") or [])}
                                  for ch, s in _twap_ch_state.items()},
                        signals_total=len(tws),
                        signals_eligible=sum(1 for r in tws
@@ -6090,7 +6230,10 @@ def strat2_api():
               "age_s": round(now - p.get("entry_ts", p["detect_ts"]), 0)}
              for p in rev_open.values()
              if not p["strategy"].startswith("_") and not p.get("done")
-             and p.get("state", "open") == "open"]
+             and p.get("state", "open") == "open"
+             # v2.15 (аудит v2.14 №5c): закрита TWAP-угода, що ще веде
+             # криву, — не «у ринку»
+             and not (p.get("row_kind") == "twap" and _twap_trade_closed(p, now))]
             + [{"strategy": p["strategy"], "coin": p["coin"], "state": "open",
                 "age_s": round(now - p["open_ts"], 0)}
                for p in follow_open.values() if not p.get("done")])
@@ -6263,16 +6406,29 @@ TWAP_SIG_HEADERS = ["twap_id", "date", "src", "posts", "addr", "coin",
                     "pos_usd", "eligible", "cancelled", "completed", "p0",
                     "p0_src", "p1", "p1_src", "move_pct", "result", "strategy",
                     "algo_v", "eol"]
+# v2.15 (аудит v2.14 №1, №5): рядок УГОДИ пишеться у момент вирішеного
+# paper-виходу (ціна хвилини виходу / перша наступна в межах
+# TWAP_EXIT_CAP_MIN / кап без ціни) і більше не змінюється; крива до 120 хв
+# — ОКРЕМИЙ файл twap_curves.csv, дописується при завершенні трекера.
+# cancel_event_min — хвилина самої події скасування (біржа/пост), для
+# дослідження; exit_min — хвилина paper-виходу (не раніше, ніж дізнались)
+TWAP_EXIT_CAP_MIN = 5             # без ціни на хвилині виходу: до 5 наступних
 TWAP_HEADERS     = (["twap_id", "strategy", "date_entry", "coin", "our_side",
                      "twap_side", "whale_addr", "src", "usd", "dur_s", "kind",
                      "kind_src", "exch_id", "start_pos",
                      "pos_usd", "move_pct", "p0", "p0_src", "p1", "p1_src",
                      "entry_px", "net60_pct", "costs_pct", "peak_pct",
                      "trough_pct", "cancel_after_entry", "completed",
-                     "exit_min", "exit_reason", "exch_status", "exec_pct",
+                     "exit_min", "exit_reason", "cancel_event_min", "exit_ts",
+                     "exch_status", "exec_pct",
                      "btc_move_pct", "hour", "algo_v"]
-                    + [f"m{i}" for i in range(1, TWAP_TRACK_MIN + 1)]
+                    + [f"m{i}" for i in range(1, TWAP_HOLD_MIN + 1)]
                     + ["eol"])
+TWAP_CURVE_CSV   = os.path.join(DATA_DIR, "twap_curves.csv")
+TWAP_CURVE_HEADERS = (["twap_id", "strategy", "date_entry", "coin", "our_side",
+                       "exit_min", "algo_v"]
+                      + [f"m{i}" for i in range(1, TWAP_TRACK_MIN + 1)]
+                      + ["eol"])
 
 twap_lock     = threading.Lock()
 twap_reg      = {}     # twap_id -> запис (див. _twap_register)
@@ -6571,7 +6727,10 @@ def _twap_find_all(addr, coin, side=None, near_ts=None, usd=None,
             continue
         du = (abs(r["usd"] - usd) / r["usd"]
               if (usd is not None and r.get("usd")) else None)
-        if du is not None and du > 0.15 and (not addr or len(addr) < 42):
+        # сума з поста — ЗАВЖДИ обмеження, і за повної адреси (аудит v2.14
+        # №4b: «closed by user $2.84m» гасив єдиний відомий $100k-твап
+        # гаманця); ±2% покриває округлення сум у постах каналів
+        if du is not None and du > 0.02:
             continue
         out.append(r)
     return out
@@ -6596,10 +6755,12 @@ def _twap_register(channel, pid, p, now):
             if (r_["coin"] != p["coin"] or r_["addr"] != p["addr"]
                     or r_["side"] != p["side"]
                     or channel in r_["src"].split("+")
-                    # dropped БЕЗ id біржі — не зливаємо (нова заявка дістане
-                    # власну звірку); dropped З id — той самий твап, дубль
-                    # поста не має рахуватись другим сигналом (рев'ю v2.14)
-                    or (r_["state"] == "dropped" and r_.get("twap_id") is None)
+                    # у dropped НЕ зливаємо взагалі (аудит v2.14 №4a: відомий
+                    # id старої заявки не доводить, що новий пост про неї —
+                    # $101k через 10с успадковував скасування); справжній
+                    # дубль знімає _twap_dedup_by_id по id біржі БЕЗ другого
+                    # сигналу
+                    or r_["state"] == "dropped"
                     or abs(r_["start"] - p["start"]) > TWAP_XCH_START_S
                     or abs((r_.get("dur") or 0) - (p.get("dur") or 0)) > TWAP_XCH_DUR_S):
                 continue
@@ -6713,6 +6874,33 @@ def _twap_candle_close(coin, cutoff):
         _twap_candle_miss.pop(key, None)
     return px
 
+def _twap_chain_head(mine):
+    """Перший філ твапу за ЛАНЦЮГОМ позицій (v2.15, аудит v2.14 №3): для
+    кожного філу end = startPosition ± sz за боком (B: +, A: −); голова —
+    філ, чий startPosition не дорівнює end жодного іншого. Рівно одна
+    голова → вона; нуль або кілька (діра в історії, філ без
+    startPosition) → None, і вид твапу лишається недоведеним."""
+    items = []
+    for f in mine:
+        if not isinstance(f, dict):
+            continue
+        try:
+            sp = float(f["startPosition"])
+            sz = float(f.get("sz") or 0)
+        except (KeyError, TypeError, ValueError):
+            return None
+        if sz <= 0:
+            continue
+        sign = 1.0 if f.get("side") == "B" else -1.0
+        items.append((f, sp, sp + sign * sz))
+    if not items:
+        return None
+    def _eq(a, b):
+        return abs(a - b) <= 1e-9 * max(1.0, abs(a), abs(b))
+    heads = [it for it in items
+             if not any(o is not it and _eq(it[1], o[2]) for o in items)]
+    return heads[0][0] if len(heads) == 1 else None
+
 def _twap_verify(rec, now, slices=True):
     """Звірка запису з біржею (v2.12, з рев'ю CH; уточнено v2.13).
     twapHistory: запис тієї ж монети/боку зі стартом ±10с І тією ж
@@ -6823,16 +7011,22 @@ def _twap_verify(rec, now, slices=True):
         if oldest > rec["start"]:
             rec["kind_src"] = "unproven"
             return True
+    # перший філ — голова ЛАНЦЮГА позицій (startPosition/розміри), а не
+    # min(time, tid): tid — хеш, не порядковий номер (аудит v2.14 №3: два
+    # філи одного слайсу з однаковим часом — «перший» обирався навмання,
+    # open ставав increase, reduce — flip)
+    first = _twap_chain_head(mine)
+    if first is None:
+        rec["kind_src"] = "unproven"
+        return True
     try:
-        first = min(mine, key=lambda f: (float(f.get("time") or 0),
-                                         float(f.get("tid") or 0)))
         first_t = float(first.get("time") or 0) / 1000.0
-        sp_raw = first.get("startPosition")
-        sp = float(sp_raw) if sp_raw is not None else None
+        sp = float(first.get("startPosition"))
         px0 = float(first.get("px") or 0)
     except (TypeError, ValueError):
+        rec["kind_src"] = "unproven"
         return True
-    if sp is None or first_t - rec["start"] > TWAP_FIRST_SLICE_S:
+    if first_t - rec["start"] > TWAP_FIRST_SLICE_S:
         rec["kind_src"] = "unproven"
         return True
     qty = rec["target_sz"] or 0
@@ -6874,6 +7068,12 @@ def _twap_sig_write(rec, result):
            result, rec["strategy"], DATA_ALGO_V]
     if _strat_csv_append(TWAP_SIG_CSV, TWAP_SIG_HEADERS, row):
         rec["sig_written"] = 1
+    else:
+        # відмова диска — в outbox (ретрай у циклі трекерів), а не втрата
+        # рядка журналу (аудит v2.14 №8d)
+        with _sig_retry_lock:
+            _sig_retry_q.append([TWAP_SIG_CSV, TWAP_SIG_HEADERS, list(row), 0])
+        rec["sig_written"] = 1
 
 def _twap_drop(rec, reason):
     rec["state"] = "dropped"
@@ -6888,23 +7088,41 @@ def _twap_cohort_name(base, thr):
     return base + TWAP_COHORT_SUFFIX[thr]
 
 def _twap_close_min(tr):
-    """Хвилина ФАКТИЧНОГО закриття paper-угоди: хвилина скасування (≤60)
-    або таймер m60. Спостереження кривої триває до 120 хв, але угода
-    закінчується тут (v2.14, аудит v2.13 №5)."""
+    """Планова хвилина закриття paper-угоди: хвилина скасування (≤60,
+    коли бот ДІЗНАВСЯ) або таймер m60. Спостереження кривої триває до
+    120 хв, але угода закінчується тут (v2.14, аудит v2.13 №5)."""
     xm = int((tr.get("twap") or {}).get("exit_min") or 0)
     return xm if 1 <= xm <= TWAP_HOLD_MIN else TWAP_HOLD_MIN
 
-def _twap_trade_closed(tr, now):
-    """Угода закрита (монета вільна, результат відомий), хоч трекер ще
-    веде криву до TWAP_TRACK_MIN: семпл хвилини виходу вже записаний або
-    минув і 30-с допуск ціни (рев'ю v2.14: інакше на самій межі 60-ї
-    хвилини pending-рядок був порожнім)."""
-    et = tr.get("entry_ts") or 0
-    if not et:
-        return False
+def _twap_exit(tr, now):
+    """ЄДИНИЙ факт виходу (v2.15, аудит v2.14 №1/№5): (exit_min, reason,
+    mx) або None, поки вихід не вирішено. Ціна хвилини виходу є → вона;
+    нема — перша наступна хвилина з ціною в межах TWAP_EXIT_CAP_MIN
+    (timer_late / cancelled_late); нема й після капу — вихід без ціни
+    (no_price, результат порожній). Саме цей факт керує записом рядка
+    угоди, зайнятістю монети, open_now і списком відкритих — угода не
+    вважається закритою, доки її вихід не відомий (нова угода не могла
+    відкритись раніше за вихід попередньої)."""
+    tw = tr.get("twap") or {}
+    s = tr.get("samples") or []
     cm = _twap_close_min(tr)
-    return (len(tr.get("samples") or ()) >= cm
-            or now - et >= cm * 60.0 + 35.0)
+    xm = int(tw.get("exit_min") or 0)
+    base = ((tw.get("exit_reason") or "cancelled") if 1 <= xm <= TWAP_HOLD_MIN
+            else "timer_60m")
+    if len(s) >= cm and s[cm - 1] != "":
+        return cm, base, s[cm - 1]
+    for k in range(cm + 1, min(len(s), cm + TWAP_EXIT_CAP_MIN) + 1):
+        if s[k - 1] != "":
+            return k, ("timer_late" if base == "timer_60m" else "cancelled_late"), s[k - 1]
+    et = tr.get("entry_ts") or 0
+    if et and now - et >= (cm + TWAP_EXIT_CAP_MIN) * 60.0 + 35.0:
+        return cm, "no_price", None
+    return None
+
+def _twap_trade_closed(tr, now):
+    """Угода закрита: рядок уже записаний/заморожений або вихід вирішено."""
+    return (bool(tr.get("trade_written")) or tr.get("trade_row") is not None
+            or _twap_exit(tr, now) is not None)
 
 def _twap_trackers(rec):
     """Ключі трекерів запису (когорти); старі записи — один ключ."""
@@ -6931,25 +7149,34 @@ def _twap_sync_trackers(rec):
             tw["exch_status"] = rec.get("exch") or ""
             tw["exec_pct"] = exec_pct
             if rec["cancel_after_entry"]:
-                # хвилина виходу — з часу ревізії біржі, коли він відомий
-                # (рев'ю v2.13 №3: після рестарту «хвилина, коли дізнались»
-                # була пізніша за фактичне скасування); інакше — наступна
-                # хвилина після поточного семплу
-                xm = None
+                # v2.15 (аудит v2.14 №2): paper-вихід — НЕ раніше, ніж бот
+                # ДІЗНАВСЯ про скасування: наступна хвилина після поточного
+                # семплу в момент отримання сигналу (v2.14 брала час події
+                # з біржі/поста і виходила заднім числом за ціною, якої ще
+                # не міг знати). Час самої події — окремо, для дослідження
+                # (cancel_event_min); закриту угоду (рядок уже записаний)
+                # пізнє скасування не змінює
                 _et = tr.get("entry_ts") or 0
                 _cts = None
                 if rec.get("exch_cancelled") and rec.get("exch_ts"):
                     _cts = rec["exch_ts"]            # ревізія біржі
                 elif rec.get("tg_fin_ts"):
-                    _cts = rec["tg_fin_ts"]          # «Time:» з поста каналу (v2.14)
-                if _cts and _et and _cts > _et:   # час до входу — не час скасування
-                    xm = int(math.ceil((_cts - _et) / 60.0))
-                    xm = max(1, min(xm, TWAP_TRACK_MIN))
-                if not tw.get("exit_min"):
-                    tw["exit_min"] = xm or min(len(tr["samples"]) + 1, TWAP_TRACK_MIN)
+                    _cts = rec["tg_fin_ts"]          # «Time:» з поста каналу
+                if _cts and _et and _cts > _et:
+                    _em = max(1, min(int(math.ceil((_cts - _et) / 60.0)), TWAP_TRACK_MIN))
+                    if not tw.get("cancel_event_min") or _em < tw["cancel_event_min"]:
+                        tw["cancel_event_min"] = _em
+                if not tw.get("exit_min") and not tr.get("trade_written") \
+                        and tr.get("trade_row") is None:
+                    # хвилина, коли дізнались: не раніше поточної хвилини за
+                    # годинником (семпли можуть відставати — пропуск ціни у
+                    # 30-с допуску ще не закріплений)
+                    _now_min = (int(math.ceil((time.time() - _et) / 60.0))
+                                if _et else 1)
+                    tw["exit_min"] = min(max(len(tr["samples"]) + 1, _now_min, 1),
+                                         TWAP_TRACK_MIN)
                     tw["exit_reason"] = "cancelled"
-                elif xm and xm < tw["exit_min"]:
-                    tw["exit_min"] = xm   # біржа знає точніший (раніший) час
+                    tw["cancel_seen_min"] = tw["exit_min"]
 
 def _twap_cancel_after_entry(rec):
     rec["cancel_after_entry"] = 1
@@ -7062,6 +7289,13 @@ def _twap_dedup_by_id(rec):
                 break
         else:
             return False
+    # дубль поста — не сигнал: без рядка у twap_signals і без другого
+    # «старту» у лічильниках (v2.15; у dropped-записи більше не зливаємо)
+    rec["sig_written"] = 1
+    twap_stats["starts"] = max(0, twap_stats.get("starts", 0) - 1)
+    if rec.get("eligible"):
+        twap_stats["eligible"] = max(0, twap_stats.get("eligible", 0) - 1)
+    twap_stats["dup_posts"] = twap_stats.get("dup_posts", 0) + 1
     _twap_drop(rec, "dup_twapid")
     return True
 
@@ -7269,6 +7503,10 @@ def _twap_ingest(channel, pid, ts, text, now, reply="", seen=False,
                     rec = found[0]
                 elif len(found) > 1:
                     twap_stats["fin_ambiguous"] = twap_stats.get("fin_ambiguous", 0) + 1
+                else:
+                    # без id і без жодного кандидата: чужий/старий твап —
+                    # лічимо, щоб бачити частку «сліпих» фіналів у /status
+                    twap_stats["fin_nomatch"] = twap_stats.get("fin_nomatch", 0) + 1
     if rec is None and cands:
         for r_ in cands:
             try:
@@ -7326,34 +7564,22 @@ def _twap_ingest(channel, pid, ts, text, now, reply="", seen=False,
     elif rec["state"] == "entered":
         _twap_cancel_after_entry(rec)
 
-def _twap_row(p):
-    """Рядок twap_trades.csv для завершеного трекера (120 хв). Вихід —
-    m60 (timer_60m) або хвилина скасування (cancelled, ≤60); крива до
-    120 хв — гіпотетичні виходи, не продовження угоди."""
+def _twap_row(p, now=None):
+    """Рядок twap_trades.csv — пишеться у момент ВИРІШЕНОГО paper-виходу
+    (v2.15): m60 (timer_60m), хвилина скасування, коли бот про нього
+    дізнався (cancelled), або перша наступна хвилина з ціною
+    (timer_late / cancelled_late), чи без ціни після капу (no_price).
+    Крива до 120 хв — окремо у twap_curves.csv."""
     slip = _sim_slip(p.get("depth") or 0)
     costs = (2 * SIM_COMMISSION + 2 * slip) * 100.0
     tw = p.get("twap") or {}
     s = p["samples"]
-    xm = int(tw.get("exit_min") or 0)
-    exit_min, exit_reason, mx = TWAP_HOLD_MIN, "timer_60m", None
-    if 1 <= xm <= TWAP_HOLD_MIN:
-        exit_min, exit_reason = xm, (tw.get("exit_reason") or "cancelled")
-        # хвилина скасування без ціни -> перша наступна з ціною (≤60)
-        for k in range(xm, TWAP_HOLD_MIN + 1):
-            if len(s) >= k and s[k - 1] != "":
-                mx, exit_min = s[k - 1], k
-                break
-    else:
-        if len(s) >= TWAP_HOLD_MIN and s[TWAP_HOLD_MIN - 1] != "":
-            mx = s[TWAP_HOLD_MIN - 1]
-        else:
-            # m60 без ціни (збій котирувань на дедлайні): paper-вихід —
-            # перша наступна хвилина з ціною, з явною позначкою
-            # (v2.14, аудит v2.13 №6: угода випадала з PnL-вибірки)
-            for k in range(TWAP_HOLD_MIN + 1, TWAP_TRACK_MIN + 1):
-                if len(s) >= k and s[k - 1] != "":
-                    mx, exit_min, exit_reason = s[k - 1], k, "timer_late"
-                    break
+    # v2.15: вихід — з єдиного резолвера (_twap_exit); рядок пишеться у
+    # момент вирішеного виходу і більше не змінюється (аудит v2.14 №1)
+    ex = _twap_exit(p, now if now is not None else time.time())
+    if ex is None:
+        ex = (_twap_close_min(p), "no_price", None)
+    exit_min, exit_reason, mx = ex
     bm = p.get("btc_move")
     def _n(v, nd=None):
         if v is None or v == "": return ""
@@ -7371,10 +7597,45 @@ def _twap_row(p):
              (round(p["peak"], 4) if p["peak"] > -999 else ""),
              (round(p["trough"], 4) if p["trough"] < 999 else ""),
              tw.get("cancel_after_entry", 0), tw.get("completed", 0),
-             exit_min, exit_reason, tw.get("exch_status", ""),
+             exit_min, exit_reason, _n(tw.get("cancel_event_min")),
+             _dt(p.get("trade_closed_ts")) if p.get("trade_closed_ts") else "",
+             tw.get("exch_status", ""),
              _n(tw.get("exec_pct")),
              (round(bm, 3) if bm is not None else ""), p.get("hour", ""),
              p.get("algo_v", "")]
+            + [("" if x == "" else round(x, 4)) for x in s[:TWAP_HOLD_MIN]]
+            + [""] * (TWAP_HOLD_MIN - min(len(s), TWAP_HOLD_MIN)))
+
+def _twap_freeze_exit(p):
+    """Після заморозки рядка угоди зберегти вирішений вихід окремо у
+    трекері (tw["exit_final"] = [exit_min, exit_reason]): крива та API
+    беруть його звідти й не залежать від позиції колонки у рядку (v2.15)."""
+    tr_row = p.get("trade_row")
+    tw = p.get("twap")
+    if not tr_row or not isinstance(tw, dict):
+        return
+    try:
+        tw["exit_final"] = [tr_row[TWAP_HEADERS.index("exit_min")],
+                            tr_row[TWAP_HEADERS.index("exit_reason")]]
+    except (TypeError, IndexError, ValueError):
+        pass
+
+def _twap_curve_row(p):
+    """Рядок twap_curves.csv (v2.15): крива m1..m120 після завершення
+    трекера — дослідницький додаток до вже записаної угоди."""
+    s = p["samples"]
+    tw = p.get("twap") or {}
+    ef = tw.get("exit_final")
+    tr_row = p.get("trade_row")
+    try:
+        if isinstance(ef, (list, tuple)) and len(ef) == 2 and ef[0] != "":
+            exit_min = ef[0]
+        else:
+            exit_min = tr_row[TWAP_HEADERS.index("exit_min")] if tr_row else _twap_close_min(p)
+    except (TypeError, IndexError, ValueError):
+        exit_min = _twap_close_min(p)
+    return ([p["sig_id"], p["strategy"], _dt(p["entry_ts"]), p["coin"],
+             p["side"], exit_min, p.get("algo_v", "")]
             + [("" if x == "" else round(x, 4)) for x in s[:TWAP_TRACK_MIN]]
             + [""] * (TWAP_TRACK_MIN - min(len(s), TWAP_TRACK_MIN)))
 
@@ -7403,23 +7664,53 @@ def run_twap_watcher():
                 last = twap_last_ids.get(ch, 0)
             # v2.14 (аудит v2.13): після пропуску (перерва вотчера, сплеск
             # постів) остання сторінка може не сягати останнього баченого
-            # id — догортаємо старіші (?before=), поки не дійдемо до last
-            # або годинного зрізу; ≤3 сторінок, збій — лишаємо що є
+            # id — догортаємо старіші (?before=) до last або годинного
+            # зрізу, ≤3 сторінок за цикл. v2.15 (аудит v2.14 №7): якщо
+            # сторінок не вистачило, НЕЗАВЕРШЕНИЙ пропуск лишається у черзі
+            # st["gaps"] = [[lo, hi, created_ts], …] (id у (lo,hi) ще не
+            # читані; новіші першими) і догортається наступними циклами —
+            # новий пропуск, що виник під час догортання старого, стає
+            # окремим записом, а не губиться. Пости з пропусків — нові,
+            # не «бачені»; пропуск старший за годину — історія, знімається
             pages = 0
-            cutoff_ = time.time() - TWAP_BACKLOG_S
-            while (last and posts and posts[0][0] > last + 1
-                   and posts[0][1] > cutoff_ and pages < 3):
+            now_ = time.time()
+            cutoff_ = now_ - TWAP_BACKLOG_S
+            gaps = st.setdefault("gaps", [])
+            if last and posts and posts[0][0] > last + 1:
+                # свіжа сторінка не сягає останнього баченого id: новий
+                # пропуск (last, низ сторінки) — завжди вище попередніх,
+                # бо last уже піднято до вершини минулої сторінки
+                if not gaps or gaps[0][1] <= last:
+                    gaps.insert(0, [last, posts[0][0], now_])
+            gaps[:] = [g_ for g_ in gaps if g_[2] > cutoff_]
+            fresh = []
+            # найновіший пропуск першим (його пости ще можуть бути живими
+            # заявками); старіші — після його закриття
+            while last and gaps and pages < 3:
+                lo_, hi_, _c = gaps[0]
+                if hi_ <= lo_ + 1:
+                    gaps.pop(0)
+                    continue
                 try:
-                    older = _tme_fetch(ch, before=posts[0][0])
+                    older = _tme_fetch(ch, before=hi_)
                 except Exception as e:
-                    print(f"  [TWAP] {ch}: догортання before={posts[0][0]}: {e}")
+                    print(f"  [TWAP] {ch}: догортання before={hi_}: {e}")
                     break
                 pages += 1
-                have = {p_[0] for p_ in posts}
-                older = [p_ for p_ in older if p_[0] not in have and p_[0] < posts[0][0]]
+                older = [p_ for p_ in older if lo_ < p_[0] < hi_]
                 if not older:
-                    break
-                posts = older + posts
+                    gaps.pop(0)         # у проміжку нічого нема — закрито
+                    continue
+                fresh = older + fresh
+                if older[0][1] <= cutoff_ or older[0][0] <= lo_ + 1:
+                    gaps.pop(0)         # дійшли до last або до історії
+                    continue
+                gaps[0][1] = older[0][0]    # ще є що догортати — далі/наступним циклом
+            if fresh:
+                have = {p_[0] for p_ in posts}
+                posts = sorted([p_ for p_ in fresh if p_[0] not in have] + posts,
+                               key=lambda p_: p_[0])
+            fresh_ids = {p_[0] for p_ in fresh}
             if pages:
                 twap_stats["pages_extra"] = twap_stats.get("pages_extra", 0) + pages
             if not last and posts:
@@ -7435,7 +7726,8 @@ def run_twap_watcher():
                     # cancelled/completed без нового поста, тож
                     # перечитуємо його лише як cancel/done (ідемпотентно)
                     _twap_ingest(ch, pid, ts, text, now, reply,
-                                 seen=(pid <= last0), reply_pid=reply_pid)
+                                 seen=(pid <= last0 and pid not in fresh_ids),
+                                 reply_pid=reply_pid)
                 except Exception as e:
                     twap_stats["parse_err"] += 1
                     print(f"  [TWAP] {ch}/{pid}: помилка обробки: {e}")

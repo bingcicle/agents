@@ -917,7 +917,7 @@ function renderSDetail(){
               C('usd','TWAP',t=>(t.twap_side==='buy'?'купівля ':'продаж ')+usdTxt(t.usd)),
               C('dur','Трив.',t=>t.dur!=null?(t.dur/60).toFixed(0)+' хв':'—'),
               C('kind','Тип',t=>t.kind==='open'?'відкриття':(t.kind==='reduce'?'скорочення':'—')),
-              C('confirm','TWAP',t=>(t.cancel_after?'скас. m'+(t.exit_min||'?'):(t.completed?'завершено':(t.confirm==='finished'?'частково':(t.confirm==='tg_done'?'канал: заверш.':(t.confirm||'—')))))+(t.exit_reason==='timer_late'?' · вихід m'+t.exit_min:'')+(t.pending?' · ще крива':'')),
+              C('confirm','TWAP',t=>(t.cancel_after?'скас. m'+(t.exit_min||'?'):(t.completed?'завершено':(t.confirm==='finished'?'частково':(t.confirm==='tg_done'?'канал: заверш.':(t.confirm||'—')))))+((t.exit_reason||'').endsWith('_late')?' · вихід m'+t.exit_min:'')+(t.exit_reason==='no_price'?' · без ціни':'')+(t.cancel_event_min?' · подія m'+t.cancel_event_min:'')),
               C('px_src','Ціни',t=>t.px_src||'—'));
     if(sMore) cols.push(C('pos_usd','Позиція кита $',t=>usdTxt(t.pos_usd)),
                         C('src','Джерело',t=>t.src||'—'),
