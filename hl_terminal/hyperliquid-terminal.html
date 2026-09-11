@@ -682,15 +682,24 @@ function renderTable(){
 /* ═══ ВКЛАДКА СТРАТЕГІЙ ═══ */
 let view='term', sData=null, sSel=null, sT=null, fSht='all', fVault='all';
 let fGrace='all', rBk='all';   // v2.16: грейс-рядки і когорта тривалості дампу (R)
-let sSlice=null, sSliceKey='';   // аудит-2 №4: зріз рахує СЕРВЕР по всій вибірці
+// аудит-2 №4: зріз рахує СЕРВЕР по всій вибірці. Рев'ю: збій (404 старого
+// сервера, {error}, мережа) — не назавжди: стан помилки з повтором через 15 с
+// і чесний підпис; живий зріз оновлюється кожні 15 с, поки фільтри увімкнені
+// (старий лишається видимим під час оновлення — без миготіння)
+let sSlice=null, sSliceKey='', sSliceTs=0, sSliceErr='', sSliceErrTs=0, sSliceBusy='';
+const SLICE_TTL_MS=15000;
 function setBk(b){rBk=b;renderSDetail();}
 function fetchSlice(st,key){
-  sSliceKey=key; sSlice=null;
+  if(key!==sSliceKey){sSlice=null;sSliceErr='';}   // нові фільтри — старий зріз не показуємо
+  sSliceKey=key; sSliceBusy=key;
   const q=new URLSearchParams({st,grace:fGrace,vault:fVault,sht:fSht,bucket:rBk});
+  const fail=()=>{if(sSliceKey!==key)return;sSliceBusy='';sSliceErr=key;sSliceErrTs=Date.now();renderSDetail();};
   fetch('/strat2_slice?'+q.toString()).then(r=>r.json()).then(j=>{
     if(sSliceKey!==key) return;           // фільтри вже змінились
-    if(j&&!j.error){sSlice=j;renderSDetail();}
-  }).catch(()=>{});
+    sSliceBusy='';
+    if(j&&!j.error){sSlice=j;sSliceTs=Date.now();sSliceErr='';renderSDetail();}
+    else fail();
+  }).catch(fail);
 }
 let sMore=false, sSortK=null, sSortD=-1;   // детальні колонки і сортування
 function usdTxt(v){if(v==null)return '—';const a=Math.abs(v);
@@ -1002,32 +1011,35 @@ function renderSDetail(){
     rows+='<tr>'+cols.map((c,i)=>`<td class="${c.cls?c.cls(t):(i>2?'dim':'')}"${c.k==='coin'?' style="text-align:center"':''}>${c.f(t)}</td>`).join('')+'</tr>';
   }
   const thead=cols.map(c=>`<th class="thsort${sSortK===c.k?' on':''}" onclick="setSort('${c.k}')" title="сортувати">${c.l}${sSortK===c.k?(sSortD===-1?' ↓':' ↑'):''}</th>`).join('');
-  // Метрики зрізу рахуємо з ВІДФІЛЬТРОВАНИХ угод — інакше таблиця
-  // показує підгрупу, а числа лишаються від усієї вибірки (аудит п.11).
-  // Зріз обмежений переданими останніми угодами (до 120) — так і підписуємо.
-  const fNets=trades.filter(t=>t.entered!==0&&t.net30!=null&&!t.late).map(t=>t.net30);   // v2.16: без пізніх виходів, як заголовок
-  const fSorted=[...fNets].sort((a,b)=>a-b);
-  const fMed=fNets.length?(fSorted.length%2?fSorted[(fSorted.length-1)/2]:(fSorted[fSorted.length/2-1]+fSorted[fSorted.length/2])/2):null;
-  const fMean=fNets.length?fNets.reduce((a,b)=>a+b,0)/fNets.length:null;
-  const fWin=fNets.length?100*fNets.filter(v=>v>0).length/fNets.length:null;
-  const fPnl=fNets.length?fNets.reduce((a,b)=>a+b,0)*10:null;
-  const filtersOn=(fSht!=='all'&&isRev)||(fVault!=='all'&&!isTw)||(fGrace!=='all'&&!isTw)||(rBk!=='all'&&isRev);
-  // аудит-2 №4: при фільтрах картка/періоди/крива — зі СЕРВЕРНОГО зрізу по всій вибірці
-  const sliceSt=isTw?((s.cohort_names||{})[tCoh]||sSel):sSel;
+  // Метрики при фільтрах — зі СЕРВЕРНОГО зрізу по всій вибірці (аудит-2 №4);
+  // таблиця нижче — з переданих останніх угод (до 120), так і підписуємо.
+  // Фільтри є лише у R/F (TWAP-когорти без фільтрів — зріз для них не потрібен)
+  const filtersOn=!isTw&&((fSht!=='all'&&isRev)||fVault!=='all'||fGrace!=='all'||(rBk!=='all'&&isRev));
+  const sliceSt=sSel;
   const sliceKey=filtersOn?[sliceSt,fGrace,fVault,fSht,rBk].join('|'):'';
-  if(filtersOn&&sSliceKey!==sliceKey) fetchSlice(sliceSt,sliceKey);
+  if(filtersOn&&sSliceBusy!==sliceKey){
+    const stale=sSliceKey!==sliceKey||Date.now()-sSliceTs>SLICE_TTL_MS;          // нові фільтри або застарів
+    const errHold=sSliceErr===sliceKey&&Date.now()-sSliceErrTs<=SLICE_TTL_MS;     // після збою — пауза 15 с
+    if(stale&&!errHold) fetchSlice(sliceSt,sliceKey);
+  }
   const sliceOk=filtersOn&&sSlice&&sSliceKey===sliceKey;
+  const sliceErr=filtersOn&&!sliceOk&&sSliceErr===sliceKey;
   const cs=sliceOk?sSlice:cs0;
-  const bkS=(isRev&&rBk!=='all'&&rBk!=='0'&&s.buckets)?s.buckets[rBk]:null;   // серверна когорта дампу (усі угоди, офіційний net)
+  // когорта дампу з /strat2 (усі угоди когорти, БЕЗ інших фільтрів) — лише коли
+  // серверного зрізу немає; інакше вона дублює або суперечить зрізу (рев'ю)
+  const bkS=(!sliceOk&&isRev&&rBk!=='all'&&rBk!=='0'&&s.buckets)?s.buckets[rBk]:null;
+  const tblAll=((isTw&&cs0.trades)?cs0.trades:(s.trades||[])).length;   // рядків передано у таблицю (≤120)
+  const cntNote=sliceOk?` (у зрізі ${cs.n_trades_total||0} угод, у таблиці ${trades.length} з останніх ${tblAll})`
+    :((cs0.n_trades_total||0)>tblAll?` (усього угод ${cs0.n_trades_total}, у таблиці останні ${tblAll})`:'');
   const per=cs.periods||{};
   const pRow=(k,l)=>{const x=per[k]||{};return `<tr><td>${l}</td><td>${x.n||0}</td><td class="${pctCls(x.median)}">${pctTxt(x.median)}</td><td class="${pctCls(x.mean)}">${pctTxt(x.mean)}</td><td>${x.win==null?'—':x.win.toFixed(0)+'%'}</td><td class="${pctCls(x.pnl_usd)}">${x.pnl_usd==null?'—':(x.pnl_usd>=0?'+':'−')+'$'+Math.abs(x.pnl_usd).toFixed(0)}</td></tr>`;};
   box.style.display='block';
   box.innerHTML=`
     <button class="mobile-back fbtn" onclick="document.getElementById('sCards').scrollIntoView({behavior:'smooth',block:'start'})">↑ До стратегій</button>
     <h3>${(sData.titles||{})[sSel]||sSel.replace(/_/g,' ')} <span class="dim" style="font-size:11px">${sSel}</span></h3>
-    <div class="sub">${(sData.desc||{})[sSel]||''} · показано ${Math.min(trades.length,150)} з ${trades.length}${(cs.n_trades_total||0)>((isTw&&cs.trades)?cs.trades:(s.trades||[])).length?' (усього угод '+cs.n_trades_total+', у таблиці останні '+((isTw&&cs.trades)?cs.trades:(s.trades||[])).length+')':''}${s.per_day!=null?' · швидкість '+s.per_day.toFixed(1)+' угод/день':''}</div>
+    <div class="sub">${(sData.desc||{})[sSel]||''} · показано ${Math.min(trades.length,150)} з ${trades.length}${cntNote}${s.per_day!=null?' · швидкість '+s.per_day.toFixed(1)+' угод/день':''}</div>
     <div class="sd-stats">
-      <div class="snum"><i>Вибірка</i><b>${sliceOk?'<span style="color:var(--amber)">зріз · усі угоди за фільтрами</span>':(filtersOn?'<span class="dim">зріз рахується…</span>':(isTw?'стратегія рух ≥'+tCoh+'% · усі paper-входи':'вся'))}</b></div>
+      <div class="snum"><i>Вибірка</i><b>${sliceOk?'<span style="color:var(--amber)">зріз · усі угоди за фільтрами</span>':(sliceErr?'<span style="color:var(--short)">зріз недоступний — показано ВСЮ вибірку</span>':(filtersOn?'<span class="dim">зріз рахується…</span>':(isTw?'стратегія рух ≥'+tCoh+'% · усі paper-входи':'вся')))}</b></div>
       <div class="snum"><i>Угод</i><b>${cs.n}</b></div>
       <div class="snum"><i>${isTw?'TWAP ≤15 хв':'Сигналів'}</i><b>${s.signals}</b></div>
       <div class="snum"><i>Медіана</i><b class="${pctCls(cs.median)}">${pctTxt(cs.median)}</b></div>
@@ -1049,14 +1061,14 @@ function renderSDetail(){
     <table><thead><tr><th>Період</th><th>Угод</th><th>Медіана</th><th>Середнє</th><th>Win</th><th>PnL</th></tr></thead>
     <tbody>${pRow('today','сьогодні')}${pRow('d7','7 днів')}${pRow('d30','30 днів')}${pRow('all','весь час')}</tbody></table></div>
     ${bkS?`<div class="sd-stats" style="border-top:1px solid var(--line);padding-top:10px">
-      <div class="snum"><i>Когорта дампу</i><b style="color:var(--signal)">${rBk-1}–${rBk} хв від початку закриття до повного</b></div>
+      <div class="snum"><i>Когорта дампу (усі угоди когорти, без інших фільтрів)</i><b style="color:var(--signal)">${rBk-1}–${rBk} хв від початку закриття до повного</b></div>
       <div class="snum"><i>Угод</i><b>${bkS.n||0}</b></div>
       <div class="snum"><i>Медіана</i><b class="${pctCls(bkS.median)}">${pctTxt(bkS.median)}</b></div>
       <div class="snum"><i>Середнє</i><b class="${pctCls(bkS.mean)}">${pctTxt(bkS.mean)}</b></div>
       <div class="snum"><i>Win</i><b>${bkS.win==null?'—':bkS.win.toFixed(0)+'%'}</b></div>
       <div class="snum"><i>PnL</i><b class="${pctCls(bkS.pnl_usd)}">${bkS.pnl_usd==null?'—':(bkS.pnl_usd>=0?'+':'−')+'$'+Math.abs(bkS.pnl_usd).toFixed(0)}</b></div>
     </div>`:''}
-    ${filtersOn&&!sliceOk?`<div class="sub">зріз по всій вибірці рахується на сервері…</div>`:''}
+    ${filtersOn&&!sliceOk?`<div class="sub">${sliceErr?'сервер не віддав зріз за фільтрами (старий сервер або збій) — числа вище по ВСІЙ вибірці, повтор через 15 с':'зріз по всій вибірці рахується на сервері…'}</div>`:''}
     ${(()=>{
       // крива хвилин виходу: у реверсів — власна, у follow — СПІЛЬНА
       // тіньова стрічка входів (одні сигнали на всі F-стратегії)
@@ -1079,7 +1091,7 @@ function renderSDetail(){
       // ЧЕСНИЙ підпис для F: стрічка — ВСІ follow-сигнали, не входи
       // саме цієї стратегії (F4 відкривається на підмножині — його
       // власна вибірка інша; аудит v2.5 №3)
-      const lbl=srcLbl+(sliceOk?'зріз за фільтрами · ':'')+(isRev?'':(isTw?('когорта рух ≥'+tCoh+'% · вхід за хвилину до кінця TWAP, вихід m60 · ')
+      const lbl=srcLbl+((sliceOk&&src===cs)?'зріз за фільтрами · ':'')+(isRev?'':(isTw?('когорта рух ≥'+tCoh+'% · вхід за хвилину до кінця TWAP, вихід m60 · ')
         :(ownCurve?'власні угоди стратегії · ':(useFirst?'лише перші постріли пари (когорта F5–F9) · ':'тіньова стрічка follow: один трек на активну пару кит:монета, НЕ лише входи цієї стратегії · '))))
         +(useC?('спільна когорта (усі '+maxM+' хв у кожній угоді) · n='+src.curve_common_n)
               :'вся вибірка · увага: різні хвилини = різні набори угод');

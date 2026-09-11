@@ -3205,14 +3205,16 @@ def _sim_slip(depth):
     return SIM_SPREAD + (SIM_POSITION_USD / depth) * 0.005
 
 _journal_lock = threading.Lock()
-def _journal(kind, **fields):
+def _journal(_kind, **fields):
     """v2.16 (аудит №8): журнал ПЕРВИННИХ подій для майбутнього replay —
     events-YYYYMMDD.jsonl у DATA_DIR: батчі закриттів кита з сирими
     цінами філів, рішення входу (стакан, мід, референс, причини пропуску),
     вирішені виходи. Без нього старий детектор не можна відтворити;
-    з ним — можна перерахувати будь-яке нове правило на минулих подіях."""
+    з ним — можна перерахувати будь-яке нове правило на минулих подіях.
+    Перший аргумент — позиційний _kind (рев'ю: поле події «kind» у
+    **fields не має конфліктувати з іменем параметра). Ніколи не кидає."""
     try:
-        rec = {"ts": round(time.time(), 3), "kind": kind}
+        rec = {"ts": round(time.time(), 3), "kind": _kind}
         rec.update(fields)
         line = json.dumps(rec, ensure_ascii=False, default=str, separators=(",", ":"))
         path = os.path.join(DATA_DIR, time.strftime("events-%Y%m%d.jsonl"))
@@ -3311,6 +3313,12 @@ def hl_book_exec(coin, side, usd=None):
     q_age = (time.time() * 1000 - q_ms) / 1000.0 if q_ms else None
     if q_age is not None and abs(q_age) > BOOK_MAX_AGE_S:
         stats["book_stale"] = stats.get("book_stale", 0) + 1
+        if stats["book_stale"] in (1, 10, 100, 1000):
+            # рев'ю: не мовчати — зсув годинника VPS >5 с від HL обнулив би
+            # УСІ paper-входи без жодного рядка логу
+            print(f"  [BOOK] {coin}: котирування l2Book старше за {BOOK_MAX_AGE_S:.0f} с "
+                  f"(вік {q_age:+.1f} с; {stats['book_stale']}-й раз) — не «зараз»; "
+                  f"якщо повторюється — перевір годинник сервера (timedatectl)")
         return None
     stats["book_ok"] = stats.get("book_ok", 0) + 1
     partial = int(left > 1e-9)
@@ -6072,492 +6080,527 @@ def run_strat2_loop():
     while True:
         time.sleep(3)
         if not STRAT2_ENABLED: continue
-        # outbox сигнальних рядків — ретраїться незалежно від трекерів
-        with _sig_retry_lock:
-            _pending = _sig_retry_q[:]
-            del _sig_retry_q[:]
-        if _pending:
-            _still = []
-            for _it in _pending:
-                if _strat_csv_append(_it[0], _it[1], _it[2]): continue
-                _it[3] += 1
-                if _it[3] > WFAIL_CAP:
-                    print(f"  [STRAT] DROP сигнальний рядок після "
-                          f"{WFAIL_CAP} спроб (диск?)")
-                else:
-                    _still.append(_it)
-            if _still:
-                with _sig_retry_lock:
-                    _sig_retry_q.extend(_still)
-        with strat2_lock:
-            active = bool(rev_open) or bool(follow_open)
-        if not active: continue
-        now = time.time()
-        # Рядки збираємо БЕЗ видалення трекера: видаляємо після успішного
-        # запису CSV (аудит v2.1 п.7). Завершений трекер отримує done=1 і
-        # ЗАМОРОЖЕНИЙ final_row: ретрай пише ті самі байти, а не
-        # перераховує результат новішою ціною — інакше тимчасовий збій
-        # диска міняв exit/net завершеної угоди (аудит v2.2 п.1).
-        # done не блокує busy; після WFAIL_CAP ретраїв — дроп із логом.
-        # Дублі після краху знімає дедуп по sig_id/trade_id у strat2_api.
-        rev_rows, fol_rows, tw_rows = [], [], []
-        rev_exited = False   # v2.16: вирішений вихід/вхід R — стан треба зберегти одразу
-        # v2.16: рішення про вхід/вихід ухвалюються під локом, а ЦІНА для них
-        # береться зі свіжого стакану ПОЗА локом (запит ~0.1–3 с; strat2_lock
-        # тримають і хуки воркерів) — списки запитів на ціну
-        rev_price, fol_exit = [], []
-        with strat2_lock:
-            for pid, p in list(rev_open.items()):
-                if p.get("done"):
-                    if p.get("row_kind") == "twap":
-                        # v2.15 (аудит v2.14 №1): угода TWAP пишеться ОКРЕМИМ
-                        # рядком у момент вирішеного виходу (нижче); тут —
-                        # лише крива (twap_curves.csv). Рядок угоди ще не
-                        # записаний (рестарт зі старого state, збій диска) —
-                        # спершу він, крива наступним тиком: трекер не
-                        # видаляється, доки не записані обидва
-                        if not p.get("trade_written"):
-                            if (p.get("trade_row") is not None
-                                    and len(p["trade_row"]) != len(TWAP_HEADERS) - 1):
-                                # заморожений рядок старої схеми (рестарт після
-                                # апдейту заголовків) — перебудувати з тих самих
-                                # семплів (вихід детермінований), а не відмова
-                                # запису щотику назавжди (рев'ю v2.15)
-                                p["trade_row"] = None
-                            if p.get("trade_row") is None:
-                                if not p.get("trade_closed_ts"):
-                                    # відновлений done-трекер без мітки закриття
-                                    # (state v2.14): час виходу — хвилина
-                                    # виходу, не момент рестарту
-                                    _ex = _twap_exit(p, now)
-                                    p["trade_closed_ts"] = ((p.get("entry_ts") or now)
-                                        + (_ex[0] if _ex else _twap_close_min(p)) * 60.0)
-                                p["trade_row"] = _twap_row(p, now)
-                                _twap_freeze_exit(p)
-                            tw_rows.append((pid, p["trade_row"]))
-                            continue
-                        if (p.get("final_row") is None
-                                or len(p["final_row"]) != len(TWAP_CURVE_HEADERS) - 1):
+        try:
+            _strat2_tick()
+        except Exception as e:
+            # рев'ю аудит-2: один битий тик (несподіване поле, помилка
+            # запису) не має вбивати потік стратегій назавжди — трекери
+            # лишаються у state, наступний тик продовжує
+            stats["strat2_tick_err"] = stats.get("strat2_tick_err", 0) + 1
+            if stats["strat2_tick_err"] in (1, 10, 100, 1000):
+                import traceback
+                print(f"  [STRAT2] тик впав ({stats['strat2_tick_err']}): {e!r}")
+                traceback.print_exc()
+
+def _strat2_tick():
+    """Один тик циклу стратегій (3 с): outbox сигнальних рядків, семпли
+    трекерів, рішення входів/виходів, ціни зі стакану поза локом, запис
+    CSV, save_state. Виділено з run_strat2_loop, щоб виняток одного тику
+    ловився зовні (рев'ю аудит-2)."""
+    # outbox сигнальних рядків — ретраїться незалежно від трекерів
+    with _sig_retry_lock:
+        _pending = _sig_retry_q[:]
+        del _sig_retry_q[:]
+    if _pending:
+        _still = []
+        for _it in _pending:
+            if _strat_csv_append(_it[0], _it[1], _it[2]): continue
+            _it[3] += 1
+            if _it[3] > WFAIL_CAP:
+                print(f"  [STRAT] DROP сигнальний рядок після "
+                      f"{WFAIL_CAP} спроб (диск?)")
+            else:
+                _still.append(_it)
+        if _still:
+            with _sig_retry_lock:
+                _sig_retry_q.extend(_still)
+    with strat2_lock:
+        active = bool(rev_open) or bool(follow_open)
+    if not active: return
+    now = time.time()
+    # Рядки збираємо БЕЗ видалення трекера: видаляємо після успішного
+    # запису CSV (аудит v2.1 п.7). Завершений трекер отримує done=1 і
+    # ЗАМОРОЖЕНИЙ final_row: ретрай пише ті самі байти, а не
+    # перераховує результат новішою ціною — інакше тимчасовий збій
+    # диска міняв exit/net завершеної угоди (аудит v2.2 п.1).
+    # done не блокує busy; після WFAIL_CAP ретраїв — дроп із логом.
+    # Дублі після краху знімає дедуп по sig_id/trade_id у strat2_api.
+    rev_rows, fol_rows, tw_rows = [], [], []
+    rev_exited = False   # v2.16: вирішений вихід/вхід R — стан треба зберегти одразу
+    # v2.16: рішення про вхід/вихід ухвалюються під локом, а ЦІНА для них
+    # береться зі свіжого стакану ПОЗА локом (запит ~0.1–3 с; strat2_lock
+    # тримають і хуки воркерів) — списки запитів на ціну
+    rev_price, fol_exit = [], []
+    with strat2_lock:
+        for pid, p in list(rev_open.items()):
+            if p.get("done"):
+                if p.get("row_kind") == "twap":
+                    # v2.15 (аудит v2.14 №1): угода TWAP пишеться ОКРЕМИМ
+                    # рядком у момент вирішеного виходу (нижче); тут —
+                    # лише крива (twap_curves.csv). Рядок угоди ще не
+                    # записаний (рестарт зі старого state, збій диска) —
+                    # спершу він, крива наступним тиком: трекер не
+                    # видаляється, доки не записані обидва
+                    if not p.get("trade_written"):
+                        if (p.get("trade_row") is not None
+                                and len(p["trade_row"]) != len(TWAP_HEADERS) - 1):
                             # заморожений рядок старої схеми (рестарт після
-                            # апдейту) — перебудувати з тих самих семплів
-                            p["final_row"] = _twap_curve_row(p)
-                        rev_rows.append((pid, "twapc", p["final_row"]))
-                        continue
-                    if p.get("final_row") is not None:
-                        rev_rows.append((pid, p.get("row_kind", "rev"),
-                                         p["final_row"]))
-                    else:
-                        # done без final_row: рядок можна відтворити з
-                        # заморожених семплів (вони в трекері)
-                        if p["strategy"] == "_OUTCOME":
-                            p["row_kind"] = "out"
-                            p["final_row"] = _rev_out_row(p)
-                        elif p["strategy"] == "_FOLLOW_OUT":
-                            p["row_kind"] = "fo"
-                            p["final_row"] = _fol_out_row(p)
-                        else:
-                            p["row_kind"] = "rev"
-                            p["final_row"] = _rev_row(
-                                p, 1 if p.get("entry_px") else 0)
-                        rev_rows.append((pid, p["row_kind"], p["final_row"]))
-                    continue
-                px = _px_now(p["coin"], max_age=30.0)
-                if p["state"] == "armed":
-                    # СПОЧАТКУ дедлайн (аудит п.3: пізній тик після
-                    # закінчення вікна відкривав позицію заднім числом)
-                    if now >= p["deadline"]:
-                        p["done"] = 1
-                        p["row_kind"] = "rev"
-                        p["final_row"] = _rev_row(p, 0)
-                        rev_rows.append((pid, "rev", p["final_row"]))
-                        continue
-                    if not px: continue
-                    trig = p["trigger_px"]
-                    hit = px >= trig if p["side"] == "LONG" else px <= trig
-                    _ah = p.get("arm_hit")
-                    if hit and (not _ah or now - (_ah.get("ts") or 0) > 30.0):
-                        # v2.16: ціна входу — зі свіжого стакану (запит поза
-                        # локом, нижче), консервативно гірша з (стакан,
-                        # тригер); застарілий arm_hit (аварія між тиками)
-                        # переставляється
-                        p["arm_hit"] = {"ts": now, "mid": px, "trig": trig}
-                        rev_price.append((pid, "arm"))
-                    continue
-                # Хвилинні мітки: закриваємо лише ті хвилини, для яких
-                # ціна СВІЖА (<=30с від межі хвилини). Пропущені через
-                # рестарт/збій пишемо як "" — НЕ підставляємо пізнішу
-                # ціну в ранній горизонт (аудит п.2)
-                if px:
-                    g = (px / p["entry_px"] - 1.0) * 100.0
-                    if p["side"] == "SHORT": g = -g
-                    p["peak"] = max(p["peak"], g)
-                    p["trough"] = min(p["trough"], g)
-                else:
-                    g = None
-                # горизонт треку — властивість трекера (v2.11: TWAP-реверс
-                # веде 120 хв, решта — REV_TRACK_MIN=60)
-                _tm = int(p.get("track_min") or REV_TRACK_MIN)
-                target = min(int((now - p["entry_ts"]) // 60), _tm)
-                while len(p["samples"]) < target:
-                    k = len(p["samples"]) + 1
-                    late = now - (p["entry_ts"] + k * 60.0)
-                    if g is not None and late <= 30.0:
-                        p["samples"].append(round(g, 4))
-                    elif g is None and late <= 30.0:
-                        # ціни нема, але 30-с допуск ще триває: пропуск
-                        # НЕ закріплюємо — наступний тик (3с) може
-                        # принести свіжу ціну (аудит v2.13 №6: три
-                        # секунди без ціни назавжди спустошували m60)
-                        break
-                    else:
-                        p["samples"].append("")
-                # v2.15 (аудит v2.14 №1/№5): TWAP-угода закривається у момент
-                # ВИРІШЕНОГО виходу (_twap_exit) — рядок угоди заморожується
-                # і пишеться одразу; далі трекер веде лише криву
-                if p.get("row_kind") == "twap" and not p.get("trade_written"):
-                    if (p.get("trade_row") is not None
-                            and len(p["trade_row"]) != len(TWAP_HEADERS) - 1):
-                        p["trade_row"] = None   # стара схема — перебудувати (рев'ю v2.15)
-                    _tx = _twap_exit(p, now) if p.get("trade_row") is None else None
-                    if _tx is not None:
-                        _fresh = now - (p["entry_ts"] + _tx[0] * 60.0) <= 35.0
-                        _rt = p.get("exit_retry_at") or 0
-                        if not _fresh:
-                            # хвилина виходу давно минула (рестарт/аварія посеред
-                            # тику): стакан «зараз» — не та ціна; рядок — з семплів,
-                            # детерміновано, як у v2.15 (рев'ю v2.16)
-                            p["trade_closed_ts"] = p.get("trade_closed_ts") or now
+                            # апдейту заголовків) — перебудувати з тих самих
+                            # семплів (вихід детермінований), а не відмова
+                            # запису щотику назавжди (рев'ю v2.15)
+                            p["trade_row"] = None
+                        if p.get("trade_row") is None:
+                            if not p.get("trade_closed_ts"):
+                                # відновлений done-трекер без мітки закриття
+                                # (state v2.14): час виходу — хвилина
+                                # виходу, не момент рестарту
+                                _ex = _twap_exit(p, now)
+                                p["trade_closed_ts"] = ((p.get("entry_ts") or now)
+                                    + (_ex[0] if _ex else _twap_close_min(p)) * 60.0)
                             p["trade_row"] = _twap_row(p, now)
                             _twap_freeze_exit(p)
-                        elif now >= _rt:
-                            # v2.16: ціна виходу — зі свіжого стакану (запит поза
-                            # локом, нижче); рядок заморожується там же
-                            _er = p.get("exit_req")
-                            if _er and now - (_er.get("ts") or 0) > 30.0:
-                                _er = None
-                            if not _er:
-                                p["exit_req"] = {"kind": "twap", "ts": now, "mid": px}
-                                rev_price.append((pid, "exit"))
-                    if p.get("trade_row") is not None:
                         tw_rows.append((pid, p["trade_row"]))
-                # v2.16: ВИРІШЕНИЙ ВИХІД заголовкової угоди реверсу — TP (R8,
-                # мід перетнув tp_px) або таймер m30 (перша хвилина з ціною у
-                # 30..33, далі — no_price); ціна виходу — зі свіжого стакану,
-                # запит поза локом. Трекер далі веде криву до m60.
-                if (p.get("row_kind") != "twap"
-                        and not p["strategy"].startswith("_")
-                        and not p.get("exit_reason")
-                        and _vt(p.get("algo_v")) >= (2, 16)):   # старий трекер — стара семантика
-                    _er = p.get("exit_req")
-                    if _er and now - (_er.get("ts") or 0) > 30.0:
-                        p.pop("exit_req", None); _er = None   # аварія між тиками
-                    if not _er and now >= (p.get("exit_retry_at") or 0):
-                        n_s = len(p["samples"])
-                        tp = p.get("tp_px")
-                        tp_hit = bool(px and tp and (px >= tp if p["side"] == "LONG"
-                                                     else px <= tp))
-                        if tp_hit and n_s < REV_HOLD_MIN:
-                            p["exit_req"] = {"kind": "tp", "ts": now, "mid": px,
-                                             "min": round((now - p["entry_ts"]) / 60.0, 2)}
-                            rev_price.append((pid, "exit"))
-                        elif n_s >= REV_HOLD_MIN:
-                            if n_s <= REV_HOLD_MIN + 3 and p["samples"][-1] != "":
-                                late = now - (p["entry_ts"] + n_s * 60.0)
-                                kind = ("timer" if (n_s == REV_HOLD_MIN and late <= 60.0)
-                                        else "timer_late")
-                                p["exit_req"] = {"kind": kind, "ts": now, "mid": px,
-                                                 "min": n_s}
-                                rev_price.append((pid, "exit"))
-                            elif n_s > REV_HOLD_MIN + 3:
-                                # тик проґавив 30..33 (рестарт/довгий тик): ціну
-                                # тієї хвилини бот ЗНАВ — вихід із семпла, а не
-                                # no_price (рев'ю v2.16)
-                                _k = next((k for k in range(REV_HOLD_MIN, REV_HOLD_MIN + 4)
-                                           if p["samples"][k - 1] != ""), None)
-                                if _k is not None:
-                                    _gs = float(p["samples"][_k - 1])
-                                    _sgn = 1.0 if p["side"] == "LONG" else -1.0
-                                    p["exit_px"] = p["entry_px"] * (1.0 + _sgn * _gs / 100.0)
-                                    p["exit_src"] = "sample"
-                                    p["exit_ts_ms"] = int(round((p["entry_ts"] + _k * 60.0) * 1000))
-                                    p["exit_min"] = _k
-                                    p["exit_reason"] = "timer" if _k == REV_HOLD_MIN else "timer_late"
-                                    rev_exited = True
-                                else:
-                                    p["exit_reason"] = "no_price"
-                                    p["exit_min"] = ""
-                if len(p["samples"]) >= _tm:
-                    p["done"] = 1
+                        continue
+                    if (p.get("final_row") is None
+                            or len(p["final_row"]) != len(TWAP_CURVE_HEADERS) - 1):
+                        # заморожений рядок старої схеми (рестарт після
+                        # апдейту) — перебудувати з тих самих семплів
+                        p["final_row"] = _twap_curve_row(p)
+                    rev_rows.append((pid, "twapc", p["final_row"]))
+                    continue
+                if p.get("final_row") is not None:
+                    rev_rows.append((pid, p.get("row_kind", "rev"),
+                                     p["final_row"]))
+                else:
+                    # done без final_row: рядок можна відтворити з
+                    # заморожених семплів (вони в трекері)
                     if p["strategy"] == "_OUTCOME":
                         p["row_kind"] = "out"
                         p["final_row"] = _rev_out_row(p)
                     elif p["strategy"] == "_FOLLOW_OUT":
                         p["row_kind"] = "fo"
                         p["final_row"] = _fol_out_row(p)
-                    elif p.get("row_kind") == "twap":
-                        p["final_row"] = _twap_curve_row(p)
-                        # криву пишемо лише після записаної угоди (порядок
-                        # гарантує done-гілка наступного тику)
-                        if p.get("trade_written"):
-                            rev_rows.append((pid, "twapc", p["final_row"]))
-                        continue
                     else:
                         p["row_kind"] = "rev"
-                        p["final_row"] = _rev_row(p, 1)
+                        p["final_row"] = _rev_row(
+                            p, 1 if p.get("entry_px") else 0)
                     rev_rows.append((pid, p["row_kind"], p["final_row"]))
-            for fid, p in list(follow_open.items()):
-                if p.get("done"):
-                    if p.get("final_row") is not None:
-                        fol_rows.append((fid, p["final_row"]))
+                continue
+            px = _px_now(p["coin"], max_age=30.0)
+            if p["state"] == "armed":
+                # СПОЧАТКУ дедлайн (аудит п.3: пізній тик після
+                # закінчення вікна відкривав позицію заднім числом)
+                if now >= p["deadline"]:
+                    p["done"] = 1
+                    p["row_kind"] = "rev"
+                    p["final_row"] = _rev_row(p, 0)
+                    rev_rows.append((pid, "rev", p["final_row"]))
+                    continue
+                if not px: continue
+                trig = p["trigger_px"]
+                hit = px >= trig if p["side"] == "LONG" else px <= trig
+                _ah = p.get("arm_hit")
+                if hit and (not _ah or now - (_ah.get("ts") or 0) > 30.0):
+                    # v2.16: ціна входу — зі свіжого стакану (запит поза
+                    # локом, нижче), консервативно гірша з (стакан,
+                    # тригер); застарілий arm_hit (аварія між тиками)
+                    # переставляється
+                    p["arm_hit"] = {"ts": now, "mid": px, "trig": trig}
+                    rev_price.append((pid, "arm"))
+                continue
+            # Хвилинні мітки: закриваємо лише ті хвилини, для яких
+            # ціна СВІЖА (<=30с від межі хвилини). Пропущені через
+            # рестарт/збій пишемо як "" — НЕ підставляємо пізнішу
+            # ціну в ранній горизонт (аудит п.2)
+            if px:
+                g = (px / p["entry_px"] - 1.0) * 100.0
+                if p["side"] == "SHORT": g = -g
+                p["peak"] = max(p["peak"], g)
+                p["trough"] = min(p["trough"], g)
+            else:
+                g = None
+            # горизонт треку — властивість трекера (v2.11: TWAP-реверс
+            # веде 120 хв, решта — REV_TRACK_MIN=60)
+            _tm = int(p.get("track_min") or REV_TRACK_MIN)
+            target = min(int((now - p["entry_ts"]) // 60), _tm)
+            while len(p["samples"]) < target:
+                k = len(p["samples"]) + 1
+                late = now - (p["entry_ts"] + k * 60.0)
+                if g is not None and late <= 30.0:
+                    p["samples"].append(round(g, 4))
+                elif g is None and late <= 30.0:
+                    # ціни нема, але 30-с допуск ще триває: пропуск
+                    # НЕ закріплюємо — наступний тик (3с) може
+                    # принести свіжу ціну (аудит v2.13 №6: три
+                    # секунди без ціни назавжди спустошували m60)
+                    break
+                else:
+                    p["samples"].append("")
+            # v2.15 (аудит v2.14 №1/№5): TWAP-угода закривається у момент
+            # ВИРІШЕНОГО виходу (_twap_exit) — рядок угоди заморожується
+            # і пишеться одразу; далі трекер веде лише криву
+            if p.get("row_kind") == "twap" and not p.get("trade_written"):
+                if (p.get("trade_row") is not None
+                        and len(p["trade_row"]) != len(TWAP_HEADERS) - 1):
+                    p["trade_row"] = None   # стара схема — перебудувати (рев'ю v2.15)
+                _tx = _twap_exit(p, now) if p.get("trade_row") is None else None
+                if _tx is not None:
+                    _fresh = now - (p["entry_ts"] + _tx[0] * 60.0) <= 35.0
+                    _rt = p.get("exit_retry_at") or 0
+                    if not _fresh:
+                        # хвилина виходу давно минула (рестарт/аварія посеред
+                        # тику): стакан «зараз» — не та ціна; рядок — з семплів,
+                        # детерміновано, як у v2.15 (рев'ю v2.16)
+                        p["trade_closed_ts"] = p.get("trade_closed_ts") or now
+                        p["trade_row"] = _twap_row(p, now)
+                        _twap_freeze_exit(p)
+                    elif now >= _rt:
+                        # v2.16: ціна виходу — зі свіжого стакану (запит поза
+                        # локом, нижче); рядок заморожується там же
+                        _er = p.get("exit_req")
+                        if _er and now - (_er.get("ts") or 0) > 30.0:
+                            _er = None
+                        if not _er:
+                            p["exit_req"] = {"kind": "twap", "ts": now, "mid": px}
+                            rev_price.append((pid, "exit"))
+                if p.get("trade_row") is not None:
+                    tw_rows.append((pid, p["trade_row"]))
+            # v2.16: ВИРІШЕНИЙ ВИХІД заголовкової угоди реверсу — TP (R8,
+            # мід перетнув tp_px) або таймер m30 (перша хвилина з ціною у
+            # 30..33, далі — no_price); ціна виходу — зі свіжого стакану,
+            # запит поза локом. Трекер далі веде криву до m60.
+            if (p.get("row_kind") != "twap"
+                    and not p["strategy"].startswith("_")
+                    and not p.get("exit_reason")
+                    and _vt(p.get("algo_v")) >= (2, 16)):   # старий трекер — стара семантика
+                _er = p.get("exit_req")
+                if _er and now - (_er.get("ts") or 0) > 30.0:
+                    p.pop("exit_req", None); _er = None   # аварія між тиками
+                if not _er and now >= (p.get("exit_retry_at") or 0):
+                    n_s = len(p["samples"])
+                    tp = p.get("tp_px")
+                    tp_hit = bool(px and tp and (px >= tp if p["side"] == "LONG"
+                                                 else px <= tp))
+                    if tp_hit and n_s < REV_HOLD_MIN:
+                        p["exit_req"] = {"kind": "tp", "ts": now, "mid": px,
+                                         "min": round((now - p["entry_ts"]) / 60.0, 2)}
+                        rev_price.append((pid, "exit"))
+                    elif n_s >= REV_HOLD_MIN:
+                        if n_s <= REV_HOLD_MIN + 3 and p["samples"][-1] != "":
+                            late = now - (p["entry_ts"] + n_s * 60.0)
+                            kind = ("timer" if (n_s == REV_HOLD_MIN and late <= 60.0)
+                                    else "timer_late")
+                            p["exit_req"] = {"kind": kind, "ts": now, "mid": px,
+                                             "min": n_s}
+                            rev_price.append((pid, "exit"))
+                        elif n_s > REV_HOLD_MIN + 3:
+                            # тик проґавив 30..33 (рестарт/довгий тик): ціну
+                            # тієї хвилини бот ЗНАВ — вихід із семпла, а не
+                            # no_price (рев'ю v2.16)
+                            _k = next((k for k in range(REV_HOLD_MIN, REV_HOLD_MIN + 4)
+                                       if p["samples"][k - 1] != ""), None)
+                            if _k is not None:
+                                _gs = float(p["samples"][_k - 1])
+                                _sgn = 1.0 if p["side"] == "LONG" else -1.0
+                                p["exit_px"] = p["entry_px"] * (1.0 + _sgn * _gs / 100.0)
+                                p["exit_src"] = "sample"
+                                p["exit_ts_ms"] = int(round((p["entry_ts"] + _k * 60.0) * 1000))
+                                p["exit_min"] = _k
+                                p["exit_reason"] = "timer" if _k == REV_HOLD_MIN else "timer_late"
+                                rev_exited = True
+                            else:
+                                p["exit_reason"] = "no_price"
+                                p["exit_min"] = ""
+            if len(p["samples"]) >= _tm:
+                p["done"] = 1
+                if p["strategy"] == "_OUTCOME":
+                    p["row_kind"] = "out"
+                    p["final_row"] = _rev_out_row(p)
+                elif p["strategy"] == "_FOLLOW_OUT":
+                    p["row_kind"] = "fo"
+                    p["final_row"] = _fol_out_row(p)
+                elif p.get("row_kind") == "twap":
+                    p["final_row"] = _twap_curve_row(p)
+                    # криву пишемо лише після записаної угоди (порядок
+                    # гарантує done-гілка наступного тику)
+                    if p.get("trade_written"):
+                        rev_rows.append((pid, "twapc", p["final_row"]))
+                    continue
+                else:
+                    p["row_kind"] = "rev"
+                    p["final_row"] = _rev_row(p, 1)
+                rev_rows.append((pid, p["row_kind"], p["final_row"]))
+        for fid, p in list(follow_open.items()):
+            if p.get("done"):
+                if p.get("final_row") is not None:
+                    fol_rows.append((fid, p["final_row"]))
+                else:
+                    # done без замороженого рядка (відновлений зі
+                    # старого state.json): вихідну ціну чесно
+                    # відтворити неможливо — дроп із логом
+                    follow_open.pop(fid, None)
+                    print(f"  [STRAT] DROP {fid}: done без final_row "
+                          f"(старий state)")
+                continue
+            px = _px_now(p["coin"], max_age=30.0)
+            if px:
+                g = (px / p["entry_px"] - 1.0) * 100.0
+                if p["our_side"] == "SHORT": g = -g
+                p["peak"] = max(p["peak"], g)
+                p["trough"] = min(p["trough"], g)
+            # аудит v2.16 №13: умова виходу (повне закриття / таймер
+            # тиші) не залежить від поллера мідів — ціну дає стакан
+            if now < (p.get("exit_retry_at") or 0):
+                continue
+            reason = p.get("force_exit")
+            if not reason:
+                last = follow_last_close.get(p["key"], p["open_ts"])
+                if now - last >= p["timer"]:
+                    reason = "silence"
+                    # ціни не було на дедлайні і вихід стався значно
+                    # пізніше таймера: маркуємо чесно — "1 хв тиші",
+                    # виконана на 5-й хвилині, це ІНША стратегія
+                    # (аудит v2.6 №11); аналіз фільтрує за reason
+                    if now - (last + p["timer"]) > 60:
+                        reason = "silence_late"
+            if reason:
+                # v2.16: рішення про вихід — тут; ЦІНА виходу — зі
+                # свіжого стакану, запит поза локом (нижче); рядок
+                # заморожується там же
+                p["exit_pending"] = {"reason": reason, "ts": now, "mid": px}
+                fol_exit.append(fid)
+    # ── v2.16: ціни зі стакану для вирішених входів/виходів — ПОЗА локом ──
+    if rev_price or fol_exit:
+        priced, fpriced = [], []
+        _pxc = {}   # (coin, bside) -> відповідь: 6 R-трекерів одного сигналу
+                    # виходять на m30 одним тиком — один запит, не шість (рев'ю)
+        _pass_t0 = time.time()
+        def _ppx(coin, bside, strict=False):
+            # strict (вхід R2 на пробої): ЛИШЕ повний свіжий стакан —
+            # без міда/partial (рев'ю аудит-2: armed→open обходив
+            # строге правило входу через фолбек міда)
+            k = (coin, bside, strict)
+            if k not in _pxc:
+                if len(_pxc) >= 6 or time.time() - _pass_t0 > 12.0:
+                    # кап на прохід: решта — з кеш-міда (тик не має
+                    # тривати хвилину, інші трекери втрачають семпли);
+                    # для входу мід не годиться → no_book
+                    _mid, _age = _px_mid_age(coin)
+                    if strict:
+                        _pxc[k] = (None, "no_book", {"mid": _mid, "px_age_ms": _age})
                     else:
-                        # done без замороженого рядка (відновлений зі
-                        # старого state.json): вихідну ціну чесно
-                        # відтворити неможливо — дроп із логом
-                        follow_open.pop(fid, None)
-                        print(f"  [STRAT] DROP {fid}: done без final_row "
-                              f"(старий state)")
-                    continue
-                px = _px_now(p["coin"], max_age=30.0)
-                if px:
-                    g = (px / p["entry_px"] - 1.0) * 100.0
-                    if p["our_side"] == "SHORT": g = -g
-                    p["peak"] = max(p["peak"], g)
-                    p["trough"] = min(p["trough"], g)
-                # аудит v2.16 №13: умова виходу (повне закриття / таймер
-                # тиші) не залежить від поллера мідів — ціну дає стакан
-                if now < (p.get("exit_retry_at") or 0):
-                    continue
-                reason = p.get("force_exit")
-                if not reason:
-                    last = follow_last_close.get(p["key"], p["open_ts"])
-                    if now - last >= p["timer"]:
-                        reason = "silence"
-                        # ціни не було на дедлайні і вихід стався значно
-                        # пізніше таймера: маркуємо чесно — "1 хв тиші",
-                        # виконана на 5-й хвилині, це ІНША стратегія
-                        # (аудит v2.6 №11); аналіз фільтрує за reason
-                        if now - (last + p["timer"]) > 60:
-                            reason = "silence_late"
-                if reason:
-                    # v2.16: рішення про вихід — тут; ЦІНА виходу — зі
-                    # свіжого стакану, запит поза локом (нижче); рядок
-                    # заморожується там же
-                    p["exit_pending"] = {"reason": reason, "ts": now, "mid": px}
-                    fol_exit.append(fid)
-        # ── v2.16: ціни зі стакану для вирішених входів/виходів — ПОЗА локом ──
-        if rev_price or fol_exit:
-            priced, fpriced = [], []
-            _pxc = {}   # (coin, bside) -> відповідь: 6 R-трекерів одного сигналу
-                        # виходять на m30 одним тиком — один запит, не шість (рев'ю)
-            _pass_t0 = time.time()
-            def _ppx(coin, bside):
-                k = (coin, bside)
-                if k not in _pxc:
-                    if len(_pxc) >= 6 or time.time() - _pass_t0 > 12.0:
-                        # кап на прохід: решта — з кеш-міда (тик не має
-                        # тривати хвилину, інші трекери втрачають семпли)
-                        _mid, _age = _px_mid_age(coin)
                         _pxc[k] = ((_mid if (_mid and (_age or 0) <= 35_000) else None),
                                    "mid", {"mid": _mid, "px_age_ms": _age})
-                    else:
-                        _pxc[k] = _paper_px(coin, bside, max_mid_age_ms=35_000)
-                return _pxc[k]
-            for pid, what in rev_price:
-                with strat2_lock:
-                    p = rev_open.get(pid)
-                    if p is None: continue
-                    coin, side = p["coin"], p["side"]
-                    req = p.get("arm_hit") if what == "arm" else p.get("exit_req")
-                if not req: continue
-                # відкриття LONG = BUY (аски), закриття LONG = SELL (біди)
-                bside = (("BUY" if side == "LONG" else "SELL") if what == "arm"
-                         else ("SELL" if side == "LONG" else "BUY"))
-                xpx, xsrc, xmeta = _ppx(coin, bside)
-                priced.append((pid, what, xpx, xsrc, xmeta))
-            for fid in fol_exit:
-                with strat2_lock:
-                    p = follow_open.get(fid)
-                    if p is None or p.get("done") or not p.get("exit_pending"):
-                        continue
-                    coin, side = p["coin"], p["our_side"]
-                xpx, xsrc, xmeta = _ppx(coin, "BUY" if side == "SHORT" else "SELL")
-                fpriced.append((fid, xpx, xsrc, xmeta))
+                else:
+                    _pxc[k] = _paper_px(coin, bside, max_mid_age_ms=35_000, strict=strict)
+            return _pxc[k]
+        for pid, what in rev_price:
             with strat2_lock:
-                for pid, what, xpx, xsrc, xmeta in priced:
-                    p = rev_open.get(pid)
-                    if p is None: continue
-                    now2 = time.time()
-                    if what == "arm":
-                        req = p.pop("arm_hit", None)
-                        if not req or p["state"] != "armed": continue
+                p = rev_open.get(pid)
+                if p is None: continue
+                coin, side = p["coin"], p["side"]
+                req = p.get("arm_hit") if what == "arm" else p.get("exit_req")
+            if not req: continue
+            # відкриття LONG = BUY (аски), закриття LONG = SELL (біди)
+            bside = (("BUY" if side == "LONG" else "SELL") if what == "arm"
+                     else ("SELL" if side == "LONG" else "BUY"))
+            xpx, xsrc, xmeta = _ppx(coin, bside, strict=(what == "arm"))
+            priced.append((pid, what, xpx, xsrc, xmeta))
+        for fid in fol_exit:
+            with strat2_lock:
+                p = follow_open.get(fid)
+                if p is None or p.get("done") or not p.get("exit_pending"):
+                    continue
+                coin, side = p["coin"], p["our_side"]
+            xpx, xsrc, xmeta = _ppx(coin, "BUY" if side == "SHORT" else "SELL")
+            fpriced.append((fid, xpx, xsrc, xmeta))
+        _jrn = []   # події журналу — пишуться ПІСЛЯ лока (диск не тримає strat2_lock)
+        with strat2_lock:
+            for pid, what, xpx, xsrc, xmeta in priced:
+                p = rev_open.get(pid)
+                if p is None: continue
+                now2 = time.time()
+                if what == "arm":
+                    req = p.pop("arm_hit", None)
+                    if not req or p["state"] != "armed": continue
+                    if now2 >= p.get("deadline", 0):
+                        # аудит v2.16 №14: запит стакану пережив вікно
+                        # входу — входу заднім числом немає
+                        p["done"] = 1
+                        p["row_kind"] = "rev"
+                        p["final_row"] = _rev_row(p, 0)
+                        rev_rows.append((pid, "rev", p["final_row"]))
                         rev_exited = True
-                        if now2 >= p.get("deadline", 0):
-                            # аудит v2.16 №14: запит стакану пережив вікно
-                            # входу — входу заднім числом немає
-                            p["done"] = 1
-                            p["row_kind"] = "rev"
-                            p["final_row"] = _rev_row(p, 0)
-                            rev_rows.append((pid, "rev", p["final_row"]))
-                            continue
-                        if not xpx:
-                            # аудит №1: вхід лише зі стаканом — чекаємо наступний
-                            # тик (дедлайн вирішить)
-                            continue
-                        trig, mid = req["trig"], req["mid"]
-                        base_px = xpx or mid
-                        # консервативно: гірша з цін (стакан / тригер)
-                        p["entry_px"] = (max(base_px, trig) if p["side"] == "LONG"
-                                         else min(base_px, trig))
-                        p["entry_ts"] = now2
-                        p["entry_src"] = xsrc
-                        p["entry_px_mid"] = xmeta.get("mid") or mid
-                        p["px_age_ms"] = xmeta.get("px_age_ms")
-                        p["state"] = "open"
-                        _journal("rev_arm_entry", pid=pid, coin=p["coin"], px=p["entry_px"],
-                                 src=xsrc, quote_ts_ms=xmeta.get("quote_ts_ms"))
-                    else:
-                        req = p.pop("exit_req", None)
-                        if not req: continue
-                        mid = req.get("mid")
-                        base_px = xpx or mid
-                        if not base_px:
-                            # ні стакану, ні міда: наступна спроба через 15 с, а не
-                            # щотику (стакан лежить → 20 запитів/хв на трекер)
-                            p["exit_retry_at"] = now2 + 15.0
-                        if req["kind"] == "twap":
-                            # TWAP: вихід уже вирішений (_twap_exit) — ціна зі
-                            # стакану в трекер, рядок угоди заморожується
-                            if p.get("trade_row") is not None or p.get("trade_written"):
-                                continue
-                            tw = p.get("twap")
-                            if isinstance(tw, dict) and base_px:
-                                tw["exit_px"] = base_px
-                                tw["exit_src"] = xsrc if xpx else "mid"
-                                tw["exit_ts_ms"] = int(round(now2 * 1000))
-                            p["trade_closed_ts"] = p.get("trade_closed_ts") or now2
-                            p["trade_row"] = _twap_row(p, now2)
-                            _twap_freeze_exit(p)
-                            tw_rows.append((pid, p["trade_row"]))
-                            continue
-                        if p.get("exit_reason"): continue
-                        if not base_px: continue   # ні стакану, ні міда — наступний тик
-                        if req["kind"] == "tp" and p.get("tp_px"):
-                            # лімітка на TP: не краще за TP і не краще за стакан
-                            tp = p["tp_px"]
-                            base_px = (min(base_px, tp) if p["side"] == "LONG"
-                                       else max(base_px, tp))
-                        p["exit_px"] = base_px
-                        p["exit_src"] = xsrc if xpx else "mid"
-                        p["exit_ts_ms"] = int(round(now2 * 1000))
-                        p["exit_min"] = req["min"]
-                        p["exit_reason"] = req["kind"]
-                        p["exit_px_mid"] = xmeta.get("mid") or mid
-                        rev_exited = True
-                        _gx = (base_px / p["entry_px"] - 1.0) * 100.0
-                        if p["side"] == "SHORT": _gx = -_gx
-                        _journal("rev_exit", pid=pid, coin=p["coin"], kind=req["kind"],
-                                 px=base_px, src=p["exit_src"], mid=mid,
-                                 quote_ts_ms=xmeta.get("quote_ts_ms"), exit_min=req["min"])
-                        print(f"  [REV] {p['strategy']} {p['coin']} вихід "
-                              f"{req['kind']} m{req['min']} @ {base_px:.6g} "
-                              f"({p['exit_src']}) gross {_gx:+.2f}%")
-                for fid, xpx, xsrc, xmeta in fpriced:
-                    p = follow_open.get(fid)
-                    if p is None or p.get("done"): continue
-                    req = p.pop("exit_pending", None)
+                        continue
+                    if not xpx or xsrc != "book":
+                        # аудит №1: вхід лише з ПОВНОГО стакану (strict віддає
+                        # саме "book"; partial/mid — ні). arm_hit лишається
+                        # (з тим самим ts) — повторний запит не раніше ніж
+                        # за 30 с (гард переставлення), не щотику
+                        # (рев'ю: без стакану — l2Book + save_state кожні 3 с)
+                        p["arm_hit"] = req
+                        continue
+                    trig, mid = req["trig"], req["mid"]
+                    base_px = xpx
+                    # консервативно: гірша з цін (стакан / тригер)
+                    p["entry_px"] = (max(base_px, trig) if p["side"] == "LONG"
+                                     else min(base_px, trig))
+                    p["entry_ts"] = now2
+                    p["entry_src"] = xsrc
+                    p["entry_px_mid"] = xmeta.get("mid") or mid
+                    p["px_age_ms"] = xmeta.get("px_age_ms")
+                    p["state"] = "open"
+                    rev_exited = True
+                    _jrn.append(("rev_arm_entry", dict(pid=pid, coin=p["coin"], px=p["entry_px"],
+                                                       src=xsrc, quote_ts_ms=xmeta.get("quote_ts_ms"))))
+                else:
+                    req = p.pop("exit_req", None)
                     if not req: continue
-                    now2 = time.time()
                     mid = req.get("mid")
-                    epx = xpx or mid
-                    if not epx:
-                        p["exit_retry_at"] = now2 + 15.0   # ні стакану, ні міда
+                    base_px = xpx or mid
+                    if not base_px:
+                        # ні стакану, ні міда: наступна спроба через 15 с, а не
+                        # щотику (стакан лежить → 20 запитів/хв на трекер)
+                        p["exit_retry_at"] = now2 + 15.0
+                    if req["kind"] == "twap":
+                        # TWAP: вихід уже вирішений (_twap_exit) — ціна зі
+                        # стакану в трекер, рядок угоди заморожується
+                        if p.get("trade_row") is not None or p.get("trade_written"):
+                            continue
+                        tw = p.get("twap")
+                        if isinstance(tw, dict) and base_px:
+                            tw["exit_px"] = base_px
+                            tw["exit_src"] = xsrc if xpx else "mid"
+                            tw["exit_ts_ms"] = int(round(now2 * 1000))
+                        p["trade_closed_ts"] = p.get("trade_closed_ts") or now2
+                        p["trade_row"] = _twap_row(p, now2)
+                        _twap_freeze_exit(p)
+                        tw_rows.append((pid, p["trade_row"]))
                         continue
-                    reason = req["reason"]
-                    if reason == "full_close":
-                        # спізнення відносно ФІЛА кита (або часу, коли
-                        # дізнались) >60 с — інша угода, поза заголовком
-                        _ft = p.get("force_fill_ts_ms")
-                        _ref = (_ft / 1000.0) if _ft else p.get("force_exit_ts")
-                        if _ref and now2 - _ref > 60.0:
-                            reason = "full_close_late"
-                    g = (epx / p["entry_px"] - 1.0) * 100.0
-                    if p["our_side"] == "SHORT": g = -g
-                    p["peak"] = max(p["peak"], g)
-                    p["trough"] = min(p["trough"], g)
-                    p["done"] = 1
+                    if p.get("exit_reason"): continue
+                    if not base_px: continue   # ні стакану, ні міда — наступний тик
+                    if req["kind"] == "tp" and p.get("tp_px"):
+                        # лімітка на TP: не краще за TP і не краще за стакан
+                        tp = p["tp_px"]
+                        base_px = (min(base_px, tp) if p["side"] == "LONG"
+                                   else max(base_px, tp))
+                    p["exit_px"] = base_px
                     p["exit_src"] = xsrc if xpx else "mid"
+                    p["exit_ts_ms"] = int(round(now2 * 1000))
+                    p["exit_min"] = req["min"]
+                    p["exit_reason"] = req["kind"]
                     p["exit_px_mid"] = xmeta.get("mid") or mid
-                    p["close_ts"] = now2
-                    _journal("follow_exit", fid=fid, coin=p["coin"], reason=reason, px=epx,
-                             src=p["exit_src"], mid=mid, quote_ts_ms=xmeta.get("quote_ts_ms"))
-                    # заморожений фінальний рядок: exit/hold/net зафіксовані
-                    # У МОМЕНТ виходу, ретраї запису їх не перерахують
-                    p["final_row"] = _fol_row(p, fid, now2, epx, reason, g)
-                    fol_rows.append((fid, p["final_row"]))
-        written_rev, written_fol = [], []
-        failed_rev, failed_fol = [], []
-        for pid, kind, r in rev_rows:
-            if kind == "out":
-                ok = _strat_csv_append(REV_OUT_CSV, REV_OUT_HEADERS, r)
-            elif kind == "fo":
-                ok = _strat_csv_append(FOLLOW_OUT_CSV, FOLLOW_OUT_HEADERS, r)
-            elif kind == "twapc":
-                ok = _strat_csv_append(TWAP_CURVE_CSV, TWAP_CURVE_HEADERS, r)
-            elif kind == "twap":
-                ok = _strat_csv_append(TWAP_CSV, TWAP_HEADERS, r)
-            else:
-                ok = _strat_csv_append(REV_CSV, REV_HEADERS, r)
-            (written_rev if ok else failed_rev).append(pid)
-        # рядки TWAP-угод у момент виходу (v2.15): трекер лишається (крива),
-        # але результат уже незмінний на диску
-        written_tw = []
-        for pid, r in tw_rows:
-            if _strat_csv_append(TWAP_CSV, TWAP_HEADERS, r):
-                written_tw.append(pid)
-        if tw_rows:
-            with strat2_lock:
-                for pid, _ in tw_rows:
-                    it = rev_open.get(pid)
-                    if it is None: continue
-                    if pid in written_tw:
-                        it["trade_written"] = 1
-                    else:
-                        it["twfail"] = it.get("twfail", 0) + 1
-                        if it["twfail"] in (1, 10, 100):
-                            print(f"  [STRAT] TWAP-угода {pid}: запис не вдався "
-                                  f"({it['twfail']}), повторю")
-                        elif it["twfail"] > WFAIL_CAP:
-                            # як і решта трекерів: після WFAIL_CAP відмов — дроп
-                            # із логом, а не вічний ретрай (рев'ю v2.15)
-                            rev_open.pop(pid, None)
-                            print(f"  [STRAT] DROP TWAP-угода {pid} без запису "
-                                  f"після {WFAIL_CAP} спроб (диск?)")
-        for fid, r in fol_rows:
-            ok = _strat_csv_append(FOLLOW_CSV, FOLLOW_HEADERS, r)
-            (written_fol if ok else failed_fol).append(fid)
-        if rev_rows or fol_rows:
-            with strat2_lock:
-                for pid in written_rev: rev_open.pop(pid, None)
-                for fid in written_fol: follow_open.pop(fid, None)
-                # кап ретраїв: після WFAIL_CAP невдалих записів трекер
-                # скидається (дані втрачені ЯВНО, з логом), а не висить
-                # зомбі, що спамить диск і роздуває стан
-                for coll, pid in ([(rev_open, x) for x in failed_rev]
-                                  + [(follow_open, x) for x in failed_fol]):
-                    it = coll.get(pid)
-                    if it is None: continue
-                    it["wfail"] = it.get("wfail", 0) + 1
-                    if it["wfail"] > WFAIL_CAP:
-                        coll.pop(pid, None)
-                        print(f"  [STRAT] DROP незаписаний трекер {pid} "
+                    rev_exited = True
+                    _gx = (base_px / p["entry_px"] - 1.0) * 100.0
+                    if p["side"] == "SHORT": _gx = -_gx
+                    _jrn.append(("rev_exit", dict(pid=pid, coin=p["coin"], exit_kind=req["kind"],
+                                                  px=base_px, src=p["exit_src"], mid=mid,
+                                                  quote_ts_ms=xmeta.get("quote_ts_ms"),
+                                                  exit_min=req["min"])))
+                    print(f"  [REV] {p['strategy']} {p['coin']} вихід "
+                          f"{req['kind']} m{req['min']} @ {base_px:.6g} "
+                          f"({p['exit_src']}) gross {_gx:+.2f}%")
+            for fid, xpx, xsrc, xmeta in fpriced:
+                p = follow_open.get(fid)
+                if p is None or p.get("done"): continue
+                req = p.pop("exit_pending", None)
+                if not req: continue
+                now2 = time.time()
+                mid = req.get("mid")
+                epx = xpx or mid
+                if not epx:
+                    p["exit_retry_at"] = now2 + 15.0   # ні стакану, ні міда
+                    continue
+                reason = req["reason"]
+                if reason == "full_close":
+                    # спізнення відносно ФІЛА кита (або часу, коли
+                    # дізнались) >60 с — інша угода, поза заголовком
+                    _ft = p.get("force_fill_ts_ms")
+                    _ref = (_ft / 1000.0) if _ft else p.get("force_exit_ts")
+                    if _ref and now2 - _ref > 60.0:
+                        reason = "full_close_late"
+                g = (epx / p["entry_px"] - 1.0) * 100.0
+                if p["our_side"] == "SHORT": g = -g
+                p["peak"] = max(p["peak"], g)
+                p["trough"] = min(p["trough"], g)
+                p["done"] = 1
+                p["exit_src"] = xsrc if xpx else "mid"
+                p["exit_px_mid"] = xmeta.get("mid") or mid
+                p["close_ts"] = now2
+                _jrn.append(("follow_exit", dict(fid=fid, coin=p["coin"], reason=reason, px=epx,
+                                                 src=p["exit_src"], mid=mid,
+                                                 quote_ts_ms=xmeta.get("quote_ts_ms"))))
+                # заморожений фінальний рядок: exit/hold/net зафіксовані
+                # У МОМЕНТ виходу, ретраї запису їх не перерахують
+                p["final_row"] = _fol_row(p, fid, now2, epx, reason, g)
+                fol_rows.append((fid, p["final_row"]))
+        for _jk, _jf in _jrn:
+            _journal(_jk, **_jf)
+    written_rev, written_fol = [], []
+    failed_rev, failed_fol = [], []
+    for pid, kind, r in rev_rows:
+        if kind == "out":
+            ok = _strat_csv_append(REV_OUT_CSV, REV_OUT_HEADERS, r)
+        elif kind == "fo":
+            ok = _strat_csv_append(FOLLOW_OUT_CSV, FOLLOW_OUT_HEADERS, r)
+        elif kind == "twapc":
+            ok = _strat_csv_append(TWAP_CURVE_CSV, TWAP_CURVE_HEADERS, r)
+        elif kind == "twap":
+            ok = _strat_csv_append(TWAP_CSV, TWAP_HEADERS, r)
+        else:
+            ok = _strat_csv_append(REV_CSV, REV_HEADERS, r)
+        (written_rev if ok else failed_rev).append(pid)
+    # рядки TWAP-угод у момент виходу (v2.15): трекер лишається (крива),
+    # але результат уже незмінний на диску
+    written_tw = []
+    for pid, r in tw_rows:
+        if _strat_csv_append(TWAP_CSV, TWAP_HEADERS, r):
+            written_tw.append(pid)
+    if tw_rows:
+        with strat2_lock:
+            for pid, _ in tw_rows:
+                it = rev_open.get(pid)
+                if it is None: continue
+                if pid in written_tw:
+                    it["trade_written"] = 1
+                else:
+                    it["twfail"] = it.get("twfail", 0) + 1
+                    if it["twfail"] in (1, 10, 100):
+                        print(f"  [STRAT] TWAP-угода {pid}: запис не вдався "
+                              f"({it['twfail']}), повторю")
+                    elif it["twfail"] > WFAIL_CAP:
+                        # як і решта трекерів: після WFAIL_CAP відмов — дроп
+                        # із логом, а не вічний ретрай (рев'ю v2.15)
+                        rev_open.pop(pid, None)
+                        print(f"  [STRAT] DROP TWAP-угода {pid} без запису "
                               f"після {WFAIL_CAP} спроб (диск?)")
-        if written_rev or written_fol or written_tw or rev_exited:
-            # СИНХРОННО (v2.14, аудит v2.13 №1): вікно «рядок у CSV, а
-            # трекер ще у state.json» — мілісекунди, а не «коли потік
-            # добереться»; залишок вікна закриває звірка при load_state.
-            # v2.16: і після вирішеного виходу R (рядок пишеться лише на
-            # m60 — аварія до періодичного save_state переоцінювала вихід)
-            save_state()
+    for fid, r in fol_rows:
+        ok = _strat_csv_append(FOLLOW_CSV, FOLLOW_HEADERS, r)
+        (written_fol if ok else failed_fol).append(fid)
+    if rev_rows or fol_rows:
+        with strat2_lock:
+            for pid in written_rev: rev_open.pop(pid, None)
+            for fid in written_fol: follow_open.pop(fid, None)
+            # кап ретраїв: після WFAIL_CAP невдалих записів трекер
+            # скидається (дані втрачені ЯВНО, з логом), а не висить
+            # зомбі, що спамить диск і роздуває стан
+            for coll, pid in ([(rev_open, x) for x in failed_rev]
+                              + [(follow_open, x) for x in failed_fol]):
+                it = coll.get(pid)
+                if it is None: continue
+                it["wfail"] = it.get("wfail", 0) + 1
+                if it["wfail"] > WFAIL_CAP:
+                    coll.pop(pid, None)
+                    print(f"  [STRAT] DROP незаписаний трекер {pid} "
+                          f"після {WFAIL_CAP} спроб (диск?)")
+    if written_rev or written_fol or written_tw or rev_exited:
+        # СИНХРОННО (v2.14, аудит v2.13 №1): вікно «рядок у CSV, а
+        # трекер ще у state.json» — мілісекунди, а не «коли потік
+        # добереться»; залишок вікна закриває звірка при load_state.
+        # v2.16: і після вирішеного виходу R (рядок пишеться лише на
+        # m60 — аварія до періодичного save_state переоцінювала вихід)
+        save_state()
+
 
 # ── API для вкладки "Стратегії" ─────────────────────────
 _strat2_cache = {"ts": 0.0, "data": None}
@@ -6614,6 +6657,16 @@ def _load_settlements():
     try:
         import settle as _settle
         data = _settle.load_settlements(DATA_DIR)
+        # аудит-2 №9/№10: рядки СТАРОЇ версії розрахунку (stale-ціни,
+        # переторговані виходи) — не «verified», а pending: воркер їх
+        # перераховує (новіші першими), до того угода показується як
+        # нерозрахована, а не з хибним офіційним net
+        cur = getattr(_settle, "SETTLE_V", None)
+        if cur is not None:
+            old = [k for k, r in data.items() if (r.get("settle_v") or "").strip() != str(cur)]
+            for k in old:
+                data.pop(k, None)
+            stats["settle_old_v"] = len(old)
     except Exception as e:
         print(f"  [SETTLE] читання settlements.csv: {e}")
         data = {}
@@ -6744,9 +6797,10 @@ def strat2_slice(st, grace="all", vault="all", sht="all", bucket="all"):
         trs = [t for t in trs if (t.get("shtanga") == 1) == (sht == "y")]
     if bucket not in ("all", "", None) and full["kind"] == "rev":
         try:
-            trs = [t for t in trs if t.get("bucket") == int(bucket)]
-        except ValueError:
-            pass
+            bk = int(float(bucket))
+        except (TypeError, ValueError):
+            return {"error": "bad bucket"}   # рев'ю: не віддавати НЕфільтрований зріз мовчки
+        trs = [t for t in trs if t.get("bucket") == bk]
     blk = _agg_block(trs, time.time(), full["H"], buckets=False)
     blk["strategy"] = st
     blk["filters"] = {"grace": grace, "vault": vault, "sht": sht, "bucket": bucket}
@@ -7346,7 +7400,7 @@ def strat2_api():
                       for k in ("move_small", "cancelled", "late",
                                 "not_new_or_reduce", "dup_twapid",
                                 "kind_unproven", "no_verify",
-                                "no_price", "kind_unknown", "busy")},
+                                "no_price", "no_book", "kind_unknown", "busy")},
         })
     with twap_lock:
         _tw_watch = [{"coin": r["coin"], "side": r["side"], "usd": r["usd"],
@@ -8379,7 +8433,13 @@ def _twap_enter(rec, now, px):
     epx, esrc, emeta = _paper_px(rec["coin"], "SELL" if our == "SHORT" else "BUY",
                                  strict=True)
     if not epx:
-        # аудит v2.16 №1: без повного стакану paper-входу немає
+        # аудит v2.16 №1: без повного стакану paper-входу немає. Рев'ю:
+        # транзиторний збій l2Book (бюджет prio-каналу, проксі) — як
+        # no_verify: поки вікно входу відкрите, наступний тик спробує знову;
+        # drop no_book — лише коли вікно вичерпане
+        if rec.get("end") is not None and time.time() < rec["end"] + TWAP_LATE_S - TWAP_POLL_S:
+            stats["twap_book_retry"] = stats.get("twap_book_retry", 0) + 1
+            return
         _twap_drop(rec, "no_book")
         return
     now = time.time()   # ціна відома САМЕ зараз
@@ -9378,6 +9438,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "px_fail":        stats.get("px_fail", 0),
                 "book_ok":        stats.get("book_ok", 0),
                 "book_fail":      stats.get("book_fail", 0),
+                # рев'ю аудит-2: строгий гейт стакану має бути видимим —
+                # book_stale (котирування >5 с: годинник?), partial-стакани,
+                # відмови входу без стакану по сім'ях, ретраї TWAP
+                "book_stale":     stats.get("book_stale", 0),
+                "book_partial_skips": stats.get("book_partial_skips", 0),
+                "rev_no_book":    stats.get("rev_no_book", 0),
+                "follow_no_book": stats.get("follow_no_book", 0),
+                "twap_book_retry": stats.get("twap_book_retry", 0),
+                "strat2_tick_err": stats.get("strat2_tick_err", 0),
+                "journal_err":    stats.get("journal_err", 0),
                 "rev_busy_skips": stats.get("rev_busy_skips", 0),
                 "rev_stale_skips": stats.get("rev_stale_skips", 0),
                 "follow_stale_skips": stats.get("follow_stale_skips", 0),
@@ -9385,6 +9455,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "settle_done":    stats.get("settle_done", 0),
                 "settle_failed":  stats.get("settle_failed", 0),
                 "settle_pending": stats.get("settle_pending", None),
+                "settle_old_v":   stats.get("settle_old_v", 0),   # рядки v1, що чекають перерахунку
                 "settle_last_ok_s_ago": (round(time.time() - stats["settle_last_ok"], 0)
                                          if stats.get("settle_last_ok") else None),
                 "settle_err":     stats.get("settle_err", ""),
@@ -9402,7 +9473,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif self.path.startswith("/strat2_slice"):
             # аудит-2 №4: зріз по ВСІЙ вибірці стратегії на сервері
             try:
-                q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                # рев'ю: BaseHTTPRequestHandler декодує рядок запиту як
+                # iso-8859-1 — сира кирилиця (curl/скрипти) стала б «R1_Ð·…»
+                _path = self.path.encode("latin-1", "replace").decode("utf-8", "replace")
+                q = urllib.parse.parse_qs(urllib.parse.urlparse(_path).query)
                 g = lambda k, d="all": (q.get(k) or [d])[0]
                 self.send_json(strat2_slice(g("st", ""), g("grace"), g("vault"),
                                             g("sht"), g("bucket")))
