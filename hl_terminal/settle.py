@@ -13,7 +13,14 @@ from collections import OrderedDict
 
 __all__ = ["Tape", "HLFills", "exec_px", "get_trades", "symbol_for", "parse_local", "settle_follow",
            "settle_rev", "settle_twap", "settle_pending", "load_settlements", "make_ctx",
-           "whale_episode", "hl_user_fills", "HEADERS", "SETTLE_V"]
+           "whale_episode", "hl_user_fills", "HEADERS", "SETTLE_V", "Transient"]
+
+
+class Transient(Exception):
+    """Транзиторний збій джерела (бюджет/мережа/429): fetcher КИДАЄ його —
+    рядок НЕ фіксується (n_failed), наступний цикл спробує знову.
+    None / b"" від fetcher-а = даних немає (no_tape / no_fills — назавжди,
+    до --force). Дефолтні fetcher-и: 404 → b"", решта помилок → Transient."""
 
 SETTLE_V = "1"
 ZIP_URL = ("https://data.binance.vision/data/futures/um/daily/aggTrades/"
@@ -23,7 +30,10 @@ HL_URL = "https://api.hyperliquid.xyz/info"
 DAY_MS, HOUR_MS, MIN_MS = 86400000, 3600000, 60000
 REST_BUCKET_MS = 600000            # REST-кеш 10-хв відрами (вікно < 1 год)
 REST_MAX_AGE_MS = 48 * HOUR_MS     # REST лише для днів без zip у межах 48 год
-LRU_MAX = 24                       # символо-днів у пам'яті
+LRU_MAX = 6                        # символо-днів у пам'яті (ZEC-день ≈ 45 МБ масивів)
+ZIP_MISS_TTL_S = 3600              # 404 zip (день ще не викладений) — не перепитувати годину
+TAPE_KEEP_DAYS = 14                # zip-и на диску старші за це — видаляються
+_ZIP_MISS = {}                     # (symbol, day) -> ts 404
 COSTS_DEF = 0.15                   # витрати за круг, % (як у server.py)
 R2_BREAKOUT = 0.003                # R2: вхід після руху +0.3% від p0
 R2_WINDOW_MS = 600000              # R2: вікно 10 хв
@@ -91,8 +101,10 @@ def _http(url, data=None, timeout=20):   # GET/POST → bytes; None при 404/�
         with urllib.request.urlopen(urllib.request.Request(url, data=data, headers=hdr),
                                     timeout=timeout) as r:
             return r.read()
-    except Exception:
-        return None
+    except Exception as e:
+        if getattr(e, "code", None) == 404:
+            return b""           # даних справді немає (день без zip) — не збій
+        raise Transient("%s: %r" % (url[:80], e))   # мережа/429/5xx — рядок відкладається
 
 
 def _json_list(b):
@@ -210,8 +222,14 @@ class Tape:
             with open(path, "rb") as f:
                 raw = f.read()
         else:
+            miss_ts = _ZIP_MISS.get(key)
+            if miss_ts is not None and time.time() - miss_ts < ZIP_MISS_TTL_S:
+                self._miss.add(key)          # 404 недавно — не смикати CDN щоциклу
+                return None
             self.stats["zip_fetch"] += 1
-            raw = self.fetch_zip(ZIP_URL.format(s=symbol, d=day))
+            raw = self.fetch_zip(ZIP_URL.format(s=symbol, d=day))   # Transient — нагору
+            if raw is not None and raw == b"":
+                _ZIP_MISS[key] = time.time()
             if raw:
                 with open(path + ".tmp", "wb") as f:
                     f.write(raw)
@@ -402,8 +420,9 @@ class HLFills:
             rows.sort(key=lambda f: int(f.get("time") or 0))
             if complete:
                 _save_json(path, rows)
-        if complete:
-            self._mem[key] = rows
+        # у пам'яті — і неповна година: ctx живе один цикл, а всі рядки одного
+        # епізоду кита ділять адресу/годину (6–15 рядків = 1 запит, не 15)
+        self._mem[key] = rows
         return rows
 
     def user_fills(self, addr, t0_ms, t1_ms):
@@ -603,9 +622,17 @@ def settle_rev(row, ctx):
     out = _base("%s|%s" % (row["sig_id"], strat), "rev", row, ctx, symbol, src, costs)
     e_live, m30 = fnum(row.get("entry_px")), _m30(row)
     out["entry_px_live"] = e_live
-    net_live = (m30 - costs) if m30 is not None else None
-    if e_live and m30 is not None:
-        out["exit_px_live"] = e_live * (1 + m30 / 100.0 * (1 if long else -1))
+    x_live_px, x_reason = fnum(row.get("exit_px")), (row.get("exit_reason") or "")
+    if e_live and x_live_px and x_reason and x_reason != "no_price":
+        # v2.16: вихід зі стакану (таймер/TP) — як рахує API
+        g_live = (x_live_px / e_live - 1) * 100.0 * (1 if long else -1)
+        net_live, out["exit_px_live"] = g_live - costs, x_live_px
+    elif x_reason == "no_price":
+        net_live = None
+    else:
+        net_live = (m30 - costs) if m30 is not None else None
+        if e_live and m30 is not None:
+            out["exit_px_live"] = e_live * (1 + m30 / 100.0 * (1 if long else -1))
     side_in, side_out = ("BUY", "SELL") if long else ("SELL", "BUY")
     p0 = _ref_px(symbol, t0, ctx)
     entry_t = t0
@@ -747,6 +774,32 @@ FAMILIES = (   # (файл, fn, ключ, ms-колонка сортування
 )
 
 
+MIN_ALGO_V = (2, 10)               # рядки старіших версій ніде не показуються
+
+
+def _vt(v):
+    try:
+        return tuple(int(x) for x in str(v).strip().split("."))
+    except (ValueError, AttributeError):
+        return (0,)
+
+
+def _prune_tape(data_dir, log=print):
+    """zip-и стрічки старші за TAPE_KEEP_DAYS — геть (ZEC-день = 36 МБ; повторний
+    розрахунок --force їх завантажить знову)."""
+    try:
+        cut = time.time() - TAPE_KEEP_DAYS * 86400
+        n = 0
+        for f in glob.glob(os.path.join(data_dir, "tape", "*.zip")):
+            if os.path.getmtime(f) < cut:
+                os.remove(f)
+                n += 1
+        if n:
+            log("[settle] видалено старих zip: %d" % n)
+    except OSError as e:
+        log("[settle] чистка zip: %r" % e)
+
+
 def settle_pending(data_dir, symbol_map=None, limit=None, force=False, log=print,
                    fetchers=None, now_ms=None, since=None):
     """Розрахувати ще не розраховані закриті угоди (найстаріші першими).
@@ -755,6 +808,7 @@ def settle_pending(data_dir, symbol_map=None, limit=None, force=False, log=print
     ctx = make_ctx(data_dir, symbol_map, fetchers, now_ms, log)
     done = {} if force else load_settlements(data_dir)
     cands = []
+    n_old = 0
     for name, fn, keyf, ms_cols, dcol in FAMILIES:
         seen = set()
         for row in read_family(data_dir, name):
@@ -764,22 +818,39 @@ def settle_pending(data_dir, symbol_map=None, limit=None, force=False, log=print
             seen.add(key)
             if key in done or (since and (row.get(dcol) or "")[:10] < since):
                 continue
+            if (row.get("algo_v") or "").strip() and _vt(row.get("algo_v")) < MIN_ALGO_V:
+                n_old += 1               # рядки до 2.10 ніде не показуються — не рахуємо
+                continue
             cands.append((_ts(row, ms_cols, dcol)[0] or 0, key, fn, row))
-    cands.sort(key=lambda c: c[0])
-    if limit:
-        cands = cands[:int(limit)]
-    n_done = n_skip = n_fail = 0
+    # НОВІШІ першими: свіжі угоди отримують офіційний net за хвилини, бек-лог
+    # доїжджає далі; limit — лише на СПРОБИ (рядки, що дають None, без мережі)
+    cands.sort(key=lambda c: c[0], reverse=True)
+    settle_pending.last_pending = len(cands)     # бек-лог (/status)
+    n_done = n_skip = n_fail = n_try = 0
     for _, key, fn, row in cands:
+        if limit and n_try >= int(limit):
+            break
         try:
             out = fn(row, ctx)
             if out is None:
                 n_skip += 1
                 continue
+            n_try += 1
             append_settlement(data_dir, out)
             n_done += 1
+        except Transient as e:
+            # джерело недоступне (мережа/429/бюджет) — рядок не фіксуємо,
+            # наступний цикл спробує знову
+            n_fail += 1
+            n_try += 1
+            log("[settle] %s: відкладено — %s" % (key, e))
         except Exception as e:
             n_fail += 1
+            n_try += 1
             log("[settle] збій %s: %r" % (key, e))
+    if n_old:
+        log("[settle] пропущено рядків до v%s: %d" % (".".join(map(str, MIN_ALGO_V)), n_old))
+    _prune_tape(data_dir, log)
     log("[settle] done=%d skipped=%d failed=%d tape=%s hl=%s"
         % (n_done, n_skip, n_fail, ctx["tape"].stats, ctx["hl"].stats))
     return n_done, n_skip, n_fail
