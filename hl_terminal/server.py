@@ -1,6 +1,7 @@
 import http.server
 import urllib.request
 import urllib.error
+import urllib.parse
 import json
 import os
 import time
@@ -382,7 +383,14 @@ def fetch_binance_depth(coin, retries=3):
             best_ask = float(asks[0][0])
             ask_depth = sum(float(p)*float(q) for p,q in asks if float(p) <= best_ask*(1+DEPTH_PCT))
             bid_depth = sum(float(p)*float(q) for p,q in bids if float(p) >= best_bid*(1-DEPTH_PCT))
-            return {"ask": ask_depth, "bid": bid_depth, "max": max(ask_depth, bid_depth)}
+            # аудит v2.16: чи вмістився весь 1%-діапазон у DEPTH_LIMIT рівнів —
+            # якщо останній рівень ще всередині діапазону, глибина занижена
+            trunc = int(float(asks[-1][0]) <= best_ask * (1 + DEPTH_PCT)
+                        or float(bids[-1][0]) >= best_bid * (1 - DEPTH_PCT))
+            if trunc:
+                stats["depth_trunc"] = stats.get("depth_trunc", 0) + 1
+            return {"ask": ask_depth, "bid": bid_depth, "max": max(ask_depth, bid_depth),
+                    "trunc": trunc, "ts": time.time()}
         except Exception as e:
             code = getattr(e, "code", None)
             if code in (418, 429):
@@ -2120,11 +2128,25 @@ def get_recent_market_fills(addr, coin, since_ms, side=None):
                 "hash": h, "sz": 0.0, "cost": 0.0,
                 "ts": f.get("time", 0), "dir": f.get("dir", ""),
                 "oids": set(), "liq": False, "liq_method": "", "sp": 0.0,
+                # аудит v2.16 №6: VWAP ≠ кінець виконання — тримаємо СИРІ
+                # ціни першого й останнього філа ордера (у межах однієї мс
+                # порядок = прохід по стакану: продаж іде вниз по бідах)
+                "px_first": px, "px_last": px,
+                "t_first": f.get("time", 0), "t_last": f.get("time", 0),
             }
         t = txs[h]
         t["sz"]   += sz
         t["cost"] += px * sz
         t["sp"]   = max(t.get("sp", 0.0), _spf)
+        _ft = f.get("time", 0)
+        _sell = d.startswith("Close Long") or d.startswith("Long >") or (
+            side == "LONG" and f_liq)
+        if _ft < t["t_first"] or (_ft == t["t_first"]
+                                  and (px > t["px_first"] if _sell else px < t["px_first"])):
+            t["t_first"], t["px_first"] = _ft, px
+        if _ft > t["t_last"] or (_ft == t["t_last"]
+                                 and (px < t["px_last"] if _sell else px > t["px_last"])):
+            t["t_last"], t["px_last"] = _ft, px
         t["oids"].add(oid)
         if f_liq:
             t["liq"] = True
@@ -2148,6 +2170,8 @@ def get_recent_market_fills(addr, coin, since_ms, side=None):
             "n_orders": len(t["oids"]),
             "liq":     t["liq"],
             "liq_method": t["liq_method"],
+            "px_first": t["px_first"],        # сирий перший філ ордера
+            "px_last":  t["px_last"],         # сирий останній філ (кінець проходу)
         })
     market_txs.sort(key=lambda x: x["ts"], reverse=True)
     return market_txs
@@ -2243,6 +2267,8 @@ def _insert_flipped(addr, coin, pos, alert_key, snap_ms=None):
     # прилетів після знімка, не має опинитись позаду курсора)
     sent_alerts.discard(alert_key)
     close_episodes.pop(alert_key, None)
+    with fc_lock:   # аудит v2.16 №7: епізод старого боку не належить новому
+        fc_episodes.pop((addr, coin), None)
     fill_cursor[alert_key] = max(fill_cursor.get(alert_key, 0),
                                  snap_ms or int(time.time() * 1000))
     print(f"  [WATCH] {coin} {addr[:10]} розворот: новий {pos['side']} "
@@ -2335,6 +2361,8 @@ def run_realtime_monitor():
                             # відсотки рахувались би від старої, меншої
                             # бази і поріг 5% спрацьовував би зарано
                             close_episodes.pop(alert_key, None)
+                            with fc_lock:   # аудит v2.16 №7: і епізод реверсу
+                                fc_episodes.pop((addr, coin), None)
                         else:
                             # Розмір той самий, а ціна входу ІНША: позицію
                             # закрили і перевідкрили тим самим розміром між
@@ -2345,6 +2373,8 @@ def run_realtime_monitor():
                             _en = new_pos.get("entry", 0)
                             if _eo and _en and abs(_en - _eo) / _eo > 1e-4:
                                 close_episodes.pop(alert_key, None)
+                                with fc_lock:   # перевідкриття = нова позиція
+                                    fc_episodes.pop((addr, coin), None)
                                 # v2.12 (з рев'ю CH): перевідкрита позиція
                                 # — нова історія, старий грейс/якір їй не
                                 # належать: мітка лише якщо ЗАРАЗ ≥2
@@ -2449,6 +2479,8 @@ def run_realtime_monitor():
                         # воскресіння снапшотом скану + новий бік фліпа
                         scan_tombstones[alert_key] = time.time()
                         close_episodes.pop(alert_key, None)
+                        with fc_lock:   # тихе закриття лімітками — епізод мертвий
+                            fc_episodes.pop((addr, coin), None)
                         # follow-позиції теж мають вийти: позиція кита
                         # зникла, хай і без нових тейкер-філів (аудит п.8)
                         try:
@@ -2474,6 +2506,17 @@ def run_realtime_monitor():
                 delta_seen.pop(alert_key, None)
                 with fast_lock:
                     fast_retry_cnt.pop((addr, coin), None)   # v2.16: повтори — з нуля на наступну подію
+                # аудит-2 №8: первинна подія у журнал — сирі ціни/розміри/час
+                # кожної транзакції, знімок позиції, джерело детекції
+                _journal("close_batch", addr=addr, coin=coin, side=old.get("side"),
+                         full_close=bool(full_close), detect_src=det_src, snap_ms=snap_ms,
+                         old_size=old.get("size"), old_val=old.get("val"), ratio=old.get("ratio"),
+                         new_size=(new_pos["size"] if new_pos else 0.0),
+                         txs=[{"h": str(f.get("hash"))[:18], "px": f["px"],
+                               "pf": f.get("px_first"), "pl": f.get("px_last"),
+                               "sz": f["sz"], "sp": f.get("sp"), "ts": f.get("ts"),
+                               "dir": f.get("dir"), "liq": int(bool(f.get("liq")))}
+                              for f in mfills[:40]])
                 fill_cursor[alert_key] = max(f["ts"] for f in mfills)
 
                 # Фліп-транзакція ("Long > Short") містить і закриття, і
@@ -3161,6 +3204,26 @@ def _sim_slip(depth):
         return SIM_SPREAD + 0.001
     return SIM_SPREAD + (SIM_POSITION_USD / depth) * 0.005
 
+_journal_lock = threading.Lock()
+def _journal(kind, **fields):
+    """v2.16 (аудит №8): журнал ПЕРВИННИХ подій для майбутнього replay —
+    events-YYYYMMDD.jsonl у DATA_DIR: батчі закриттів кита з сирими
+    цінами філів, рішення входу (стакан, мід, референс, причини пропуску),
+    вирішені виходи. Без нього старий детектор не можна відтворити;
+    з ним — можна перерахувати будь-яке нове правило на минулих подіях."""
+    try:
+        rec = {"ts": round(time.time(), 3), "kind": kind}
+        rec.update(fields)
+        line = json.dumps(rec, ensure_ascii=False, default=str, separators=(",", ":"))
+        path = os.path.join(DATA_DIR, time.strftime("events-%Y%m%d.jsonl"))
+        with _journal_lock:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+    except Exception as e:
+        stats["journal_err"] = stats.get("journal_err", 0) + 1
+        if stats["journal_err"] in (1, 10, 100):
+            print(f"  [JOURNAL] запис не вдався ({stats['journal_err']}): {e}")
+
 def _sim_costs(coin, our_side):
     """v2.16 (рев'ю): витрати за круг, % — комісія ×2 + сліпаж по ОБОХ
     боках стакану Binance: вхід б'є один бік (наш SHORT = SELL у біди),
@@ -3168,19 +3231,37 @@ def _sim_costs(coin, our_side):
     закриття кита. → (costs_pct, depth_entry, depth_exit)."""
     with cache_lock:
         d = cache["depth"].get(coin) or cache.get("depth_prev", {}).get(coin)
+    if d and d.get("ts") and time.time() - d["ts"] > 2 * REFRESH_S:
+        d = None   # аудит v2.16: стара глибина (2 цикли) — як невідома
     bids, asks = depth_for_side(d, "LONG"), depth_for_side(d, "SHORT")
     d_in, d_out = (bids, asks) if our_side == "SHORT" else (asks, bids)
     return ((2 * SIM_COMMISSION + _sim_slip(d_in or 0) + _sim_slip(d_out or 0)) * 100.0,
             d_in or 0, d_out or 0)
 
 def _p_costs(p):
-    """Витрати трекера: збережені при вході (v2.16, обидва боки) або, для
-    трекерів зі старого state, стара формула по одній глибині."""
+    """Витрати трекера (ПОВНА модель, колонка costs_pct): збережені при
+    вході (v2.16, обидва боки) або, для трекерів зі старого state, стара
+    формула по одній глибині."""
     c = p.get("costs")
     if isinstance(c, (int, float)) and math.isfinite(c):
         return float(c)
     slip = _sim_slip(p.get("depth") or 0)
     return (2 * SIM_COMMISSION + 2 * slip) * 100.0
+
+def _leg_costs(costs_full, entry_src, exit_src):
+    """Аудит v2.16 №12: нога, виконана по стакану (VWAP по асках/бідах),
+    уже містить спред і вплив ордера — модельний сліпаж додається ЛИШЕ до
+    ніг, оцінених мідом/семплом. costs_full = комісія×2 + сліпаж×2 (колонка
+    costs_pct); повертає ефективні витрати для net."""
+    comm = 2 * SIM_COMMISSION * 100.0
+    try:
+        slip_each = max(0.0, (float(costs_full) - comm) / 2.0)
+    except (TypeError, ValueError):
+        slip_each = 0.0
+    def _book(src):
+        return str(src or "").startswith("book")
+    return comm + (0.0 if _book(entry_src) else slip_each) \
+                + (0.0 if _book(exit_src) else slip_each)
 
 def hl_book_exec(coin, side, usd=None):
     """Свіжий стакан HL (l2Book, вага 2) через prio-канал → ВИКОНУВАНА
@@ -3221,6 +3302,16 @@ def hl_book_exec(coin, side, usd=None):
             break
     if qty <= 0:
         return None
+    # аудит v2.16 №14: час котирування — біржовий; стакан старший за
+    # BOOK_MAX_AGE_S відносно локального годинника = не «зараз»
+    try:
+        q_ms = int(data.get("time") or 0)
+    except (TypeError, ValueError):
+        q_ms = 0
+    q_age = (time.time() * 1000 - q_ms) / 1000.0 if q_ms else None
+    if q_age is not None and abs(q_age) > BOOK_MAX_AGE_S:
+        stats["book_stale"] = stats.get("book_stale", 0) + 1
+        return None
     stats["book_ok"] = stats.get("book_ok", 0) + 1
     partial = int(left > 1e-9)
     # стакан (20 рівнів) не вміщує $1000: VWAP заповненої частини —
@@ -3230,7 +3321,7 @@ def hl_book_exec(coin, side, usd=None):
            else (best_ask or best_bid))
     return {"px": px_exec, "mid": mid,
             "bid": best_bid, "ask": best_ask,
-            "ts_ms": int(data.get("time") or t0 * 1000),
+            "ts_ms": (q_ms or int(t0 * 1000)), "q_age_s": q_age,
             "req_ms": int((time.time() - t0) * 1000),
             "partial": partial}
 
@@ -3254,20 +3345,32 @@ def _px_mid_age(coin):
         ts, px = h[-1]
     return px, int((time.time() - ts) * 1000)
 
-def _paper_px(coin, side, whale_px=None, max_mid_age_ms=20_000):
+def _paper_px(coin, side, whale_px=None, max_mid_age_ms=20_000, strict=False):
     """Ціна paper-угоди У МОМЕНТ рішення (v2.16): свіжий стакан → src
-    'book'; нема — гірша для нас із кеш-міда і ціни філа кита → 'mid+whale'
-    (лише мід → 'mid'); нема й міда → (None, 'none'). BUY: гірша = вища,
-    SELL: нижча. meta несе мід, його вік, ціну філа кита і час запиту —
-    усе це йде в рядок, щоб похибку можна було виміряти, а не вгадувати."""
-    mid, age_ms = _px_mid_age(coin)
-    meta = {"mid": mid, "px_age_ms": age_ms, "whale_px": whale_px,
-            "book_ms": None, "partial": 0}
+    'book'. strict=True (ВХОДИ, аудит v2.16 №1): без повного стакану
+    угоди немає — (None, 'no_book'); мід/ціна філа кита не є доказом
+    виконуваної ціни ПІСЛЯ зливу. strict=False (виходи, тіньова стрічка):
+    нема стакану — гірша для нас із кеш-міда і ціни філа кита →
+    'mid+whale' (лише мід → 'mid'); нема й міда → (None, 'none'). BUY:
+    гірша = вища, SELL: нижча. Стакан, що не вмістив $1000 (partial), —
+    не доказ повного виконання: у strict = нема стакану, інакше src
+    'book_partial' за гіршим пройденим рівнем. Вік міда міряється ПІСЛЯ
+    запиту стакану (запит міг тривати секунди). meta: мід, його вік, ціна
+    філа кита, час запиту, біржовий час котирування — усе йде в рядок."""
+    meta = {"mid": None, "px_age_ms": None, "whale_px": whale_px,
+            "book_ms": None, "partial": 0, "quote_ts_ms": None}
     bx = hl_book_exec(coin, side)
+    mid, age_ms = _px_mid_age(coin)   # ПІСЛЯ запиту: вік на момент входу
+    meta["mid"], meta["px_age_ms"] = mid, age_ms
     if bx:
         meta["book_ms"] = bx["req_ms"]; meta["partial"] = bx["partial"]
-        meta["book_mid"] = bx["mid"]
+        meta["book_mid"] = bx["mid"]; meta["quote_ts_ms"] = bx["ts_ms"]
+        if bx["partial"] and strict:
+            stats["book_partial_skips"] = stats.get("book_partial_skips", 0) + 1
+            return None, "no_book", meta
         return bx["px"], ("book_partial" if bx["partial"] else "book"), meta
+    if strict:
+        return None, "no_book", meta
     if mid is None or (age_ms or 0) > max_mid_age_ms:
         return None, "none", meta
     px, src = mid, "mid"
@@ -3987,13 +4090,22 @@ def fc_on_txs(addr, coin, old, mfills):
         new = sorted([t for t in mfills if t.get("hash") not in seen],
                      key=lambda t: t.get("ts", 0))
         if not new: return
-        # стара серія видихлась: нова транзакція починає нову
-        if ep and (new[0]["ts"] - ep["last_ts"]) / 1000 > FC_MAX_EPISODE_S \
-              and key not in fc_positions:
-            ep = None
+        # стара серія видихлась: нова транзакція починає нову.
+        # v2.16 (аудит №5/№7): ЄДИНЕ правило епізоду з settle.py —
+        # розрив ≤FC_MAX_EPISODE_S між сусідніми транзакціями І позиція
+        # між ними не зростала (startPosition нової tx ≈ залишок після
+        # попередньої; долив/перевідкриття = новий епізод із новою базою)
+        if ep and key not in fc_positions:
+            _gap = (new[0]["ts"] - ep["last_ts"]) / 1000
+            _sp0 = new[0].get("sp") or 0
+            _pa = ep.get("pos_after")
+            if _gap > FC_MAX_EPISODE_S or (
+                    _sp0 and _pa is not None and _sp0 > _pa * 1.01 + 1e-9):
+                ep = None
         if ep is None:
             t0 = new[0]
-            ep = {"first_ts": t0["ts"], "first_px": t0["px"],
+            ep = {"first_ts": t0["ts"], "first_px": (t0.get("px_first") or t0["px"]),
+                  "pos_after": None,
                   "last_ts": t0["ts"], "sum_usd": 0.0, "seen": set(),
                   "side": old.get("side", "?"),
                   "ratio": old.get("ratio", 0), "val": old.get("val", 0),
@@ -4002,13 +4114,15 @@ def fc_on_txs(addr, coin, old, mfills):
                   # звіряється з ними, а не з залишком поточного батча
                   # (аудит v2.10 №2: велика tx могла бути в попередньому
                   # батчі, а частки в токенах не спотворює рух ціни)
-                  "start_size": old.get("size", 0),
+                  "start_size": (t0.get("sp") or old.get("size", 0)),
                   "max_sz": 0.0, "max_usd": 0.0, "max_liq": 0}
             fc_episodes[key] = ep
         for t in new:
             ep["seen"].add(t.get("hash"))
             ep["last_ts"] = max(ep["last_ts"], t.get("ts", 0))
             ep["sum_usd"] += t["px"] * t["sz"]
+            if t.get("sp"):
+                ep["pos_after"] = max(0.0, float(t["sp"]) - float(t["sz"]))
             if t["sz"] > ep.get("max_sz", 0):
                 ep["max_sz"] = t["sz"]
                 ep["max_usd"] = t["px"] * t["sz"]
@@ -4179,6 +4293,7 @@ R7_NAME          = "R7_одним"       # реверс «одним постр�
                                     # ≥$100k, рух ≥1% — вхід одразу
 R7_MIN_TX_USD    = 100_000.0
 # ── v2.16 ──
+BOOK_MAX_AGE_S   = 5.0              # стакан із біржовим часом старшим за це — не «зараз»
 R8_NAME          = "R8_тп80"        # реверс з уявним тейк-профітом: лонг
                                     # після падіння, вихід при відновленні
                                     # 80% руху (падіння 1% → TP +0.8%),
@@ -4347,8 +4462,9 @@ STRAT2_DESC = {
     "R3_великі":    "Відскок тільки на ZEC і HYPE (вибір користувача)",
     "R4_великий":   "Відскок тільки після сильного падіння ≥2% за епізод",
     "R5_дуже":      "Відскок тільки після екстремального падіння ≥3% за епізод",
-    "R6_волт":      "Відскок після зливу ВОЛТОМ (механічний вивід коштів "
-                    "вкладників, не рішення трейдера)",
+    "R6_волт":      "Реверс проти волта (механічний вивід коштів вкладників): "
+                    "ПОВНЕ закриття, епізод <5 хв, падіння ≥1% (v2.16: шматок "
+                    "≥5% без повного закриття — не сигнал)",
     "R7_одним":     "Проти кита: ВСЯ позиція закрита однією транзакцією "
                     "≥$100k, падіння ≥1% — вхід одразу",
     "R8_тп80":      "Проти кита, як R1, але з уявним тейк-профітом: монета "
@@ -4696,13 +4812,17 @@ def _px_ago(coin, sec):
     return best[1] if target - best[0] <= PX_AGO_TOL_S else None
 
 # ── РЕВЕРС ──────────────────────────────────────────────
+REV_REF_TOL_S = 12.0   # семпл-референс не старший за це (поллер — кожні 5 с)
+
 def _rev_ref_px(coin, first_ts_ms, first_px):
     """v2.16 п.7: референс «до закриття» для руху епізоду — мід ДО першого
-    close-філа кита (5-с семпл поллера, не пізніший за філ, ≤90 с): сам
-    перший ордер уже рухає ціну (одним пострілом = один філ, у якого перша
-    ціна = остання). Нема семпла — ціна першого філа."""
+    close-філа кита (5-с семпл поллера, не пізніший за філ). Аудит №6:
+    допуск лише REV_REF_TOL_S=12 с — 80-секундний мід давав фальшивий
+    «дамп 1% за 2 с» із руху, що стався ДО закриття. Нема свіжого семпла
+    — СИРА ціна першого філа (консервативно: удар першого ордера не
+    рахується у рух)."""
     if first_ts_ms:
-        p = _px_at(coin, first_ts_ms / 1000.0 - 0.001, tol=90.0)
+        p = _px_at(coin, first_ts_ms / 1000.0 - 0.001, tol=REV_REF_TOL_S)
         if p:
             return p
     return first_px
@@ -4750,7 +4870,10 @@ def rev_on_close(addr, coin, old, mfills, full_close, detect_src="sweep"):
     # ВОЛТ = реальна стратегія ЛИШЕ за старим гейтом (повне АБО шматок
     # >=5%); партіал-30% без великого шматка — тінь src=partial і для
     # волта (рев'ю v2.5 п.3: інакше R6 тихо отримував новий клас подій)
-    if vault and (full_close or big_any):
+    # аудит v2.16 №16: R6 — теж лише ПОВНЕ закриття (єдине епізодне
+    # правило п.7 для всіх реверсів); шматок волта ≥5% без повного
+    # закриття — не сигнал і не тінь
+    if vault and full_close:
         src = "vault"
     elif not vault and full_close:
         src = "wallet"
@@ -4780,11 +4903,14 @@ def rev_on_close(addr, coin, old, mfills, full_close, detect_src="sweep"):
         ep = dict(_ep0) if _ep0 else None
     _txs = sorted(mfills, key=lambda f: f.get("ts") or 0)
     fill_ts_ms = int(_txs[-1].get("ts") or 0)
-    last_px = float(_txs[-1]["px"])
+    # аудит v2.16 №6: кінець зливу — СИРИЙ останній філ (VWAP ордера, що
+    # пройшов кілька рівнів, ховає кінець проходу)
+    last_px = float(_txs[-1].get("px_last") or _txs[-1]["px"])
     if ep and ep.get("first_ts") and ep.get("first_px"):
         dump_first_ts, dump_first_px = int(ep["first_ts"]), float(ep["first_px"])
     else:
-        dump_first_ts, dump_first_px = int(_txs[0].get("ts") or fill_ts_ms), float(_txs[0]["px"])
+        dump_first_ts = int(_txs[0].get("ts") or fill_ts_ms)
+        dump_first_px = float(_txs[0].get("px_first") or _txs[0]["px"])
     dump_last_ts = max(fill_ts_ms, int((ep or {}).get("last_ts") or 0))
     dump_dur = (max(0.0, (dump_last_ts - dump_first_ts) / 1000.0)
                 if dump_first_ts and dump_last_ts else 0.0)
@@ -4806,11 +4932,18 @@ def rev_on_close(addr, coin, old, mfills, full_close, detect_src="sweep"):
     # ціна входу — зі СВІЖОГО стакану з нашого боку (проти кита: його
     # LONG закрито → ми купуємо), без стакану — гірша з міда й ціни
     # останнього філа кита (v2.16 п.1)
+    # аудит v2.16 №1: стратегії відкриваються ЛИШЕ за повним свіжим
+    # стаканом; без нього — тільки тіньова outcome-стрічка від міда
     px_entry, entry_src, pmeta = _paper_px(coin, "BUY" if side == "LONG" else "SELL",
-                                           whale_px=last_px)
-    if not px_entry:
-        stats["rev_no_px"] = stats.get("rev_no_px", 0) + 1
-        return
+                                           whale_px=last_px, strict=True)
+    no_book = not px_entry
+    if no_book:
+        stats["rev_no_book"] = stats.get("rev_no_book", 0) + 1
+        _mid0, _age0 = _px_mid_age(coin)
+        if _mid0 is None or (_age0 or 0) > 20_000:
+            stats["rev_no_px"] = stats.get("rev_no_px", 0) + 1
+            return
+        px_entry, entry_src = _mid0, "mid"
     t_entry = time.time()   # ціна відома САМЕ зараз (запит стакану міг тривати секунди)
     px_now = pmeta.get("book_mid") or pmeta.get("mid") or px_entry
     stale = lag_s is not None and lag_s > REV_MAX_FILL_AGE_S
@@ -4867,8 +5000,8 @@ def rev_on_close(addr, coin, old, mfills, full_close, detect_src="sweep"):
                and _big_tx["px"] * _big_tx["sz"] >= R7_MIN_TX_USD \
                and not _big_tx.get("liq"):
                 one_shot = 1
-    if below_threshold or src == "partial" or stale:
-        strats = []   # 0.5-1%, довгий епізод, часткове або старий філ: лише outcome
+    if below_threshold or src == "partial" or stale or no_book:
+        strats = []   # 0.5-1%, довгий епізод, часткове, старий філ або без стакану: лише outcome
     elif src == "vault":
         strats = ["R6_волт"]
     else:
@@ -4877,6 +5010,14 @@ def rev_on_close(addr, coin, old, mfills, full_close, detect_src="sweep"):
         if mag + 1e-9 >= 2.0: strats.append("R4_великий")
         if mag + 1e-9 >= 3.0: strats.append("R5_дуже")
         if one_shot: strats.append(R7_NAME)   # вхід одразу, як R1
+    _journal("rev_decision", sig_id=sig_id, addr=addr, coin=coin, side=side, src=src,
+             detect_src=detect_src, ref_px=ref_px, first_px=dump_first_px, last_px=last_px,
+             dump_first_ts=dump_first_ts, dump_last_ts=dump_last_ts, dump_dur=round(dump_dur, 1),
+             mag=round(mag, 4), bucket=dump_bucket, lag_s=(round(lag_s, 2) if lag_s is not None else None),
+             stale=bool(stale), no_book=bool(no_book), entry_px=px_entry, entry_src=entry_src,
+             mid=pmeta.get("mid"), mid_age_ms=pmeta.get("px_age_ms"),
+             quote_ts_ms=pmeta.get("quote_ts_ms"), btc_ok=bool(btc_ok), below=bool(below_threshold),
+             strats=list(strats))
     base_pos = {"sig_id": sig_id, "coin": coin,
                 "side": side, "addr": addr, "src": src,
                 "detect_ts": now, "detect_px": px_now,
@@ -5096,13 +5237,14 @@ def _fol_row(p, fid, close_ts, exit_px, reason, g):
     виходу — зі стакану в момент рішення (exit_src), плюс мс-мітки, вік
     філа кита і міда на вході, джерела цін, ціна філа кита, грейс."""
     costs = _p_costs(p)
+    costs_eff = _leg_costs(costs, p.get("entry_src"), p.get("exit_src"))
     _bm = p.get("btc_move")
     pr = p.get("prof") or {}
     return [_dt(p["open_ts"]), _dt(close_ts),
             p["strategy"], p["coin"], p["our_side"], p["addr"],
             round(p["entry_px"], 8), round(exit_px, 8), reason,
             round(close_ts - p["open_ts"], 1), round(g, 4),
-            round(costs, 4), round(g - costs, 4),
+            round(costs, 4), round(g - costs_eff, 4),
             round(p["peak"], 4), round(p["trough"], 4),
             round(p["tx_pct"], 3), round(p["tx_usd"], 0),
             round(p["ratio"], 2), round(p["pos_usd"], 0),
@@ -5170,7 +5312,9 @@ def follow_on_txs(addr, coin, old, mfills, full_close, detect_src="sweep"):
     # вхід «зараз» у рух, що вже відбувся, не є стратегією; алерти й
     # тінь пари від цього не залежать. Вік філа і джерело детекції — у
     # рядок кожної угоди
-    fill_ts_ms = max((f.get("ts") or 0) for f in mfills) or 0
+    # аудит v2.16 №2: вік — саме ТРИГЕРНОЇ транзакції (найбільшої
+    # придатної), а не найновішого дрібного філа батча
+    fill_ts_ms = int(tx.get("ts") or 0)
     lag_s = (now - fill_ts_ms / 1000.0) if fill_ts_ms else None
     if lag_s is not None and lag_s > FOLLOW_MAX_FILL_AGE_S:
         stats["follow_stale_skips"] = stats.get("follow_stale_skips", 0) + 1
@@ -5184,13 +5328,16 @@ def follow_on_txs(addr, coin, old, mfills, full_close, detect_src="sweep"):
                           for f in mfills):
         first_shot = 0
     our = "SHORT" if old.get("side") == "LONG" else "LONG"
-    # v2.16 (аудит: paper-вхід за застарілим мідом): ціна входу — зі
-    # СВІЖОГО стакану з нашого боку (виконувана на $1000); без стакану —
-    # гірша з кеш-міда і ціни філа кита, з позначкою джерела у рядку
+    # v2.16 (аудит: paper-вхід за застарілим мідом): ціна входу — ЛИШЕ зі
+    # СВІЖОГО повного стакану з нашого боку (виконувана на $1000); без
+    # нього paper-угоди немає (аудит №1: мід і ціна філа кита не є доказом
+    # ціни після зливу) — пропуск рахується
     px, entry_src, pmeta = _paper_px(coin, "SELL" if our == "SHORT" else "BUY",
-                                     whale_px=tx["px"])
+                                     whale_px=tx["px"], strict=True)
     if not px:
-        stats["follow_no_px"] = stats.get("follow_no_px", 0) + 1
+        stats["follow_no_book"] = stats.get("follow_no_book", 0) + 1
+        _journal("follow_skip", addr=addr, coin=coin, why="no_book",
+                 fill_ts_ms=fill_ts_ms, lag_s=lag_s, detect_src=detect_src)
         return
     t_entry = time.time()   # ціна відома САМЕ зараз — від цього моменту угода
     vault = is_vault(addr)
@@ -5202,6 +5349,10 @@ def follow_on_txs(addr, coin, old, mfills, full_close, detect_src="sweep"):
     # грейс (v2.16 п.4): пара пройшла ratio-гейт лише завдяки 30-хв
     # грейсу після падіння ratio нижче 2 — позначка, щоб вимикати кнопкою
     grace = int((old.get("ratio") or 0) < 2.0)
+    _journal("follow_entry", addr=addr, coin=coin, our=our, detect_src=detect_src,
+             fill_ts_ms=fill_ts_ms, lag_s=(round(lag_s, 2) if lag_s is not None else None),
+             tx_px=tx["px"], tx_sz=tx["sz"], px=px, src=entry_src, mid=pmeta.get("mid"),
+             mid_age_ms=pmeta.get("px_age_ms"), quote_ts_ms=pmeta.get("quote_ts_ms"), grace=grace)
     base = {"key": key, "coin": coin, "our_side": our, "addr": addr,
             "open_ts": t_entry, "entry_px": px, "peak": -999.0, "trough": 999.0,
             "tx_pct": tx["sz"] / (tx.get("sp") or base_sz) * 100.0,
@@ -6167,11 +6318,15 @@ def run_strat2_loop():
                               f"(старий state)")
                     continue
                 px = _px_now(p["coin"], max_age=30.0)
-                if not px: continue
-                g = (px / p["entry_px"] - 1.0) * 100.0
-                if p["our_side"] == "SHORT": g = -g
-                p["peak"] = max(p["peak"], g)
-                p["trough"] = min(p["trough"], g)
+                if px:
+                    g = (px / p["entry_px"] - 1.0) * 100.0
+                    if p["our_side"] == "SHORT": g = -g
+                    p["peak"] = max(p["peak"], g)
+                    p["trough"] = min(p["trough"], g)
+                # аудит v2.16 №13: умова виходу (повне закриття / таймер
+                # тиші) не залежить від поллера мідів — ціну дає стакан
+                if now < (p.get("exit_retry_at") or 0):
+                    continue
                 reason = p.get("force_exit")
                 if not reason:
                     last = follow_last_close.get(p["key"], p["open_ts"])
@@ -6236,16 +6391,30 @@ def run_strat2_loop():
                         req = p.pop("arm_hit", None)
                         if not req or p["state"] != "armed": continue
                         rev_exited = True
+                        if now2 >= p.get("deadline", 0):
+                            # аудит v2.16 №14: запит стакану пережив вікно
+                            # входу — входу заднім числом немає
+                            p["done"] = 1
+                            p["row_kind"] = "rev"
+                            p["final_row"] = _rev_row(p, 0)
+                            rev_rows.append((pid, "rev", p["final_row"]))
+                            continue
+                        if not xpx:
+                            # аудит №1: вхід лише зі стаканом — чекаємо наступний
+                            # тик (дедлайн вирішить)
+                            continue
                         trig, mid = req["trig"], req["mid"]
                         base_px = xpx or mid
                         # консервативно: гірша з цін (стакан / тригер)
                         p["entry_px"] = (max(base_px, trig) if p["side"] == "LONG"
                                          else min(base_px, trig))
                         p["entry_ts"] = now2
-                        p["entry_src"] = xsrc if xpx else "mid"
+                        p["entry_src"] = xsrc
                         p["entry_px_mid"] = xmeta.get("mid") or mid
                         p["px_age_ms"] = xmeta.get("px_age_ms")
                         p["state"] = "open"
+                        _journal("rev_arm_entry", pid=pid, coin=p["coin"], px=p["entry_px"],
+                                 src=xsrc, quote_ts_ms=xmeta.get("quote_ts_ms"))
                     else:
                         req = p.pop("exit_req", None)
                         if not req: continue
@@ -6286,6 +6455,9 @@ def run_strat2_loop():
                         rev_exited = True
                         _gx = (base_px / p["entry_px"] - 1.0) * 100.0
                         if p["side"] == "SHORT": _gx = -_gx
+                        _journal("rev_exit", pid=pid, coin=p["coin"], kind=req["kind"],
+                                 px=base_px, src=p["exit_src"], mid=mid,
+                                 quote_ts_ms=xmeta.get("quote_ts_ms"), exit_min=req["min"])
                         print(f"  [REV] {p['strategy']} {p['coin']} вихід "
                               f"{req['kind']} m{req['min']} @ {base_px:.6g} "
                               f"({p['exit_src']}) gross {_gx:+.2f}%")
@@ -6297,7 +6469,9 @@ def run_strat2_loop():
                     now2 = time.time()
                     mid = req.get("mid")
                     epx = xpx or mid
-                    if not epx: continue
+                    if not epx:
+                        p["exit_retry_at"] = now2 + 15.0   # ні стакану, ні міда
+                        continue
                     reason = req["reason"]
                     if reason == "full_close":
                         # спізнення відносно ФІЛА кита (або часу, коли
@@ -6314,6 +6488,8 @@ def run_strat2_loop():
                     p["exit_src"] = xsrc if xpx else "mid"
                     p["exit_px_mid"] = xmeta.get("mid") or mid
                     p["close_ts"] = now2
+                    _journal("follow_exit", fid=fid, coin=p["coin"], reason=reason, px=epx,
+                             src=p["exit_src"], mid=mid, quote_ts_ms=xmeta.get("quote_ts_ms"))
                     # заморожений фінальний рядок: exit/hold/net зафіксовані
                     # У МОМЕНТ виходу, ретраї запису їх не перерахують
                     p["final_row"] = _fol_row(p, fid, now2, epx, reason, g)
@@ -6445,23 +6621,136 @@ def _load_settlements():
     return data
 
 def _official_net(net_live, srow, fnum):
-    """v2.16 п.3: офіційний net = ГІРШИЙ з live-запису і стрічки Binance.
-    → (official, net_tape, settled, flags). Розрахований рядок без ціни зі
-    стрічки (no_tape / no_trigger) лишає live із прапорцем."""
+    """v2.16 п.3 (аудит-2 №10/№11): офіційний net = ГІРШИЙ з ДОСТУПНИХ
+    оцінок — live-запису і стрічки Binance; коли є лише одна — вона
+    (записаний результат ніколи не зникає). Статус верифікації:
+    verified (обидві оцінки), live_only (стрічки нема / R2 без тригера на
+    стрічці), tape_only (live без ціни), none, pending (ще не розраховано).
+    → (official, net_tape, settled, flags, status)."""
     if not srow:
-        return net_live, None, 0, ""
+        return net_live, None, 0, "", ("live_only" if net_live is not None else "pending")
     nt = fnum(srow.get("net_tape_pct"))
     flags = srow.get("flags") or ""
-    if "no_trigger" in flags:
-        # R2: стрічка не бачила пробою — за гіршим сценарієм угоди не було
-        return None, None, 1, flags
-    if nt is None:
-        return net_live, None, 1, flags
-    if net_live is None:
-        # live-результату немає (без ціни) — стрічка сама по собі не «гірший
-        # з двох»; угода лишається без результату
-        return None, nt, 1, flags
-    return min(net_live, nt), nt, 1, flags
+    if nt is not None and net_live is not None:
+        return min(net_live, nt), nt, 1, flags, "verified"
+    if nt is not None:
+        return nt, nt, 1, flags, "tape_only"
+    if net_live is not None:
+        return net_live, None, 1, flags, "live_only"
+    return None, None, 1, flags, "none"
+
+def _parse_curve(txt, H):
+    """curve_tape settlement ("v1;v2;…", "" = нема) → список H float/None."""
+    if not txt:
+        return None
+    out = []
+    for x in str(txt).split(";")[:H]:
+        try:
+            v = float(x)
+            out.append(v if math.isfinite(v) else None)
+        except (TypeError, ValueError):
+            out.append(None)
+    if not any(v is not None for v in out):
+        return None
+    return out + [None] * (H - len(out))
+
+def _curves_of(trs, H):
+    """Криві «медіана net за хвилиною виходу» (аудит-2 №3): зі СТРІЧКИ
+    (settlement curve_tape, ті самі правила ціни/витрат, що й офіційний
+    net), коли їх ≥3; інакше — live-семпли (мід поллера) з явним
+    підписом curve_src=live. Спільна когорта — лише повні траєкторії."""
+    tape_rows = [t["_ct"] for t in trs if t.get("_ct")]
+    live_rows = [t["_cl"] for t in trs if t.get("_cl")]
+    src = "tape" if len(tape_rows) >= 3 else "live"
+    rows_ = tape_rows if src == "tape" else live_rows
+    curve = [[] for _ in range(H)]
+    complete = []
+    for vals in rows_:
+        vv = list(vals[:H]) + [None] * (H - len(vals[:H]))
+        for i, v in enumerate(vv):
+            if v is not None:
+                curve[i].append(v)
+        if all(v is not None for v in vv):
+            complete.append(vv)
+    return {"curve": [(_median(c) if c else None) for c in curve],
+            "curve_n": [len(c) for c in curve],
+            "curve_common": ([_median([c[i] for c in complete]) for i in range(H)]
+                             if complete else None),
+            "curve_common_n": len(complete), "curve_src": src,
+            "curve_tape_n": len(tape_rows), "curve_live_n": len(live_rows)}
+
+def _agg_block(trs, now, H, buckets=False):
+    """ЄДИНИЙ агрегатор статистики стратегії/зрізу (аудит-2 №4): ті самі
+    правила для картки, періодів, когорт, кривих і серверного зрізу.
+    Заголовкова вибірка = офіційний net угод БЕЗ пізніх виходів (late) і
+    БЕЗ старих F-рядків, що не пройшли б гейт свіжості (stale)."""
+    head = [t for t in trs if t.get("entered", 1) != 0 and t.get("net30") is not None
+            and not t.get("late") and not t.get("stale")]
+    nets = [t["net30"] for t in head]
+    items = [(t.get("ts"), t["net30"]) for t in head]
+    half = len(nets) // 2
+    cum, acc = [], 0.0
+    for v in nets:
+        acc += v; cum.append(round(acc, 3))
+    ver = [t["net30"] for t in head if t.get("status") == "verified"]
+    out = {"n": len(nets), "median": _median(nets),
+           "mean": (sum(nets) / len(nets)) if nets else None,
+           "win": (100.0 * sum(1 for v in nets if v > 0) / len(nets)) if nets else None,
+           "pnl_usd": round(sum(nets) * 10.0, 2) if nets else 0.0,
+           "half1": _median(nets[:half]), "half2": _median(nets[half:]), "cum": cum,
+           "periods": _period_stats(items, now),
+           "live": _stat_small([t["net_live"] for t in head if t.get("net_live") is not None]),
+           "tape": _stat_small([t["net_tape"] for t in head if t.get("net_tape") is not None]),
+           # лише верифіковані (обидві оцінки є; аудит-2 №10)
+           "verified": _stat_small(ver),
+           "n_late": sum(1 for t in trs if t.get("late")),
+           "n_stale": sum(1 for t in trs if t.get("stale")),
+           "n_no_price": sum(1 for t in trs if t.get("no_price")),
+           "n_settled": sum(1 for t in trs if t.get("settled")),
+           "n_unsettled": sum(1 for t in trs if not t.get("settled") and t.get("net30") is not None),
+           "n_verified": sum(1 for t in trs if t.get("status") == "verified"),
+           "n_live_only": sum(1 for t in trs if t.get("status") == "live_only"),
+           "n_tape_only": sum(1 for t in trs if t.get("status") == "tape_only"),
+           "n_mismatch": sum(1 for t in trs if t.get("mismatch")),
+           "n_grace": sum(1 for t in trs if t.get("grace") == 1),
+           "n_grace_unknown": sum(1 for t in trs if t.get("grace") is None),
+           "n_trades_total": len(trs)}
+    out.update(_curves_of(head, H))
+    if buckets:
+        out["buckets"] = {str(b): _stat_small([t["net30"] for t in head if t.get("bucket") == b])
+                          for b in (1, 2, 3, 4, 5)}
+    return out
+
+_PRIV = ("_ct", "_cl")
+def _pub(trs):
+    """Публічні копії угод (без внутрішніх кривих)."""
+    return [{k: v for k, v in t.items() if k not in _PRIV} for t in trs]
+
+_strat2_full = {}   # стратегія -> {"kind", "H", "trades": [усі угоди з кривими]} (для /strat2_slice)
+
+def strat2_slice(st, grace="all", vault="all", sht="all", bucket="all"):
+    """Аудит-2 №4: зріз стратегії на СЕРВЕРІ по ВСІЙ вибірці до агрегації
+    (не по останніх 120 у браузері): ті самі правила, що й картка."""
+    strat2_api()
+    full = _strat2_full.get(st)
+    if not full:
+        return {"error": "unknown strategy"}
+    trs = full["trades"]
+    if grace in ("y", "n"):
+        trs = [t for t in trs if t.get("grace") == (1 if grace == "y" else 0)]
+    if vault in ("y", "n"):
+        trs = [t for t in trs if (t.get("vault") or 0) == (1 if vault == "y" else 0)]
+    if sht in ("y", "n") and full["kind"] == "rev":
+        trs = [t for t in trs if (t.get("shtanga") == 1) == (sht == "y")]
+    if bucket not in ("all", "", None) and full["kind"] == "rev":
+        try:
+            trs = [t for t in trs if t.get("bucket") == int(bucket)]
+        except ValueError:
+            pass
+    blk = _agg_block(trs, time.time(), full["H"], buckets=False)
+    blk["strategy"] = st
+    blk["filters"] = {"grace": grace, "vault": vault, "sht": sht, "bucket": bucket}
+    return blk
 
 def strat2_api():
     now = time.time()
@@ -6755,44 +7044,33 @@ def strat2_api():
         # половини рахуємо у ХРОНОЛОГІЇ сигналів, а не в порядку
         # завершення записів (аудит п.10)
         rows.sort(key=lambda r: r.get("date") or "")
-        nets30, trades, items = [], [], []
-        lives, tapes = [], []
-        n_entered, n_late, n_no_px, n_settled, n_unsettled, n_grace = 0, 0, 0, 0, 0, 0
-        by_bucket = {b: [] for b in (1, 2, 3, 4, 5)}
-        curve = [[] for _ in range(REV_TRACK_MIN)]
-        complete = []   # угоди з УСІМА 60 хвилинами: спільна когорта
+        trades = []
+        n_entered = 0
         for r in rows:
             entered = 1 if fnum(r.get("entered"), 0) == 1 else 0
             costs = fnum(r.get("costs_pct"), 0.15) or 0.15
             net_live = None
             late_exit = 0
             exit_reason = r.get("exit_reason") or ""
+            live_curve = None
             if entered:
                 n_entered += 1
-                row_vals = []
-                for i in range(REV_TRACK_MIN):
-                    v = fnum(r.get(f"m{i+1}"))
-                    row_vals.append(v)
-                    if v is not None:
-                        curve[i].append(v - costs)
-                if all(v is not None for v in row_vals):
-                    complete.append([v - costs for v in row_vals])
+                row_vals = [fnum(r.get(f"m{i+1}")) for i in range(REV_TRACK_MIN)]
+                live_curve = [((v - costs) if v is not None else None) for v in row_vals]
                 ex_px = fnum(r.get("exit_px")); e_px = fnum(r.get("entry_px"))
                 if ex_px and e_px and exit_reason and exit_reason != "no_price":
                     # v2.16: вирішений вихід зі стакану (таймер m30 / TP R8)
-                    # — gross від ціни виходу, не від міда хвилини
+                    # — gross від ціни виходу; витрати за ногами (аудит-2 №12)
                     gx = (ex_px / e_px - 1.0) * 100.0
                     if (r.get("our_side") or "") == "SHORT": gx = -gx
-                    net_live = gx - costs
+                    net_live = gx - _leg_costs(costs, r.get("entry_src"), r.get("exit_src"))
                     late_exit = 1 if exit_reason == "timer_late" else 0
                 elif exit_reason == "no_price":
                     net_live = None
                 else:
                     n30 = fnum(r.get("m30"))
-                    # m30 без ціни (збій котирувань на дедлайні): paper-
-                    # вихід — перша наступна хвилина з ціною (≤3 хв), з
-                    # явною позначкою запізнення (v2.14, аудит v2.13 №6)
-                    # — лише для рядків ≥2.14 (методика)
+                    # m30 без ціни: paper-вихід — перша наступна хвилина з ціною
+                    # (≤3 хв), з позначкою запізнення (v2.14) — лише рядки ≥2.14
                     if n30 is None and _vt(r.get("algo_v")) >= (2, 14):
                         for _j in (31, 32, 33):
                             n30 = fnum(r.get(f"m{_j}"))
@@ -6801,12 +7079,11 @@ def strat2_api():
                                 break
                     net_live = (n30 - costs) if n30 is not None else None
             srow = settl.get(f"{r.get('sig_id')}|{st}")
-            official, net_tape, settled, flags = _official_net(net_live, srow, fnum)
+            official, net_tape, settled, flags, vstat = _official_net(net_live, srow, fnum)
             late = 1 if late_exit else 0
             ratio_ = fnum(r.get("ratio"))
             grace = fnum(r.get("grace"))
-            if grace is None:
-                grace = 1 if (ratio_ is not None and ratio_ < 2.0) else 0
+            grace = (int(grace) if grace is not None else None)   # аудит-2 №4: старий рядок — невідомо
             bucket = fnum(r.get("dump_bucket"))
             dump_dur = fnum(r.get("dump_dur_s"))
             dump_move = fnum(r.get("dump_move_pct"))
@@ -6814,115 +7091,55 @@ def strat2_api():
                 if bucket is None: bucket = fnum(srow.get("dump_bucket"))
                 if dump_dur is None: dump_dur = fnum(srow.get("dump_dur_s"))
                 if dump_move is None:
-                    # settlement пише рух «у бік тиску» (додатний = впала при
-                    # продажу); рядок — сирий знак (LONG кита: падіння < 0)
                     _mv = fnum(srow.get("dump_move_pct"))
                     if _mv is not None:
                         dump_move = (-_mv) if (r.get("our_side") or "") == "LONG" else _mv
             ts = _ts_local(r.get("date"))
-            if entered:
-                if exit_reason == "no_price" or (net_live is None and not settled):
-                    n_no_px += 1
-                if settled: n_settled += 1
-                elif official is not None: n_unsettled += 1
-                if late: n_late += 1
-                if grace: n_grace += 1
-                # заголовкова вибірка: офіційний net, без пізніх виходів
-                if official is not None and not late:
-                    nets30.append(official)
-                    items.append((ts, official))
-                    if net_live is not None: lives.append(net_live)
-                    if net_tape is not None: tapes.append(net_tape)
-                    if bucket is not None and int(bucket) in by_bucket:
-                        by_bucket[int(bucket)].append(official)
-            # пік руху за перші 3 хв ПІСЛЯ детекту (у напрямку угоди):
-            # скільки максимально дало/забрало одразу після закриття
-            _m3 = [x for x in (fnum(r.get(f"m{i}")) for i in (1, 2, 3))
-                   if x is not None]
+            _m3 = [x for x in (fnum(r.get(f"m{i}")) for i in (1, 2, 3)) if x is not None]
             trades.append({"date": r.get("date"), "coin": r.get("coin"),
-                "side": r.get("our_side"), "net30": official,
+                "side": r.get("our_side"), "net30": (official if entered else None),
                 "net_live": net_live, "net_tape": net_tape,
-                "settled": settled, "flags": flags,
-                "peak": fnum(r.get("peak_pct")),
-                "trough": fnum(r.get("trough_pct")),
+                "settled": settled, "flags": flags, "status": (vstat if entered else ""),
+                "mismatch": int("no_trigger" in (flags or "")),
+                "no_price": int(bool(entered) and (exit_reason == "no_price"
+                                                   or (net_live is None and not settled))),
+                "peak": fnum(r.get("peak_pct")), "trough": fnum(r.get("trough_pct")),
                 "move": fnum(r.get("move_3m_pct")),
                 "dur": fnum(r.get("dur_s")), "ratio": ratio_,
-                "shtanga": fnum(r.get("shtanga"), 0),
-                "vault": fnum(r.get("vault"), 0),
-                "hour": fnum(r.get("hour")),
-                "btc": fnum(r.get("btc_move_pct")),
+                "shtanga": fnum(r.get("shtanga"), 0), "vault": fnum(r.get("vault"), 0),
+                "hour": fnum(r.get("hour")), "btc": fnum(r.get("btc_move_pct")),
                 "sum_usd": fnum(r.get("sum_usd")),
-                "p3u": (max(_m3) if _m3 else None),
-                "p3d": (min(_m3) if _m3 else None),
-                "late_exit": late_exit, "late": late,
+                "p3u": (max(_m3) if _m3 else None), "p3d": (min(_m3) if _m3 else None),
+                "late_exit": late_exit, "late": late, "stale": 0,
                 "exit_reason": exit_reason, "exit_min": fnum(r.get("exit_min")),
-                "grace": int(grace), "bucket": (int(bucket) if bucket is not None else None),
+                "grace": grace, "bucket": (int(bucket) if bucket is not None else None),
                 "dump_dur": dump_dur, "dump_move": dump_move,
                 "lag": fnum(r.get("lag_s")),
-                "entry_src": r.get("entry_src") or "",
-                "exit_src": r.get("exit_src") or "",
+                "entry_src": r.get("entry_src") or "", "exit_src": r.get("exit_src") or "",
                 "detect_src": r.get("detect_src") or "",
                 "adm": 1 if id(r) in _adm_ids else 0,
-                "entered": entered})
-        half = len(nets30) // 2
-        cum, acc = [], 0.0
-        for v in nets30:
-            acc += v; cum.append(round(acc, 3))
-        _pd_st, _days_st = _rate2(st, rows, "date",
-                                  n_entered + _open_by_st.get(st, 0))
-        out["strategies"][st] = {
+                "entered": entered, "ts": ts,
+                "_ct": (_parse_curve(srow.get("curve_tape"), REV_TRACK_MIN) if (srow and entered) else None),
+                "_cl": live_curve})
+        blk = _agg_block(trades, now, REV_TRACK_MIN, buckets=True)
+        _strat2_full[st] = {"kind": "rev", "H": REV_TRACK_MIN, "trades": trades}
+        _pd_st, _days_st = _rate2(st, rows, "date", n_entered + _open_by_st.get(st, 0))
+        blk.update({
             "kind": "rev", "signals": len(rows), "entered": n_entered,
-            "n": len(nets30),
-            "median": _median(nets30), "mean": (sum(nets30) / len(nets30))
-                if nets30 else None,
-            "win": (100.0 * sum(1 for v in nets30 if v > 0) / len(nets30))
-                if nets30 else None,
-            "pnl_usd": round(sum(nets30) * 10.0, 2) if nets30 else 0.0,
-            "half1": _median(nets30[:half]), "half2": _median(nets30[half:]),
-            "cum": cum,
-            "curve": [(_median(c) if c else None) for c in curve],
-            # покриття кожної хвилини: після чесних пропусків хвилини
-            # мають РІЗНУ кількість спостережень — без n крива порівнює
-            # різні вибірки як одну (аудит v2.1 п.6)
-            "curve_n": [len(c) for c in curve],
-            # СПІЛЬНА когорта: медіани лише по угодах, що мають УСІ 60
-            # хвилин — однакове n НЕ означає однакові події (аудит v2.3
-            # п.8: m1 з одних угод проти m2 з інших — не порівняння);
-            # тут кожна хвилина рахується з ТИХ САМИХ угод
-            "curve_common": ([_median([c[i] for c in complete])
-                              for i in range(REV_TRACK_MIN)]
-                             if complete else None),
-            "curve_common_n": len(complete),
-            "trades": trades[-120:],
-            "n_trades_total": len(trades),
-            # швидкість (v2.11 п.3): відкритих позицій на день; горизонт
-            # — від ПЕРШОГО сигналу стратегії, а не першого входу
-            # (інакше 1 вхід через 9 днів після старту давав «1/день»)
-            "per_day": _pd_st,
-            "days": _days_st,
+            "trades": _pub(trades[-120:]),
+            "per_day": _pd_st, "days": _days_st,
             "open_now": _open_by_st.get(st, 0),
             "since": STRAT_SINCE.get(st, DATA_ALGO_V),
-            "n_late": n_late,   # пізні виходи — поза заголовком (v2.16)
-            # v2.16: без ціни виходу; settlement; грейс; live/tape-зрізи тієї
-            # ж заголовкової вибірки; періоди; когорти за тривалістю дампу;
-            # допущені старі рядки (епізод відновлено зі стрічки філів)
-            "n_no_price": n_no_px, "n_settled": n_settled,
-            "n_unsettled": n_unsettled, "n_grace": n_grace,
-            "live": _stat_small(lives), "tape": _stat_small(tapes),
-            "periods": _period_stats(items, now),
-            "buckets": {str(b): _stat_small(v) for b, v in by_bucket.items()},
             "n_adm_legacy": len(adm_rows),
-        }
-
+        })
+        out["strategies"][st] = blk
     out["legacy_rows"] = legacy_rows   # v2.16: мінус допущені за settlement старі R-рядки
 
     for st in list(FOLLOW_TIMERS) + [F6_NAME, F4_NAME, F5_NAME, F8_NAME,
                                      F7_NAME, F9_NAME]:
         rows = [r for r in fol if r.get("strategy") == st]
         rows.sort(key=lambda r: r.get("date_open") or "")
-        nets, trades, items = [], [], []
-        lives, tapes = [], []
-        n_late, n_settled, n_unsettled, n_grace = 0, 0, 0, 0
+        trades = []
         # профіль швидкості ГАМАНЦІВ цієї стратегії (v2.8): один запис
         # на гаманець (останній рядок), щоб агрегат не зважувався
         # кількістю угод одного й того ж кита
@@ -6931,27 +7148,20 @@ def strat2_api():
         for r in rows:
             net_live = fnum(r.get("net_pct"))
             reason = r.get("exit_reason") or ""
-            # v2.16: пізній вихід (silence_late / full_close_late — тиша «1 хв»
-            # виконана на 5-й, повне закриття, про яке дізнались через
-            # хвилину+) — інша угода, поза заголовком; рахуємо n_late
+            # пізній вихід (silence_late / full_close_late) — поза заголовком
             late = 1 if reason.endswith("_late") else 0
             srow = settl.get(r.get("trade_id") or "")
-            official, net_tape, settled, flags = _official_net(net_live, srow, fnum)
-            ratio_ = fnum(r.get("ratio"))
+            official, net_tape, settled, flags, vstat = _official_net(net_live, srow, fnum)
             grace = fnum(r.get("grace"))
-            if grace is None:
-                grace = 1 if (ratio_ is not None and ratio_ < 2.0) else 0
+            grace = (int(grace) if grace is not None else None)   # старий рядок — невідомо
+            # аудит-2 №8: старий F-рядок (до 2.16) без гейта свіжості — якщо
+            # settlement показує лаг філа >20 с, v2.16 такий вхід не відкрила б
+            stale = 0
+            if _vt(r.get("algo_v")) < (2, 16) and srow:
+                _lg = fnum(srow.get("lag_s"))
+                if _lg is not None and _lg > FOLLOW_MAX_FILL_AGE_S:
+                    stale = 1
             ts = _ts_local(r.get("date_open"))
-            if settled: n_settled += 1
-            elif official is not None: n_unsettled += 1
-            if late: n_late += 1
-            if grace: n_grace += 1
-            net = official if not late else None
-            if net is not None:
-                nets.append(net)
-                items.append((ts, net))
-                if net_live is not None: lives.append(net_live)
-                if net_tape is not None: tapes.append(net_tape)
             fs = fnum(r.get("first_shot"))
             if fs == 1: n_first += 1
             pf = {"n_fast": fnum(r.get("prof_n_fast")),
@@ -6965,8 +7175,10 @@ def strat2_api():
             trades.append({"date": r.get("date_open"), "coin": r.get("coin"),
                 "side": r.get("our_side"), "net30": official,
                 "net_live": net_live, "net_tape": net_tape,
-                "settled": settled, "flags": flags, "late": late,
-                "grace": int(grace), "lag": fnum(r.get("lag_s")),
+                "settled": settled, "flags": flags, "status": vstat,
+                "mismatch": 0, "no_price": int(net_live is None and not settled),
+                "late": late, "stale": stale,
+                "grace": grace, "lag": fnum(r.get("lag_s")),
                 "entry_src": r.get("entry_src") or "",
                 "exit_src": r.get("exit_src") or "",
                 "detect_src": r.get("detect_src") or "",
@@ -6985,90 +7197,89 @@ def strat2_api():
                 "pf_fast": pf["n_fast"], "pf_slow": pf["n_slow"],
                 "pf_pct": pf["fast_pct"], "pf_unload": pf["unload_med"],
                 "pf_unload_mean": pf["unload_mean"],
-                "wallet": (r.get("whale_addr") or "")[:10]})
-        half = len(nets) // 2
-        cum, acc = [], 0.0
-        for v in nets:
-            acc += v; cum.append(round(acc, 3))
+                "wallet": (r.get("whale_addr") or "")[:10], "ts": ts,
+                "_ct": (_parse_curve(srow.get("curve_tape"), REV_TRACK_MIN) if srow else None),
+                "_cl": None})
+        blk = _agg_block(trades, now, REV_TRACK_MIN)
+        _strat2_full[st] = {"kind": "follow", "H": REV_TRACK_MIN, "trades": trades}
+        if blk["curve_src"] != "tape":
+            # власних live-траєкторій у F немає: UI бере тіньову стрічку
+            for k_ in ("curve", "curve_n", "curve_common"):
+                blk[k_] = None
+            blk["curve_common_n"] = 0
+            blk["curve_src"] = "shadow"
         pw = list(prof_by_wallet.values())
         _pcts = [p["fast_pct"] for p in pw if p["fast_pct"] is not None]
         _unl = [p["unload_med"] for p in pw if p["unload_med"] is not None]
         _unm = [p["unload_mean"] for p in pw if p["unload_mean"] is not None]
-        out["strategies"][st] = {
+        blk.update({
             "kind": "follow", "signals": len(rows), "entered": len(rows),
-            "n": len(nets),
-            "median": _median(nets),
-            "mean": (sum(nets) / len(nets)) if nets else None,
-            "win": (100.0 * sum(1 for v in nets if v > 0) / len(nets))
-                if nets else None,
-            "pnl_usd": round(sum(nets) * 10.0, 2) if nets else 0.0,
-            "half1": _median(nets[:half]), "half2": _median(nets[half:]),
-            "cum": cum, "curve": None,
-            "trades": trades[-120:],
-            "n_trades_total": len(trades),
-            "per_day": _rate2(st, rows, "date_open",
-                              len(rows) + _open_by_st.get(st, 0))[0],
-            "days": _rate2(st, rows, "date_open",
-                           len(rows) + _open_by_st.get(st, 0))[1],
+            "trades": _pub(trades[-120:]),
+            "per_day": _rate2(st, rows, "date_open", len(rows) + _open_by_st.get(st, 0))[0],
+            "days": _rate2(st, rows, "date_open", len(rows) + _open_by_st.get(st, 0))[1],
             "open_now": _open_by_st.get(st, 0),
             "since": STRAT_SINCE.get(st, DATA_ALGO_V),
-            # v2.16
-            "n_late": n_late, "n_settled": n_settled,
-            "n_unsettled": n_unsettled, "n_grace": n_grace,
-            "live": _stat_small(lives), "tape": _stat_small(tapes),
-            "periods": _period_stats(items, now),
-            # v2.8: скільки входів були «першим пострілом» пари (у F5 —
-            # усі за побудовою; у F1–F4 — частка, порівняння когорт)
             "first_shot_n": n_first,
-            # агрегат профілів швидкості по гаманцях цієї стратегії:
-            # медіана частки швидких, медіана медіанного зливу і
-            # середнього зливу, сума швидких/повільних епізодів
             "prof": {"wallets": len(pw),
                      "fast_pct_med": _median(_pcts),
                      "unload_med_s": _median(_unl),
                      "unload_mean_s": (sum(_unm) / len(_unm)) if _unm else None,
                      "n_fast": sum(int(p["n_fast"] or 0) for p in pw),
                      "n_slow": sum(int(p["n_slow"] or 0) for p in pw)},
-        }
+        })
+        out["strategies"][st] = blk
 
     # ── TWAP-реверс T1/T2 (v2.11 п.5): headline = m60 net (вихід через
     # годину), крива 120 хв; когорти ≥1/≥1.5/≥2% — ті самі входи,
     # відфільтровані по руху за час твапу (кнопки в UI)
     def _tw_net(r):
-        """v2.16: (official, live, tape, settled, flags) для рядка TWAP-угоди."""
+        """(official, live, tape, settled, flags, status, live) для рядка TWAP-угоди."""
         nl = fnum(r.get("net60_pct"))
         srow = settl.get(f"{r.get('twap_id')}|{r.get('strategy')}")
         return _official_net(nl, srow, fnum) + (nl,)
-    def _tw_block(rs):
-        nets, lives, tapes, items = [], [], [], []
-        n_settled = n_unsettled = 0
+    def _tw_trades(rs):
+        # v2.14 (аудит v2.13 №4): список угод — ВЛАСНИЙ для кожної
+        # когорти-стратегії (це різні входи, а не фільтр базової по руху)
+        out_ = []
         for r in rs:
-            official, nt, settled, flags, nl = _tw_net(r)
-            if settled: n_settled += 1
-            elif official is not None: n_unsettled += 1
-            if official is not None:
-                nets.append(official)
-                items.append((_ts_local(r.get("date_entry")), official))
-                if nl is not None: lives.append(nl)
-                if nt is not None: tapes.append(nt)
-        curve = [[] for _ in range(TWAP_TRACK_MIN)]
-        complete = []
-        for r in rs:
+            official, nt, settled, flags, vstat, nl = _tw_net(r)
+            srow = settl.get(f"{r.get('twap_id')}|{r.get('strategy')}")
             costs = fnum(r.get("costs_pct"), 0.15) or 0.15
-            # v2.15: крива 120 хв — з twap_curves.csv (по ключу угоди); поки
-            # трекер її ще веде — перші 60 хв із рядка угоди
             cr = _tw_curves.get((r.get("twap_id"), r.get("strategy")))
             src_ = cr if cr is not None else r
             vals = [fnum(src_.get(f"m{i + 1}")) for i in range(TWAP_TRACK_MIN)]
-            for i, v in enumerate(vals):
-                if v is not None:
-                    curve[i].append(v - costs)
-            if vals and all(v is not None for v in vals):
-                complete.append([v - costs for v in vals])
-        cum, acc = [], 0.0
-        for v in nets:
-            acc += v; cum.append(round(acc, 3))
-        half = len(nets) // 2
+            live_curve = [((v - costs) if v is not None else None) for v in vals]
+            reason = r.get("exit_reason") or ""
+            out_.append({"date": r.get("date_entry"), "coin": r.get("coin"),
+                "side": r.get("our_side"), "net30": official,
+                "net_live": nl, "net_tape": nt, "settled": settled, "flags": flags,
+                "status": vstat, "mismatch": 0,
+                "no_price": int(reason == "no_price"),
+                "late": int(reason.endswith("_late")), "stale": 0,   # аудит-2 №15
+                "grace": None, "vault": 0,
+                "entry_src": r.get("entry_src") or "", "exit_src": r.get("exit_src") or "",
+                "peak": fnum(r.get("peak_pct")), "trough": fnum(r.get("trough_pct")),
+                "move": fnum(r.get("move_pct")), "dur": fnum(r.get("dur_s")),
+                "usd": fnum(r.get("usd")), "pos_usd": fnum(r.get("pos_usd")),
+                "twap_side": r.get("twap_side"), "src": r.get("src"),
+                "kind": r.get("kind"), "hour": fnum(r.get("hour")),
+                "btc": fnum(r.get("btc_move_pct")),
+                "cancel_after": fnum(r.get("cancel_after_entry"), 0),
+                "completed": fnum(r.get("completed"), 0),
+                "confirm": r.get("exch_status") or "",
+                "exit_reason": reason, "exit_min": fnum(r.get("exit_min")),
+                "px_src": f"{r.get('p0_src') or '?'}/{r.get('p1_src') or '?'}",
+                "cancel_event_min": fnum(r.get("cancel_event_min")),
+                "cancel_seen_min": fnum(r.get("cancel_seen_min")),
+                "exit_ts": r.get("exit_ts") or "",
+                "wallet": (r.get("whale_addr") or "")[:10], "entered": 1,
+                "ts": _ts_local(r.get("date_entry")),
+                "_ct": (_parse_curve(srow.get("curve_tape"), TWAP_TRACK_MIN) if srow else None),
+                "_cl": live_curve})
+        return out_
+    def _tw_block(rs, trs=None):
+        trs = _tw_trades(rs) if trs is None else trs
+        blk = _agg_block(trs, now, TWAP_TRACK_MIN)
         # v2.13 (рев'ю v2.12 №4): головна вибірка — УСІ фактичні paper-
         # входи (скасовані після входу виходять хвилиною скасування);
         # окремо — підтверджено завершені твапи (біржа: finished і
@@ -7077,9 +7288,9 @@ def strat2_api():
         # скільки входів мають обидві ціни зі свічок біржі
         _f = lambda r, k: fnum(r.get(k), 0)
         conf_rows = [r for r in rs
-                     if _f(r, "completed") == 1 and _f(r, "cancel_after_entry") == 0]
-        conf = [x for x in (_tw_net(r)[0] for r in conf_rows)
-                if x is not None]
+                     if _f(r, "completed") == 1 and _f(r, "cancel_after_entry") == 0
+                     and not (r.get("exit_reason") or "").endswith("_late")]
+        conf = [x for x in (_tw_net(r)[0] for r in conf_rows) if x is not None]
         n_cancel = sum(1 for r in rs if _f(r, "cancel_after_entry") == 1)
         n_partial = sum(1 for r in rs
                         if _f(r, "completed") == 0 and _f(r, "cancel_after_entry") == 0
@@ -7087,34 +7298,16 @@ def strat2_api():
         n_unconf = sum(1 for r in rs
                        if _f(r, "completed") == 0 and _f(r, "cancel_after_entry") == 0
                        and r.get("exch_status") != "finished")
-        # лише рядки з результатом (no_price без net60 у n не входить —
-        # інакше «свічок 4 з 3»; рев'ю v2.15)
         n_candle = sum(1 for r in rs
                        if fnum(r.get("net60_pct")) is not None
                        and r.get("p0_src") == "candle" and r.get("p1_src") == "candle")
-        return {"n": len(nets), "median": _median(nets),
-                "mean": (sum(nets) / len(nets)) if nets else None,
-                "win": (100.0 * sum(1 for v in nets if v > 0) / len(nets))
-                    if nets else None,
-                "pnl_usd": round(sum(nets) * 10.0, 2) if nets else 0.0,
-                "half1": _median(nets[:half]), "half2": _median(nets[half:]),
-                "cum": cum,
-                "curve": [(_median(c) if c else None) for c in curve],
-                "curve_n": [len(c) for c in curve],
-                "curve_common": ([_median([c[i] for c in complete])
-                                  for i in range(TWAP_TRACK_MIN)]
-                                 if complete else None),
-                "curve_common_n": len(complete),
-                "n_confirmed": len(conf), "median_confirmed": _median(conf),
-                "mean_confirmed": (sum(conf) / len(conf)) if conf else None,
-                "win_confirmed": (100.0 * sum(1 for v in conf if v > 0) / len(conf))
-                    if conf else None,
-                "n_cancelled": n_cancel, "n_partial": n_partial,
-                "n_unconfirmed": n_unconf, "n_candle": n_candle,
-                # v2.16
-                "n_settled": n_settled, "n_unsettled": n_unsettled,
-                "live": _stat_small(lives), "tape": _stat_small(tapes),
-                "periods": _period_stats(items, now)}
+        blk.update({"n_confirmed": len(conf), "median_confirmed": _median(conf),
+                    "mean_confirmed": (sum(conf) / len(conf)) if conf else None,
+                    "win_confirmed": (100.0 * sum(1 for v in conf if v > 0) / len(conf))
+                        if conf else None,
+                    "n_cancelled": n_cancel, "n_partial": n_partial,
+                    "n_unconfirmed": n_unconf, "n_candle": n_candle})
+        return blk
     for st, kind_ in ((T1_NAME, "open"), (T2_NAME, "reduce")):
         # когорти ≥1/≥1.5/≥2% — окремі стратегії зі своїми рядками (v2.13)
         fam = [r for r in tw if (r.get("strategy") or "").startswith(st)]
@@ -7126,49 +7319,22 @@ def strat2_api():
         sig_rows = [r for r in tws_all if r.get("kind") == kind_
                     and fnum(r.get("eligible"), 0) == 1
                     and _v_ok(r.get("algo_v"), STRAT_SINCE.get(st, DATA_ALGO_V))]
-        def _tw_trades(rs):
-            # v2.14 (аудит v2.13 №4): список угод — ВЛАСНИЙ для кожної
-            # когорти-стратегії (це різні входи, а не фільтр базової по руху)
-            return [{"date": r.get("date_entry"), "coin": r.get("coin"),
-                "side": r.get("our_side"), "net30": _tw_net(r)[0],
-                "net_live": fnum(r.get("net60_pct")), "net_tape": _tw_net(r)[1],
-                "settled": _tw_net(r)[2], "flags": _tw_net(r)[3],
-                "entry_src": r.get("entry_src") or "", "exit_src": r.get("exit_src") or "",
-                "peak": fnum(r.get("peak_pct")), "trough": fnum(r.get("trough_pct")),
-                "move": fnum(r.get("move_pct")), "dur": fnum(r.get("dur_s")),
-                "usd": fnum(r.get("usd")), "pos_usd": fnum(r.get("pos_usd")),
-                "twap_side": r.get("twap_side"), "src": r.get("src"),
-                "kind": r.get("kind"), "hour": fnum(r.get("hour")),
-                "btc": fnum(r.get("btc_move_pct")),
-                "cancel_after": fnum(r.get("cancel_after_entry"), 0),
-                "completed": fnum(r.get("completed"), 0),
-                "confirm": r.get("exch_status") or "",
-                "exit_reason": r.get("exit_reason") or "",
-                "exit_min": fnum(r.get("exit_min")),
-                "px_src": f"{r.get('p0_src') or '?'}/{r.get('p1_src') or '?'}",
-                "cancel_event_min": fnum(r.get("cancel_event_min")),
-                "cancel_seen_min": fnum(r.get("cancel_seen_min")),
-                "exit_ts": r.get("exit_ts") or "",
-                "wallet": (r.get("whale_addr") or "")[:10], "entered": 1}
-                for r in rs]
-        cohorts = {str(thr): _tw_block([r for r in fam
-                                        if r.get("strategy") == _twap_cohort_name(st, thr)])
-                   for thr in TWAP_COHORTS}
+        cohorts = {}
         for thr in TWAP_COHORTS:
             _cn = _twap_cohort_name(st, thr)
             _crows = [r for r in fam if r.get("strategy") == _cn]
-            cohorts[str(thr)]["entered"] = len(_crows)
-            cohorts[str(thr)]["per_day"], cohorts[str(thr)]["days"] = _rate2(
+            _ctr = _tw_trades(_crows)
+            _blk = _tw_block(_crows, _ctr)
+            _strat2_full[_cn] = {"kind": "twap", "H": TWAP_TRACK_MIN, "trades": _ctr}
+            _blk["entered"] = len(_crows)
+            _blk["per_day"], _blk["days"] = _rate2(
                 _cn, _crows, "date_entry", len(_crows) + _open_by_st.get(_cn, 0))
-            cohorts[str(thr)]["open_now"] = _open_by_st.get(_cn, 0)
-            cohorts[str(thr)]["trades"] = _tw_trades(_crows)[-120:]
-            cohorts[str(thr)]["n_trades_total"] = len(_crows)
-            cohorts[str(thr)]["n_late"] = sum(
-                1 for r in _crows if (r.get("exit_reason") or "").endswith("_late"))
-            cohorts[str(thr)]["n_no_price"] = sum(
-                1 for r in _crows if r.get("exit_reason") == "no_price")
+            _blk["open_now"] = _open_by_st.get(_cn, 0)
+            _blk["trades"] = _pub(_ctr[-120:])
+            cohorts[str(thr)] = _blk
         base = cohorts[str(TWAP_COHORTS[0])]
         trades = base["trades"]
+        _strat2_full[st] = _strat2_full.get(_twap_cohort_name(st, TWAP_COHORTS[0]))
         out["strategies"][st] = dict(base, **{
             "kind": "twap", "signals": len(sig_rows), "entered": len(rows),
             "track_min": TWAP_TRACK_MIN, "hold_min": TWAP_HOLD_MIN,
@@ -8210,9 +8376,12 @@ def _twap_enter(rec, now, px):
     move = float(rec.get("move") or 0.0)
     # v2.16: ціна входу — зі свіжого стакану (виконувана на $1000 з нашого
     # боку), запит ДО локу; без стакану — жива ціна поллера з позначкою
-    epx, esrc, emeta = _paper_px(rec["coin"], "SELL" if our == "SHORT" else "BUY")
+    epx, esrc, emeta = _paper_px(rec["coin"], "SELL" if our == "SHORT" else "BUY",
+                                 strict=True)
     if not epx:
-        epx, esrc = px, "mid"
+        # аудит v2.16 №1: без повного стакану paper-входу немає
+        _twap_drop(rec, "no_book")
+        return
     now = time.time()   # ціна відома САМЕ зараз
     if rec.get("end") is not None and now > rec["end"] + TWAP_LATE_S:
         # запит стакану тривав довше за вікно входу — входу заднім числом
@@ -8630,10 +8799,12 @@ def _twap_row(p, now=None):
     # v2.16: ціна виходу зі стакану в момент вирішеного виходу (tw.exit_px)
     # — gross від неї; без стакану — семпл хвилини виходу, як раніше
     ex_px = tw.get("exit_px")
+    costs_eff = costs
     if ex_px and mx is not None and p.get("entry_px"):
         gx = (ex_px / p["entry_px"] - 1.0) * 100.0
         if p["side"] == "SHORT": gx = -gx
         mx = gx
+        costs_eff = _leg_costs(costs, p.get("entry_src"), tw.get("exit_src"))
     bm = p.get("btc_move")
     def _n(v, nd=None):
         if v is None or v == "": return ""
@@ -8646,7 +8817,7 @@ def _twap_row(p, now=None):
              _n(tw.get("pos_usd"), 0), _n(tw.get("move"), 4),
              _n(tw.get("p0")), tw.get("p0_src", ""), _n(tw.get("p1")),
              tw.get("p1_src", ""), round(p["entry_px"], 8),
-             (round(mx - costs, 4) if mx is not None else ""),
+             (round(mx - costs_eff, 4) if mx is not None else ""),
              round(costs, 4),
              (round(p["peak"], 4) if p["peak"] > -999 else ""),
              (round(p["trough"], 4) if p["trough"] < 999 else ""),
@@ -9226,6 +9397,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif self.path == "/strat2":
             try:
                 self.send_json(strat2_api())
+            except Exception as e:
+                self.send_json({"error": str(e)})
+        elif self.path.startswith("/strat2_slice"):
+            # аудит-2 №4: зріз по ВСІЙ вибірці стратегії на сервері
+            try:
+                q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                g = lambda k, d="all": (q.get(k) or [d])[0]
+                self.send_json(strat2_slice(g("st", ""), g("grace"), g("vault"),
+                                            g("sht"), g("bucket")))
             except Exception as e:
                 self.send_json({"error": str(e)})
         elif self.path == "/depth":
