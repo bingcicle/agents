@@ -353,9 +353,12 @@ SYMBOL_MAP = {
     "KBONK":  "1000BONKUSDT",
     "KSHIB":  "1000SHIBUSDT",
     "KFLOKI": "1000FLOKIUSDT",
+    "KLUNC":  "1000LUNCUSDT",   # v2.16 (рев'ю): не мапилась — без глибини
+    "KDOGS":  "DOGSUSDT",       # глибина в USD, префікс одиниць неважливий
 }
 DEPTH_PCT  = 0.01   # 1% від best price
-DEPTH_LIMIT = 500   # рівнів стакану
+DEPTH_LIMIT = 1000  # рівнів стакану (v2.16: 500 обрізали 1% для HYPE/ZEC
+                    # — глибина занижена ~1.5–2×, ratio роздутий); вага 20
 
 def get_bn_symbol(coin):
     return SYMBOL_MAP.get(coin.upper(), coin.upper() + "USDT")
@@ -408,8 +411,15 @@ def fetch_hl_coins_list():
     )
     with urllib.request.urlopen(req, timeout=15) as r:
         data = json.loads(r.read())
+    # v2.16 (рев'ю): делістнуті монети лишаються в allMids із замороженою
+    # ціною, яка виглядає свіжою — тримаємо їх список для поллера цін
+    _hl_delisted.clear()
+    _hl_delisted.update(u["name"] for u in data[0]["universe"]
+                        if u.get("isDelisted") and u.get("name"))
     return [u["name"] for u in data[0]["universe"]
-            if "/" not in u.get("name","")]
+            if "/" not in u.get("name","") and not u.get("isDelisted")]
+
+_hl_delisted = set()   # назви делістнутих perp-монет (оновлює fetch_hl_coins_list)
 
 def fetch_binance_symbols_set():
     req = urllib.request.Request(
@@ -419,7 +429,10 @@ def fetch_binance_symbols_set():
     with urllib.request.urlopen(req, timeout=15) as r:
         info = json.loads(r.read())
     return {s["symbol"] for s in info.get("symbols",[])
-            if s.get("contractType")=="PERPETUAL" and s.get("quoteAsset")=="USDT"}
+            if s.get("contractType")=="PERPETUAL" and s.get("quoteAsset")=="USDT"
+            # v2.16 (рев'ю): делістнутий символ повертає порожню книгу →
+            # None → у кеші назавжди лишалась стара глибина
+            and s.get("status") == "TRADING"}
 
 def fetch_all_depth(coins=None):
     """Завантажує глибину для всіх HL монет що є на Binance."""
@@ -471,7 +484,9 @@ def fetch_all_depth(coins=None):
         if done % 20 == 0 or done == total:
             print(f"  [DEPTH] {done}/{total} ({pct:.0f}%) | got: {len(depth_map)} | errors: {len(errors)}")
         if i+2 < total:
-            time.sleep(1.1)
+            # v2.16: DEPTH_LIMIT 1000 = вага 20 за запит (було 10 при 500);
+            # 2 запити / 1.5 с ≈ 1600 ваги/хв < ліміт 2400 із запасом
+            time.sleep(1.5)
 
     elapsed = time.time() - t0
     print(f"  [DEPTH] Done in {elapsed:.0f}s — {len(depth_map)} coins, {len(errors)} errors")
@@ -1451,6 +1466,14 @@ fast_hold    = [0.0]  # до цього моменту скан-воркери �
 fast_lock    = threading.Lock()
 fast_event   = threading.Event()
 fast_last    = {}     # (addr, coin) -> ts останнього тригера, дебаунс 2с
+# v2.16 (рев'ю): швидкий шлях побачив дельту, а філів в API ще нема →
+# повторна швидка перевірка через FAST_RETRY_S (не чекати sweep 20–30 с);
+# кап спроб на пару, лічильник скидається, коли філи знайдено
+FAST_RETRY_S   = 1.5
+FAST_RETRY_MAX = 3
+FAST_SWEEP_CHUNK = 20  # обхід — чанками; між ними обробляються швидкі події
+fast_retry     = {}   # (addr, coin) -> ts, коли повторити
+fast_retry_cnt = {}   # (addr, coin) -> зроблено повторів
 _fastpath_err_ts = [0.0]   # дросель логів помилок fastpath
 
 # ── Пріоритетний фетч невідомих китів ───────────────────
@@ -2212,8 +2235,12 @@ def run_realtime_monitor():
     cycle_rl      = [0]     # rate limit hits (list для мутації з потоків)
 
     def check_wallet_worker(item):
-            """Перевіряє один гаманець. Викликається паралельно."""
-            addr, coins = item
+            """Перевіряє один гаманець. Викликається паралельно.
+            item = (addr, coins) або (addr, coins, detect_src) — v2.16:
+            джерело детекції ("ws" швидкий шлях / "sweep" обхід) їде у
+            рядки стратегій."""
+            addr, coins = item[0], item[1]
+            det_src = item[2] if len(item) > 2 else "sweep"
             stats["checks"] += 1
             # Момент ЗНІМКА позицій: усі синхронізації бази і курсор
             # філів прив'язуються саме до нього, а не до "зараз" —
@@ -2355,8 +2382,22 @@ def run_realtime_monitor():
                     # Саме так пропадали закриття по частині монет.
                     # Свіжій дельті (до 45с) даємо ще спроби
                     if time.time() - delta_seen.get(alert_key, 0) < 45:
+                        if det_src == "ws":
+                            # v2.16 (рев'ю): філи з'являються в API на ~1 с
+                            # пізніше за трейд у WS — повторна ШВИДКА
+                            # перевірка через FAST_RETRY_S, а не чекання
+                            # sweep (20–30 с; це і був «стеарий філ» у
+                            # рядках). Кап FAST_RETRY_MAX спроб на пару
+                            with fast_lock:
+                                _n = fast_retry_cnt.get((addr, coin), 0)
+                                if _n < FAST_RETRY_MAX:
+                                    fast_retry[(addr, coin)] = time.time() + FAST_RETRY_S
+                                    fast_retry_cnt[(addr, coin)] = _n + 1
+                                    stats["fast_retries"] = stats.get("fast_retries", 0) + 1
                         continue
                     delta_seen.pop(alert_key, None)
+                    with fast_lock:
+                        fast_retry_cnt.pop((addr, coin), None)
                     _r9 = (None if full_close else
                            _fresh_ratio(coin, old.get("side"), new_pos["val"]))
                     with watchlist_lock:
@@ -2387,6 +2428,9 @@ def run_realtime_monitor():
                                 for _fp in follow_open.values():
                                     if _fp["key"] == alert_key:
                                         _fp["force_exit"] = "full_close"
+                                        # v2.16: час, коли ДІЗНАЛИСЬ (філів
+                                        # нема — час події невідомий)
+                                        _fp.setdefault("force_exit_ts", time.time())
                         except Exception as _qe:
                             print(f"  [FOLLOW] quiet-close hook err: {_qe}")
                         if flipped_pos is not None:
@@ -2442,11 +2486,13 @@ def run_realtime_monitor():
                 # ── ОБОЛОНКА СТРАТЕГІЙ: реверс + вхід у бік. rev читає
                 #    епізод ДО того, як fc_on_full_close його зніме
                 try:
-                    rev_on_close(addr, coin, old, mfills, full_close)
+                    rev_on_close(addr, coin, old, mfills, full_close,
+                                 detect_src=det_src)
                 except Exception as _re:
                     print(f"  [REV] hook err: {_re}")
                 try:
-                    follow_on_txs(addr, coin, old, mfills, full_close)
+                    follow_on_txs(addr, coin, old, mfills, full_close,
+                                  detect_src=det_src)
                 except Exception as _fo:
                     print(f"  [FOLLOW] hook err: {_fo}")
 
@@ -2635,31 +2681,54 @@ def run_realtime_monitor():
         except Exception as _we:
             print(f"  [WATCH] worker err: {_we}")
 
+    def _process_fast():
+        """Швидкі події (WS-тригери + повторні перевірки, чий час настав):
+        один clearinghouseState на адресу, item = (addr, coins, "ws").
+        v2.16: викликається і МІЖ чанками обходу — sweep на 300 гаманців
+        більше не блокує швидкий шлях на 20–40 с."""
+        now_r = time.time()
+        with fast_lock:
+            due = [k for k, t in fast_retry.items() if t <= now_r]
+            for k in due:
+                fast_retry.pop(k, None)
+                fast_pending.setdefault(k, int(now_r * 1000))
+            pend = dict(fast_pending)
+            fast_pending.clear()
+        if not pend:
+            return
+        by_addr = {}
+        with watchlist_lock:
+            for a, c in pend:
+                if a in watchlist and c in watchlist[a]:
+                    by_addr.setdefault(a, {})[c] = dict(watchlist[a][c])
+        if by_addr:
+            t0 = time.time()
+            items = [(a, c, "ws") for a, c in by_addr.items()]
+            with ThreadPoolExecutor(max_workers=min(10, len(items))) as pool:
+                list(pool.map(_safe_worker, items))
+            oldest = min(pend.values()) if pend else 0
+            chain  = time.time() * 1000 - oldest if oldest else 0
+            print(f"  [FAST] checked {len(by_addr)} wallet(s) in "
+                  f"{time.time()-t0:.2f}s | блок→готово {chain:.0f}ms"
+                  f"{' (+retry)' if due else ''}")
+
+    def _fast_due():
+        with fast_lock:
+            if fast_pending:
+                return True
+            if not fast_retry:
+                return False
+            t = time.time()
+            return any(v <= t for v in fast_retry.values())
+
     # ── Головний цикл: FAST-події миттєво, повний обхід як резерв ──
     last_sweep = 0.0
     while True:
         woke = fast_event.wait(timeout=1.0)
-
         if woke:
             fast_event.clear()
-            with fast_lock:
-                pend = dict(fast_pending)
-                fast_pending.clear()
-            if pend:
-                # Групуємо по гаманцю: один clearinghouseState на адресу
-                by_addr = {}
-                with watchlist_lock:
-                    for a, c in pend:
-                        if a in watchlist and c in watchlist[a]:
-                            by_addr.setdefault(a, {})[c] = dict(watchlist[a][c])
-                if by_addr:
-                    t0 = time.time()
-                    with ThreadPoolExecutor(max_workers=min(10, len(by_addr))) as pool:
-                        list(pool.map(_safe_worker, by_addr.items()))
-                    oldest = min(pend.values()) if pend else 0
-                    chain  = time.time() * 1000 - oldest if oldest else 0
-                    print(f"  [FAST] checked {len(by_addr)} wallet(s) in "
-                          f"{time.time()-t0:.2f}s | блок→готово {chain:.0f}ms")
+        if woke or _fast_due():
+            _process_fast()
 
         # Резервний повний обхід. Базовий інтервал WATCH_INTERVAL, але коли
         # watchlist виростає (без ММ-фільтра гаманців стало більше),
@@ -2675,8 +2744,15 @@ def run_realtime_monitor():
                 wl_snap = {addr: dict(coins)
                            for addr, coins in watchlist.items() if coins}
             if wl_snap:
+                items = [(a, c, "sweep") for a, c in wl_snap.items()]
                 with ThreadPoolExecutor(max_workers=10) as pool:
-                    list(pool.map(_safe_worker, wl_snap.items()))
+                    for ci in range(0, len(items), FAST_SWEEP_CHUNK):
+                        list(pool.map(_safe_worker, items[ci:ci + FAST_SWEEP_CHUNK]))
+                        # v2.16: між чанками — швидкі події не чекають кінця
+                        # обходу (WS-трейд посеред sweep раніше ждав до 40 с)
+                        if fast_event.is_set() or _fast_due():
+                            fast_event.clear()
+                            _process_fast()
             if cycle_rl[0] > 0:
                 print(f"  [WATCH] sweep rate limited {cycle_rl[0]}x")
 
@@ -3023,9 +3099,11 @@ sim_positions = {}   # (addr,coin) -> відкрита симуляційна п
 sim_closed    = []   # закриті, останні 100 для /sim
 
 def sim_all_mids():
-    """Поточні mid-ціни всіх монет одним запитом. None при помилці."""
+    """Поточні mid-ціни всіх монет одним запитом. None при помилці.
+    v2.16 (рев'ю): ОДНА спроба — поллер і так повторює кожні 5 с, а
+    4 ретраї з бекофом давали 16–44 с сліпого вікна саме при 429."""
     try:
-        data = hl_post({"type": "allMids"})
+        data = hl_post({"type": "allMids"}, retries=1)
         return data if isinstance(data, dict) else None
     except Exception:
         return None
@@ -3045,6 +3123,113 @@ def _sim_slip(depth):
     if depth <= 0:
         return SIM_SPREAD + 0.001
     return SIM_SPREAD + (SIM_POSITION_USD / depth) * 0.005
+
+def _sim_costs(coin, our_side):
+    """v2.16 (рев'ю): витрати за круг, % — комісія ×2 + сліпаж по ОБОХ
+    боках стакану Binance: вхід б'є один бік (наш SHORT = SELL у біди),
+    вихід — інший (BUY з асків). Раніше обидві ноги рахувались по стороні
+    закриття кита. → (costs_pct, depth_entry, depth_exit)."""
+    with cache_lock:
+        d = cache["depth"].get(coin) or cache.get("depth_prev", {}).get(coin)
+    bids, asks = depth_for_side(d, "LONG"), depth_for_side(d, "SHORT")
+    d_in, d_out = (bids, asks) if our_side == "SHORT" else (asks, bids)
+    return ((2 * SIM_COMMISSION + _sim_slip(d_in or 0) + _sim_slip(d_out or 0)) * 100.0,
+            d_in or 0, d_out or 0)
+
+def _p_costs(p):
+    """Витрати трекера: збережені при вході (v2.16, обидва боки) або, для
+    трекерів зі старого state, стара формула по одній глибині."""
+    c = p.get("costs")
+    if isinstance(c, (int, float)) and math.isfinite(c):
+        return float(c)
+    slip = _sim_slip(p.get("depth") or 0)
+    return (2 * SIM_COMMISSION + 2 * slip) * 100.0
+
+def hl_book_exec(coin, side, usd=None):
+    """Свіжий стакан HL (l2Book, вага 2) через prio-канал → ВИКОНУВАНА
+    ціна ринкового ордера на usd з нашого боку: BUY іде по асках, SELL по
+    бідах, VWAP по рівнях (v2.16, paper-вхід: замість міда з кешу
+    5-секундного поллера, який міг передувати філу кита і дарував нам
+    частину його зливу). Повертає dict(px, mid, bid, ask, ts_ms, req_ms,
+    partial) або None — бюджет/збій/порожній бік; викликач тоді бере
+    запасний варіант і ПОЗНАЧАЄ його у рядку."""
+    usd = SIM_POSITION_USD if usd is None else usd
+    t0 = time.time()
+    try:
+        data = hl_post_prio({"type": "l2Book", "coin": coin}, retries=1,
+                            direct=not _prio_opener, max_wait=3.0)
+        lv = data.get("levels") or []
+        bids, asks = lv[0], lv[1]
+        best_bid = float(bids[0]["px"]); best_ask = float(asks[0]["px"])
+    except Exception as e:
+        stats["book_fail"] = stats.get("book_fail", 0) + 1
+        if stats["book_fail"] in (1, 10, 100) or stats["book_fail"] % 1000 == 0:
+            print(f"  [BOOK] {coin}: стакан недоступний ({stats['book_fail']}): {e}")
+        return None
+    book = asks if side == "BUY" else bids
+    left, cost, qty = float(usd), 0.0, 0.0
+    for lvl in book:
+        try:
+            px = float(lvl["px"]); sz = float(lvl["sz"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        take = min(left, px * sz)
+        if take <= 0:
+            continue
+        cost += take; qty += take / px; left -= take
+        if left <= 1e-9:
+            break
+    if qty <= 0:
+        return None
+    stats["book_ok"] = stats.get("book_ok", 0) + 1
+    return {"px": cost / qty, "mid": (best_bid + best_ask) / 2.0,
+            "bid": best_bid, "ask": best_ask,
+            "ts_ms": int(data.get("time") or t0 * 1000),
+            "req_ms": int((time.time() - t0) * 1000),
+            "partial": int(left > 1e-9)}
+
+def _px_age_s():
+    """Вік найсвіжішого семпла цін (BTC — завжди у allMids), с; None —
+    історії ще нема. /status + watchdog (v2.16): поллер, що «живий», але
+    мовчить, — сліпа зона paper-угод."""
+    with px_lock:
+        h = px_hist.get("BTC")
+        if not h:
+            return None
+        ts = h[-1][0]
+    return round(time.time() - ts, 1)
+
+def _px_mid_age(coin):
+    """Мід з кешу поллера і його вік у мс; (None, None) — історії нема."""
+    with px_lock:
+        h = px_hist.get(coin)
+        if not h:
+            return None, None
+        ts, px = h[-1]
+    return px, int((time.time() - ts) * 1000)
+
+def _paper_px(coin, side, whale_px=None, max_mid_age_ms=20_000):
+    """Ціна paper-угоди У МОМЕНТ рішення (v2.16): свіжий стакан → src
+    'book'; нема — гірша для нас із кеш-міда і ціни філа кита → 'mid+whale'
+    (лише мід → 'mid'); нема й міда → (None, 'none'). BUY: гірша = вища,
+    SELL: нижча. meta несе мід, його вік, ціну філа кита і час запиту —
+    усе це йде в рядок, щоб похибку можна було виміряти, а не вгадувати."""
+    mid, age_ms = _px_mid_age(coin)
+    meta = {"mid": mid, "px_age_ms": age_ms, "whale_px": whale_px,
+            "book_ms": None, "partial": 0}
+    bx = hl_book_exec(coin, side)
+    if bx:
+        meta["book_ms"] = bx["req_ms"]; meta["partial"] = bx["partial"]
+        meta["book_mid"] = bx["mid"]
+        return bx["px"], "book", meta
+    if mid is None or (age_ms or 0) > max_mid_age_ms:
+        return None, "none", meta
+    px, src = mid, "mid"
+    if whale_px:
+        worse = max(mid, whale_px) if side == "BUY" else min(mid, whale_px)
+        if worse != mid:
+            px, src = worse, "mid+whale"
+    return px, src, meta
 
 def _csv_append(row):
     try:
@@ -3943,6 +4128,22 @@ R7_NAME          = "R7_одним"       # реверс «одним постр�
                                     # закриття однією транзакцією
                                     # ≥$100k, рух ≥1% — вхід одразу
 R7_MIN_TX_USD    = 100_000.0
+# ── v2.16 ──
+R8_NAME          = "R8_тп80"        # реверс з уявним тейк-профітом: лонг
+                                    # після падіння, вихід при відновленні
+                                    # 80% руху (падіння 1% → TP +0.8%),
+                                    # інакше таймер m30
+R8_TP_FRAC       = 0.8
+REV_HOLD_MIN     = 30               # заголовкова угода реверсу закривається
+                                    # на m30; трекер веде криву до
+                                    # REV_TRACK_MIN, але монету не тримає
+REV_EP_MAX_S     = 300.0            # правило v2.16: епізод закриття кита
+                                    # (перший → останній філ) коротший за
+                                    # 5 хв…
+REV_EP_MIN_MAG   = 1.0              # …і падіння ≥1% між цінами його філів
+FOLLOW_MAX_FILL_AGE_S = 20.0        # paper-вхід лише за свіжим філом кита:
+                                    # старіший (рестарт, пауза) — не вхід
+REV_MAX_FILL_AGE_S    = 60.0
 # ── ТЗ 08.09 п.4 ──
 F8_NAME          = "F8_ratio35"     # v2.12 (рішення користувача 08.09):
                                     # копія F6 (тиша 1 хв · перший
@@ -3982,9 +4183,13 @@ def _v_ok(row_v, since):
     return _vt(row_v) >= _vt(since) and _vt(row_v) != (0,)
 
 STRAT_SINCE = {
-    "R1_загальний": "2.10", "R2_breakout": "2.10", "R3_великі": "2.10",
-    "R4_великий": "2.10", "R5_дуже": "2.10", "R6_волт": "2.10",
-    "R7_одним": "2.10",
+    # v2.16: реверси — нове правило кваліфікації (епізод закриття <5 хв,
+    # падіння ≥1% між філами кита), чесний вхід зі свіжого стакану, вихід
+    # m30 з ціною стакану, R8 — рядки R з 2.10 не порівнянні (старі рядки
+    # доступні через settlement, якщо проходять нове правило)
+    "R1_загальний": "2.16", "R2_breakout": "2.16", "R3_великі": "2.16",
+    "R4_великий": "2.16", "R5_дуже": "2.16", "R6_волт": "2.16",
+    "R7_одним": "2.16", R8_NAME: "2.16",
     "F1_1хв": "2.10", "F2_2хв": "2.10", "F3_3хв": "2.10",
     "F6_1хв_перший": "2.10", "F4_розумний": "2.10", "F5_перший": "2.10",
     "F7_без_ратіо": "2.10",
@@ -4039,7 +4244,7 @@ PROFILE_ALGO_V   = 9      # версія алгоритму профілів: с
                           # (лише ≥$100k) — кваліфікація F7, ТЗ 04.09;
                           # v9: бік "Short > Long" — SHORT, глибина з
                           # правильної сторони (аудит v2.10 №8))
-DATA_ALGO_V      = "2.15" # версія логіки збору: трекер отримує її при
+DATA_ALGO_V      = "2.16" # версія логіки збору: трекер отримує її при
                           # СТВОРЕННІ і несе у рядок; API рахує лише
                           # поточну версію (аудит v2.2: рестарт підписував
                           # старі трекери новою версією). При зміні
@@ -4066,6 +4271,7 @@ STRAT2_TITLES = {
     "R5_дуже":      "Реверс · екстрим ≥3%",
     "R6_волт":      "Реверс · волти",
     "R7_одним":     "Реверс · одним пострілом",
+    "R8_тп80":      "Реверс · TP 80% відкату",
     "F1_1хв":       "За китом · тиша 1 хв",
     "F2_2хв":       "За китом · тиша 2 хв",
     "F3_3хв":       "За китом · тиша 3 хв",
@@ -4083,17 +4289,21 @@ STRAT2_TITLES = {
     "T2_твап_скорочення_20": "TWAP-реверс · скорочення · рух ≥2%",
 }
 STRAT2_DESC = {
-    "R1_загальний": "Проти кита: він повністю злив позицію, монета впала "
-                    "≥1% за 3 хв — ставимо на відскок, тримаємо 30 хв",
+    "R1_загальний": "Проти кита: він повністю злив позицію за <5 хв, і між "
+                    "його першим і останнім філом монета впала ≥1% — "
+                    "ставимо на відскок, тримаємо 30 хв",
     "R2_breakout":  "Те саме, але чекаємо підтвердження: вхід лише коли "
                     "ціна відбилась на +0.3% від дна (вікно 10 хв)",
     "R3_великі":    "Відскок тільки на ZEC і HYPE (вибір користувача)",
-    "R4_великий":   "Відскок тільки після сильного руху ≥2% за 3 хв",
-    "R5_дуже":      "Відскок тільки після екстремального руху ≥3% за 3 хв",
+    "R4_великий":   "Відскок тільки після сильного падіння ≥2% за епізод",
+    "R5_дуже":      "Відскок тільки після екстремального падіння ≥3% за епізод",
     "R6_волт":      "Відскок після зливу ВОЛТОМ (механічний вивід коштів "
                     "вкладників, не рішення трейдера)",
     "R7_одним":     "Проти кита: ВСЯ позиція закрита однією транзакцією "
-                    "≥$100k, рух ≥1% за 3 хв — вхід одразу",
+                    "≥$100k, падіння ≥1% — вхід одразу",
+    "R8_тп80":      "Проти кита, як R1, але з уявним тейк-профітом: монета "
+                    "впала на X% — виходимо, щойно відновила 80% від X "
+                    "(падіння 1% → +0.8%); не відновила — таймер 30 хв",
     "F1_1хв":       "Разом з китом: він скинув ≥5% позиції — входимо в "
                     "його бік, виходимо після 1 хв без нових продажів",
     "F2_2хв":       "Разом з китом, вихід після 2 хв тиші",
@@ -4136,12 +4346,23 @@ STRAT2_DESC = {
 REV_SIG_HEADERS = ["sig_id", "date", "coin", "fade_side", "whale_addr", "src",
                    "px", "move_3m_pct", "dur_s", "sum_usd", "usd_s", "ratio",
                    "shtanga", "vault", "hour", "btc_move_pct", "btc_ok",
-                   "depth_usd", "opened", "algo_v", "eol"]
+                   "depth_usd", "opened", "algo_v",
+                   # v2.16: епізод закриття (перший→останній філ), вік філа,
+                   # грейс, джерело детекції
+                   "dump_dur_s", "dump_move_pct", "dump_bucket", "lag_s",
+                   "grace", "detect_src", "eol"]
 REV_HEADERS = (["sig_id", "strategy", "date", "coin", "our_side", "whale_addr",
                 "src", "detect_px", "entry_px", "entered", "move_3m_pct",
                 "dur_s", "sum_usd", "usd_s", "ratio", "shtanga", "vault",
                 "hour", "btc_move_pct", "depth_usd", "costs_pct", "peak_pct",
-                "trough_pct", "algo_v"]
+                "trough_pct", "algo_v",
+                # v2.16: чесний вхід (стакан), вік філа/міда, грейс, епізод
+                # закриття, вирішений вихід (m30 зі стакану / TP R8)
+                "entry_ts_ms", "fill_ts_ms", "lag_s", "detect_src",
+                "entry_src", "entry_px_mid", "px_age_ms", "whale_px", "grace",
+                "dump_first_ts_ms", "dump_last_ts_ms", "dump_dur_s",
+                "dump_move_pct", "dump_bucket", "exit_min", "exit_reason",
+                "exit_ts_ms", "exit_px", "exit_src", "tp_px"]
                + [f"m{i}" for i in range(1, REV_TRACK_MIN + 1)] + ["eol"])
 FOLLOW_HEADERS = ["date_open", "date_close", "strategy", "coin", "our_side",
                   "whale_addr", "entry_px", "exit_px", "exit_reason", "hold_s",
@@ -4156,7 +4377,12 @@ FOLLOW_HEADERS = ["date_open", "date_close", "strategy", "coin", "our_side",
                   # (лише F4/F5, у решти порожньо)
                   "first_shot", "pair_gap_s", "prof_n_fast", "prof_n_slow",
                   "prof_fast_pct", "prof_unload_med_s", "prof_unload_mean_s",
-                  "prof_window_d", "eol"]
+                  "prof_window_d",
+                  # v2.16: мс-мітки, вік філа кита і міда, джерела цін входу
+                  # й виходу, ціна філа кита, грейс
+                  "open_ts_ms", "close_ts_ms", "fill_ts_ms", "lag_s",
+                  "detect_src", "entry_src", "entry_px_mid", "px_age_ms",
+                  "whale_px", "exit_src", "exit_px_mid", "grace", "eol"]
 # Тіньова хвилинна стрічка FOLLOW-входів: m1..m60 у НАШОМУ напрямку від
 # ціни входу, незалежно від правил виходу F1-F4 — щоб крива "яка хвилина
 # виходу найкраща" існувала й для follow (запит користувача 30.08)
@@ -4168,7 +4394,9 @@ FOLLOW_OUT_HEADERS = (["fo_id", "date", "coin", "our_side", "whale_addr",
                        "algo_v",
                        # v2.8: щоб крива «хвилина виходу» існувала і для
                        # когорти першого пострілу (F5) окремо
-                       "first_shot", "pair_gap_s"]
+                       "first_shot", "pair_gap_s",
+                       # v2.16
+                       "fill_ts_ms", "lag_s", "detect_src", "grace", "entry_src"]
                       + [f"m{i}" for i in range(1, REV_TRACK_MIN + 1)] + ["eol"])
 
 # OUTCOME-стрічка: шлях ціни КОЖНОГО сигналу від детекту, незалежно від
@@ -4179,7 +4407,10 @@ REV_OUT_HEADERS = (["sig_id", "date", "coin", "fade_side", "whale_addr",
                     "src", "detect_px", "move_3m_pct", "dur_s", "sum_usd",
                     "usd_s", "ratio", "shtanga", "vault", "hour",
                     "btc_move_pct", "btc_ok", "would_open", "depth_usd",
-                    "costs_pct", "peak_pct", "trough_pct", "algo_v"]
+                    "costs_pct", "peak_pct", "trough_pct", "algo_v",
+                    # v2.16
+                    "fill_ts_ms", "lag_s", "detect_src", "grace",
+                    "dump_dur_s", "dump_move_pct", "dump_bucket", "entry_src"]
                    + [f"m{i}" for i in range(1, REV_TRACK_MIN + 1)] + ["eol"])
 
 strat2_lock       = threading.RLock()   # RLock: захист від self-deadlock
@@ -4313,16 +4544,21 @@ px_min  = {}   # coin -> [(minute_ts, px), ...] — 4 год похвилинн�
 PX_MIN_KEEP = 240
 
 def _px_at(coin, ts, tol=90.0):
-    """Ціна монети НА момент ts: найближчий семпл із хвилинної або
-    5-секундної історії, не далі tol секунд; None — історії немає."""
+    """Ціна монети НА момент ts: найближчий семпл ДО ts (не після — v2.16,
+    рев'ю: семпл після точки був підгляданням у майбутнє для P0 TWAP) із
+    хвилинної або 5-секундної історії, не далі tol секунд; None — нема."""
     with px_lock:
         pts = list(px_min.get(coin) or ()) + list(px_hist.get(coin) or ())
     best = None
     for t, p in pts:
-        d = abs(t - ts)
+        if t > ts:
+            continue
+        d = ts - t
         if best is None or d < best[0]:
             best = (d, p)
     return best[1] if best is not None and best[0] <= tol else None
+
+_px_pending = {}   # coin -> (ts, px): різкий стрибок міда чекає підтвердження
 
 def run_px_poller():
     while True:
@@ -4332,7 +4568,11 @@ def run_px_poller():
         except Exception:
             mids = None
         if mids:
-            now = time.time()
+            # v2.16 (рев'ю): мітка семпла — час ВІДПРАВКИ запиту (t0), а не
+            # відповіді: вік ціни не занижується на RTT; лічильники живості
+            # фіду — у /status і вотчдогу
+            now = t0
+            stats["px_last_ok"] = time.time()
             with px_lock:
                 for c, v in mids.items():
                     try:
@@ -4343,7 +4583,26 @@ def run_px_poller():
                     # False) і давав сигнал "+nan%" та отруєні медіани
                     # аж до битого JSON у /strat2 (аудит v2.6 №7)
                     if not math.isfinite(px) or px <= 0: continue
+                    # делістнута монета висить в allMids із замороженою
+                    # ціною — для нас це «ціни немає» (рев'ю v2.15)
+                    if c in _hl_delisted: continue
                     h = px_hist.setdefault(c, [])
+                    # захист від одиничного викиду (порожній бік стакану
+                    # → мід далеко від ринку на один семпл): стрибок >25%
+                    # проти попереднього семпла чекає підтвердження
+                    # НАСТУПНИМ семплом; реальний рух підтверджується за 5 с
+                    if h:
+                        _prev = h[-1][1]
+                        _pend = _px_pending.get(c)
+                        if abs(px / _prev - 1.0) > 0.25:
+                            if _pend is not None and abs(px / _pend[1] - 1.0) <= 0.10:
+                                h.append(_pend)           # підтверджено — обидва
+                                _px_pending.pop(c, None)
+                            else:
+                                _px_pending[c] = (now, px)
+                                continue
+                        else:
+                            _px_pending.pop(c, None)
                     h.append((now, px))
                     if len(h) > 50: del h[:len(h) - 50]
                     # хвилинна історія на 4 год (TWAP-реверс, v2.11 п.5):
@@ -4354,6 +4613,8 @@ def run_px_poller():
                     if not hm or hm[-1][0] != _mn:
                         hm.append((_mn, px))
                         if len(hm) > PX_MIN_KEEP: del hm[:len(hm) - PX_MIN_KEEP]
+        else:
+            stats["px_fail"] = stats.get("px_fail", 0) + 1
         time.sleep(max(0.5, 5.0 - (time.time() - t0)))
 
 def _px_now(coin, max_age=20.0):
@@ -4378,7 +4639,18 @@ def _px_ago(coin, sec):
     return best[1] if target - best[0] <= PX_AGO_TOL_S else None
 
 # ── РЕВЕРС ──────────────────────────────────────────────
-def rev_on_close(addr, coin, old, mfills, full_close):
+def _rev_ref_px(coin, first_ts_ms, first_px):
+    """v2.16 п.7: референс «до закриття» для руху епізоду — мід ДО першого
+    close-філа кита (5-с семпл поллера, не пізніший за філ, ≤90 с): сам
+    перший ордер уже рухає ціну (одним пострілом = один філ, у якого перша
+    ціна = остання). Нема семпла — ціна першого філа."""
+    if first_ts_ms:
+        p = _px_at(coin, first_ts_ms / 1000.0 - 0.001, tol=90.0)
+        if p:
+            return p
+    return first_px
+
+def rev_on_close(addr, coin, old, mfills, full_close, detect_src="sweep"):
     """Викликається на кожен підтверджений батч закриттів, ДО того як
     fc_on_full_close зніме епізод (фічі dur/sum ще доступні)."""
     if not STRAT2_ENABLED or not mfills: return
@@ -4440,16 +4712,52 @@ def rev_on_close(addr, coin, old, mfills, full_close):
                 return
     side = old.get("side")
     if side not in ("LONG", "SHORT"): return
-    px_now = _px_now(coin)
-    ago = _px_ago(coin, REV_WINDOW_S)
-    if not px_now or not ago:
-        return   # історія цін ще не набралась (перші 3 хв після старту)
-    move = (px_now / ago - 1.0) * 100.0
-    mag = -move if side == "LONG" else move   # рух У БІК закриття кита
+    # ── v2.16 п.7: кваліфікація за ЕПІЗОДОМ закриття кита, а не за 3-хв
+    # вікном кешу мідів (аудит: вікно було прив'язане до часу рішення й
+    # до застарілого міда). Епізод = серія його close-філів (fc_on_txs,
+    # уже викликаний): від ціни ПЕРШОГО філа до ціни ОСТАННЬОГО, за
+    # біржовими цінами й часом; коротший за REV_EP_MAX_S і з падінням
+    # ≥REV_EP_MIN_MAG у бік закриття. Когорта = ceil(тривалість, хв) 1..5
+    with fc_lock:
+        _ep0 = fc_episodes.get((addr, coin))
+        ep = dict(_ep0) if _ep0 else None
+    _txs = sorted(mfills, key=lambda f: f.get("ts") or 0)
+    fill_ts_ms = int(_txs[-1].get("ts") or 0)
+    last_px = float(_txs[-1]["px"])
+    if ep and ep.get("first_ts") and ep.get("first_px"):
+        dump_first_ts, dump_first_px = int(ep["first_ts"]), float(ep["first_px"])
+    else:
+        dump_first_ts, dump_first_px = int(_txs[0].get("ts") or fill_ts_ms), float(_txs[0]["px"])
+    dump_last_ts = max(fill_ts_ms, int((ep or {}).get("last_ts") or 0))
+    dump_dur = (max(0.0, (dump_last_ts - dump_first_ts) / 1000.0)
+                if dump_first_ts and dump_last_ts else 0.0)
+    ref_px = _rev_ref_px(coin, dump_first_ts, dump_first_px)
+    dump_move = (last_px / ref_px - 1.0) * 100.0 if ref_px else 0.0
+    mag = -dump_move if side == "LONG" else dump_move   # падіння У БІК закриття
+    dump_bucket = (max(1, int(math.ceil(dump_dur / 60.0)))
+                   if dump_dur < REV_EP_MAX_S else 0)
+    now = time.time()
+    lag_s = (now - fill_ts_ms / 1000.0) if fill_ts_ms else None
+    # старий 3-хв рух по кешу — лише як довідкова колонка move_3m_pct
+    _pn = _px_now(coin); _pa = _px_ago(coin, REV_WINDOW_S)
+    move3 = ((_pn / _pa - 1.0) * 100.0) if (_pn and _pa) else None
+    mag3 = ((-move3 if side == "LONG" else move3) if move3 is not None else None)
     # outcome-стрічка пише від 0.5% (перевірка нижчих порогів у
-    # майбутньому); стратегії відкриваються від 1%, як у специфікації
+    # майбутньому); стратегії відкриваються від 1% за <5 хв
     if mag < REV_OUT_MIN_MAG: return
-    below_threshold = mag < 1.0
+    below_threshold = (mag < REV_EP_MIN_MAG) or (dump_dur >= REV_EP_MAX_S)
+    # ціна входу — зі СВІЖОГО стакану з нашого боку (проти кита: його
+    # LONG закрито → ми купуємо), без стакану — гірша з міда й ціни
+    # останнього філа кита (v2.16 п.1)
+    px_entry, entry_src, pmeta = _paper_px(coin, "BUY" if side == "LONG" else "SELL",
+                                           whale_px=last_px)
+    if not px_entry:
+        stats["rev_no_px"] = stats.get("rev_no_px", 0) + 1
+        return
+    px_now = pmeta.get("book_mid") or pmeta.get("mid") or px_entry
+    stale = lag_s is not None and lag_s > REV_MAX_FILL_AGE_S
+    if stale:
+        stats["rev_stale_skips"] = stats.get("rev_stale_skips", 0) + 1
     b_now = _px_now("BTC"); b_ago = _px_ago("BTC", REV_WINDOW_S)
     if b_now and b_ago:
         btc_move = (b_now / b_ago - 1.0) * 100.0
@@ -4460,10 +4768,8 @@ def rev_on_close(addr, coin, old, mfills, full_close):
         # позиції не відкриваємо, у CSV btc_move порожній (аудит п.6)
         btc_move = None
         btc_ok = False
-    with fc_lock:
-        ep = fc_episodes.get((addr, coin))
-        dur = (ep["last_ts"] - ep["first_ts"]) / 1000.0 if ep else 0.0
-        sum_usd = ep["sum_usd"] if ep else sum(f["px"] * f["sz"] for f in mfills)
+    dur = dump_dur
+    sum_usd = ep["sum_usd"] if ep else sum(f["px"] * f["sz"] for f in mfills)
     usd_s = sum_usd / dur if dur > 0 else 0.0
     shtanga = int((0 < dur < 30) or (usd_s and usd_s < 5000) or dur == 0)
     hour = time.localtime().tm_hour
@@ -4472,7 +4778,7 @@ def rev_on_close(addr, coin, old, mfills, full_close):
     # №7a), інакше — поточний (часткові закриття оновлюють його свіжим)
     ratio = (((_ep_gate or {}).get("ratio") or old.get("ratio", 0) or 0)
              if full_close else (old.get("ratio", 0) or 0))
-    now = time.time()
+    grace = int((old.get("ratio") or 0) < 2.0)   # v2.16 п.4
     # унікальність: мс + монета + гаманець + hash транзакції-тригера
     _txh = str(mfills[-1].get("hash", ""))[2:10]
     _sig_seq[0] += 1
@@ -4503,12 +4809,12 @@ def rev_on_close(addr, coin, old, mfills, full_close):
                and _big_tx["px"] * _big_tx["sz"] >= R7_MIN_TX_USD \
                and not _big_tx.get("liq"):
                 one_shot = 1
-    if below_threshold or src == "partial":
-        strats = []   # 0.5-1% або часткове закриття: лише outcome-стрічка
+    if below_threshold or src == "partial" or stale:
+        strats = []   # 0.5-1%, довгий епізод, часткове або старий філ: лише outcome
     elif src == "vault":
         strats = ["R6_волт"]
     else:
-        strats = ["R1_загальний", "R2_breakout"]
+        strats = ["R1_загальний", "R2_breakout", R8_NAME]
         if coin in BIG_COINS: strats.append("R3_великі")
         if mag >= 2.0: strats.append("R4_великий")
         if mag >= 3.0: strats.append("R5_дуже")
@@ -4516,14 +4822,26 @@ def rev_on_close(addr, coin, old, mfills, full_close):
     base_pos = {"sig_id": sig_id, "coin": coin,
                 "side": side, "addr": addr, "src": src,
                 "detect_ts": now, "detect_px": px_now,
-                "move": mag, "dur": dur, "sum_usd": sum_usd,
+                # move — довідковий 3-хв рух по кешу (як у старих рядках),
+                # кваліфікація v2.16 — move_ep/dump_* за епізодом
+                "move": (mag3 if mag3 is not None else mag), "move_ep": mag,
+                "dur": dur, "sum_usd": sum_usd,
                 "usd_s": usd_s, "ratio": ratio, "shtanga": shtanga,
                 "vault": int(vault), "hour": hour,
                 "btc_move": btc_move, "depth": depth,
+                "costs": _sim_costs(coin, side)[0],   # v2.16: обидва боки стакану
                 # версія — В МОМЕНТ створення: трекер, відновлений зі
                 # старого state.json без версії, пишеться як legacy (""),
                 # а не підписується поточною (аудит v2.2)
                 "algo_v": DATA_ALGO_V,
+                # v2.16: епізод, вік філа/міда, джерела, грейс
+                "dump_first_ts": dump_first_ts, "dump_last_ts": dump_last_ts,
+                "dump_dur": dump_dur, "dump_move": dump_move,
+                "dump_bucket": dump_bucket,
+                "fill_ts_ms": fill_ts_ms, "lag_s": lag_s, "detect_src": detect_src,
+                "grace": grace, "entry_src": entry_src,
+                "entry_px_mid": pmeta.get("mid"), "px_age_ms": pmeta.get("px_age_ms"),
+                "whale_px": last_px,
                 "samples": [], "peak": -999.0, "trough": 999.0}
     opened = []
     with strat2_lock:
@@ -4541,11 +4859,16 @@ def rev_on_close(addr, coin, old, mfills, full_close):
         pos["would_open"] = "+".join(strats)
         rev_open[f"{sig_id}|_OUTCOME"] = pos
         if btc_ok:
+            # v2.16 (рев'ю №2): монета зайнята лише поки заголовкова угода
+            # (m30 / TP) не закрита — трекер, що веде криву до m60, монету
+            # не тримає; пропуски рахуємо
             busy = {(p["strategy"], p["coin"]) for p in rev_open.values()
                     if not p["strategy"].startswith("_")
-                    and not p.get("done")}
+                    and not p.get("done") and not _rev_trade_closed(p, now)}
             for st in strats:
-                if (st, coin) in busy: continue
+                if (st, coin) in busy:
+                    stats["rev_busy_skips"] = stats.get("rev_busy_skips", 0) + 1
+                    continue
                 pos = dict(base_pos); pos["strategy"] = st
                 pos["samples"] = []
                 if st == "R2_breakout":
@@ -4557,24 +4880,48 @@ def rev_on_close(addr, coin, old, mfills, full_close):
                 else:
                     pos["state"] = "open"
                     pos["entry_ts"] = now
-                    pos["entry_px"] = px_now
+                    pos["entry_px"] = px_entry
+                    if st == R8_NAME:
+                        # уявний тейк-профіт: відновлення 80% падіння
+                        pos["tp_px"] = (px_entry * (1 + R8_TP_FRAC * mag / 100.0)
+                                        if side == "LONG"
+                                        else px_entry * (1 - R8_TP_FRAC * mag / 100.0))
                 rev_open[f"{sig_id}|{st}"] = pos
                 opened.append(st)
     _sig_row = [sig_id, _dt(now), coin, side, addr, src, round(px_now, 8),
-                round(mag, 3), round(dur, 1), round(sum_usd, 0),
+                (round(mag3, 3) if mag3 is not None else ""), round(dur, 1),
+                round(sum_usd, 0),
                 round(usd_s, 0), round(ratio, 2), shtanga, int(vault), hour,
                 (round(btc_move, 3) if btc_move is not None else ""),
                 int(btc_ok), round(depth or 0, 0), "+".join(opened),
-                DATA_ALGO_V]
+                DATA_ALGO_V,
+                round(dump_dur, 1), round(dump_move, 3), dump_bucket,
+                (round(lag_s, 1) if lag_s is not None else ""), grace, detect_src]
     if not _strat_csv_append(REV_SIG_CSV, REV_SIG_HEADERS, _sig_row):
         # сигнал — вісь paired-порівнянь: без нього outcome/угоди висять
         # у повітрі. Невдалий запис іде в outbox (ретрай у циклі)
         with _sig_retry_lock:
             _sig_retry_q.append([REV_SIG_CSV, REV_SIG_HEADERS, _sig_row, 0])
     _btc_txt = f"{btc_move:+.2f}%" if btc_move is not None else "н/д"
-    print(f"  [REV] сигнал {coin} fade={side} {mag:+.2f}%/3хв src={src} "
-          f"btc={_btc_txt}{'' if btc_ok else ' VETO'} -> "
-          f"{'+'.join(opened) or '—'}")
+    print(f"  [REV] сигнал {coin} fade={side} епізод {mag:+.2f}%/{dur:.0f}с "
+          f"(к{dump_bucket}) src={src} ціна {entry_src} "
+          f"btc={_btc_txt}{'' if btc_ok else ' VETO'}"
+          f"{' STALE' if stale else ''} -> {'+'.join(opened) or '—'}")
+
+def _rev_trade_closed(p, now):
+    """Заголовкова угода реверсу закрита (v2.16): вирішений вихід (TP або
+    таймер m30 зі стакану) або минуло REV_HOLD_MIN хвилин (+35 с допуску
+    семпла). Трекер може ще вести криву до REV_TRACK_MIN, але монету для
+    нової угоди тієї ж стратегії не тримає."""
+    if p.get("exit_reason"):
+        return True
+    if p.get("state") == "armed":
+        return False
+    et = p.get("entry_ts") or 0
+    if not et:
+        return False
+    return (len(p.get("samples") or ()) >= REV_HOLD_MIN
+            or now - et >= REV_HOLD_MIN * 60.0 + 35.0)
 
 def _rev_samples(p, entered):
     """Хвилинні семпли: float або "" (чесний пропуск після збою котирувань)."""
@@ -4584,9 +4931,49 @@ def _rev_samples(p, entered):
            for x in p["samples"][:REV_TRACK_MIN]]
     return out + [""] * (REV_TRACK_MIN - len(out))
 
+def _ms(ts):
+    """Секунди (float) → цілі мс для CSV; None/0/"" → ""."""
+    try:
+        if ts is None or ts == "":
+            return ""
+        ts = float(ts)
+        if not math.isfinite(ts) or ts <= 0:
+            return ""
+        return int(round(ts * 1000.0))
+    except Exception:
+        return ""
+
+def _rnd(x, n):
+    """round або "" для None/нечисла/non-finite (нові v2.16 колонки)."""
+    try:
+        if x is None or x == "":
+            return ""
+        x = float(x)
+        if not math.isfinite(x):
+            return ""
+        return round(x, n)
+    except Exception:
+        return ""
+
+def _rev_extra(p):
+    """v2.16: 20 колонок REV_HEADERS після algo_v (перед m1..m60)."""
+    return [_ms(p.get("entry_ts")), (p.get("fill_ts_ms") or ""),
+            _rnd(p.get("lag_s"), 3), p.get("detect_src", ""),
+            p.get("entry_src", ""), _rnd(p.get("entry_px_mid"), 8),
+            (int(p["px_age_ms"]) if isinstance(p.get("px_age_ms"), (int, float))
+             and math.isfinite(p["px_age_ms"]) else ""),
+            _rnd(p.get("whale_px"), 8), p.get("grace", ""),
+            # dump_first_ts/dump_last_ts у трекері вже в мс (час біржі)
+            (int(p["dump_first_ts"]) if p.get("dump_first_ts") else ""),
+            (int(p["dump_last_ts"]) if p.get("dump_last_ts") else ""),
+            _rnd(p.get("dump_dur"), 1), _rnd(p.get("dump_move"), 3),
+            p.get("dump_bucket", ""),
+            p.get("exit_min", ""), p.get("exit_reason", ""),
+            (p.get("exit_ts_ms") or ""), _rnd(p.get("exit_px"), 8),
+            p.get("exit_src", ""), _rnd(p.get("tp_px"), 8)]
+
 def _rev_row(p, entered):
-    slip = _sim_slip(p.get("depth") or 0)
-    costs = (2 * SIM_COMMISSION + 2 * slip) * 100.0
+    costs = _p_costs(p)
     bm = p.get("btc_move")
     return ([p["sig_id"], p["strategy"], _dt(p["detect_ts"]), p["coin"],
              p["side"], p["addr"], p["src"], round(p["detect_px"], 8),
@@ -4600,13 +4987,13 @@ def _rev_row(p, entered):
              (round(p["peak"], 4) if entered and p["peak"] > -999 else ""),
              (round(p["trough"], 4) if entered and p["trough"] < 999 else ""),
              p.get("algo_v", "")]
+            + _rev_extra(p)
             + _rev_samples(p, entered))
 
 def _fol_out_row(p):
     """Рядок тіньової хвилинної стрічки follow-входу (m1..60 у нашому
     напрямку від ціни входу)."""
-    slip = _sim_slip(p.get("depth") or 0)
-    costs = (2 * SIM_COMMISSION + 2 * slip) * 100.0
+    costs = _p_costs(p)
     bm = p.get("btc_move")
     return ([p["sig_id"], _dt(p["detect_ts"]), p["coin"], p["side"],
              p["addr"], round(p["entry_px"], 8),
@@ -4618,12 +5005,15 @@ def _fol_out_row(p):
              (round(p["peak"], 4) if p["peak"] > -999 else ""),
              (round(p["trough"], 4) if p["trough"] < 999 else ""),
              p.get("algo_v", ""),
-             p.get("first_shot", ""), p.get("pair_gap", "")]
+             p.get("first_shot", ""), p.get("pair_gap", ""),
+             # v2.16
+             (p.get("fill_ts_ms") or ""), _rnd(p.get("lag_s"), 3),
+             p.get("detect_src", ""), p.get("grace", ""),
+             p.get("entry_src", "")]
             + _rev_samples(p, 1))
 
 def _rev_out_row(p):
-    slip = _sim_slip(p.get("depth") or 0)
-    costs = (2 * SIM_COMMISSION + 2 * slip) * 100.0
+    costs = _p_costs(p)
     bm = p.get("btc_move")
     return ([p["sig_id"], _dt(p["detect_ts"]), p["coin"], p["side"],
              p["addr"], p["src"], round(p["detect_px"], 8),
@@ -4635,11 +5025,51 @@ def _rev_out_row(p):
              round(p.get("depth") or 0, 0), round(costs, 4),
              (round(p["peak"], 4) if p["peak"] > -999 else ""),
              (round(p["trough"], 4) if p["trough"] < 999 else ""),
-             p.get("algo_v", "")]
+             p.get("algo_v", ""),
+             # v2.16
+             (p.get("fill_ts_ms") or ""), _rnd(p.get("lag_s"), 3),
+             p.get("detect_src", ""), p.get("grace", ""),
+             _rnd(p.get("dump_dur"), 1), _rnd(p.get("dump_move"), 3),
+             p.get("dump_bucket", ""), p.get("entry_src", "")]
             + _rev_samples(p, 1))
 
+def _fol_row(p, fid, close_ts, exit_px, reason, g):
+    """Заморожений рядок follow-угоди (FOLLOW_HEADERS без eol). v2.16: ціна
+    виходу — зі стакану в момент рішення (exit_src), плюс мс-мітки, вік
+    філа кита і міда на вході, джерела цін, ціна філа кита, грейс."""
+    costs = _p_costs(p)
+    _bm = p.get("btc_move")
+    pr = p.get("prof") or {}
+    return [_dt(p["open_ts"]), _dt(close_ts),
+            p["strategy"], p["coin"], p["our_side"], p["addr"],
+            round(p["entry_px"], 8), round(exit_px, 8), reason,
+            round(close_ts - p["open_ts"], 1), round(g, 4),
+            round(costs, 4), round(g - costs, 4),
+            round(p["peak"], 4), round(p["trough"], 4),
+            round(p["tx_pct"], 3), round(p["tx_usd"], 0),
+            round(p["ratio"], 2), round(p["pos_usd"], 0),
+            p["vault"], p["hour"],
+            (round(_bm, 3) if _bm is not None else ""),
+            round(p["profile_gap"], 1), p.get("algo_v", ""), fid,
+            # v2.8: перший постріл/пауза пари і профіль швидкості на момент
+            # входу (трекери зі старого state.json цих полів не мають)
+            p.get("first_shot", ""), p.get("pair_gap", ""),
+            pr.get("n_fast", ""), pr.get("n_slow", ""),
+            (pr.get("fast_pct") if pr.get("fast_pct") is not None else ""),
+            (pr.get("unload_med_s") if pr.get("unload_med_s") is not None else ""),
+            (pr.get("unload_mean_s") if pr.get("unload_mean_s") is not None else ""),
+            (pr.get("window_d") if pr.get("window_d") is not None else ""),
+            # v2.16
+            _ms(p["open_ts"]), _ms(close_ts), (p.get("fill_ts_ms") or ""),
+            _rnd(p.get("lag_s"), 3), p.get("detect_src", ""),
+            p.get("entry_src", ""), _rnd(p.get("entry_px_mid"), 8),
+            (int(p["px_age_ms"]) if isinstance(p.get("px_age_ms"), (int, float))
+             and math.isfinite(p["px_age_ms"]) else ""),
+            _rnd(p.get("whale_px"), 8), p.get("exit_src", ""),
+            _rnd(p.get("exit_px_mid"), 8), p.get("grace", "")]
+
 # ── ВХІД У БІК ТИСКУ ────────────────────────────────────
-def follow_on_txs(addr, coin, old, mfills, full_close):
+def follow_on_txs(addr, coin, old, mfills, full_close, detect_src="sweep"):
     if not STRAT2_ENABLED or not mfills: return
     key = f"{addr}:{coin}"
     now = time.time()
@@ -4649,9 +5079,17 @@ def follow_on_txs(addr, coin, old, mfills, full_close):
         prev_close = follow_last_close.get(key)
         follow_last_close[key] = now
         if full_close:
+            _last_fill_ms = max((f.get("ts") or 0) for f in mfills) or None
             for p in follow_open.values():
                 if p["key"] == key:
                     p["force_exit"] = "full_close"
+                    # v2.16 (рев'ю: вихід full_close за мідом ДО філа): час
+                    # останнього філа кита і час, коли дізнались — вихід
+                    # рахується зі стакану в момент рішення, а спізнення
+                    # >60 с маркується full_close_late (поза заголовком)
+                    p.setdefault("force_exit_ts", now)
+                    if _last_fill_ms:
+                        p["force_fill_ts_ms"] = _last_fill_ms
     if full_close: return   # кит уже все закрив — заходити пізно
     pair_gap = (now - prev_close) if prev_close else None
     first_shot = int(pair_gap is None or pair_gap >= F5_FIRST_SHOT_S)
@@ -4668,9 +5106,19 @@ def follow_on_txs(addr, coin, old, mfills, full_close):
     big = [f for f in mfills if f["sz"] >= (f.get("sp") or base_sz) * FOLLOW_TX_PCT
            and f["px"] * f["sz"] >= MIN_TX_USD]
     if not big: return
-    px = _px_now(coin)
-    if not px: return
     tx = max(big, key=lambda f: f["sz"])
+    # v2.16 (рев'ю v2.15 №1): paper-вхід лише за СВІЖИМ філом кита. Після
+    # рестарту/паузи перший прохід підтверджує філи до години давності —
+    # вхід «зараз» у рух, що вже відбувся, не є стратегією; алерти й
+    # тінь пари від цього не залежать. Вік філа і джерело детекції — у
+    # рядок кожної угоди
+    fill_ts_ms = max((f.get("ts") or 0) for f in mfills) or 0
+    lag_s = (now - fill_ts_ms / 1000.0) if fill_ts_ms else None
+    if lag_s is not None and lag_s > FOLLOW_MAX_FILL_AGE_S:
+        stats["follow_stale_skips"] = stats.get("follow_stale_skips", 0) + 1
+        print(f"  [FOLLOW] {coin}: філ кита {lag_s:.0f}с тому "
+              f"(>{FOLLOW_MAX_FILL_AGE_S:.0f}с, {detect_src}) — paper-вхід пропущено")
+        return
     # «перший постріл» — властивість ТРАНЗАКЦІЇ, не батча (аудит v2.10
     # №6): якщо в цьому ж батчі БУЛА старша транзакція (навіть дрібна,
     # нижче порога), вона вже використала перший постріл пари
@@ -4678,25 +5126,43 @@ def follow_on_txs(addr, coin, old, mfills, full_close):
                           for f in mfills):
         first_shot = 0
     our = "SHORT" if old.get("side") == "LONG" else "LONG"
+    # v2.16 (аудит: paper-вхід за застарілим мідом): ціна входу — зі
+    # СВІЖОГО стакану з нашого боку (виконувана на $1000); без стакану —
+    # гірша з кеш-міда і ціни філа кита, з позначкою джерела у рядку
+    px, entry_src, pmeta = _paper_px(coin, "SELL" if our == "SHORT" else "BUY",
+                                     whale_px=tx["px"])
+    if not px:
+        stats["follow_no_px"] = stats.get("follow_no_px", 0) + 1
+        return
+    t_entry = time.time()   # ціна відома САМЕ зараз — від цього моменту угода
     vault = is_vault(addr)
     hour = time.localtime().tm_hour
     b_now = _px_now("BTC"); b_ago = _px_ago("BTC", REV_WINDOW_S)
     # немає даних BTC -> None (у CSV порожньо), а не фальшивий 0.0
     btc_move = (b_now / b_ago - 1.0) * 100.0 if b_now and b_ago else None
     depth = _sim_depth(coin, old.get("side"))
+    # грейс (v2.16 п.4): пара пройшла ratio-гейт лише завдяки 30-хв
+    # грейсу після падіння ratio нижче 2 — позначка, щоб вимикати кнопкою
+    grace = int((old.get("ratio") or 0) < 2.0)
     base = {"key": key, "coin": coin, "our_side": our, "addr": addr,
-            "open_ts": now, "entry_px": px, "peak": -999.0, "trough": 999.0,
+            "open_ts": t_entry, "entry_px": px, "peak": -999.0, "trough": 999.0,
             "tx_pct": tx["sz"] / (tx.get("sp") or base_sz) * 100.0,
             "tx_usd": tx["px"] * tx["sz"],
             "ratio": old.get("ratio", 0) or 0,
             "pos_usd": old.get("val", 0) or 0,
             "vault": int(vault), "hour": hour, "btc_move": btc_move,
-            "depth": depth, "force_exit": None, "profile_gap": 0.0,
+            "depth": depth, "costs": _sim_costs(coin, our)[0],
+            "force_exit": None, "profile_gap": 0.0,
             "first_shot": first_shot,
             "pair_gap": (round(pair_gap, 1) if pair_gap is not None else ""),
             # профіль швидкості гаманця НА МОМЕНТ входу (v2.8): у рядок
             # кожної F-угоди, якщо профіль уже є — порівнювати когорти
             "prof": {},
+            # v2.16: вік філа й міда, джерела, ціна філа кита, грейс
+            "fill_ts_ms": fill_ts_ms, "lag_s": lag_s, "detect_src": detect_src,
+            "entry_src": entry_src, "entry_px_mid": pmeta.get("mid"),
+            "px_age_ms": pmeta.get("px_age_ms"), "whale_px": tx["px"],
+            "grace": grace,
             "algo_v": DATA_ALGO_V}   # версія в момент створення
     prof = wallet_profiles.get(addr.lower())
     # профіль треба (пере)тягнути, якщо його немає, він зі старої версії
@@ -4751,11 +5217,11 @@ def follow_on_txs(addr, coin, old, mfills, full_close):
                 _timers.append((F8_NAME, F6_TIMER_S))
         for st, timer in _timers:
             if (st, coin) in busy:
+                # v2.16 (рев'ю): пропуск рахуємо для ВСІХ стратегій; лог —
+                # лише для рідкісних first-shot-когорт (рев'ю v2.9 S3)
+                stats["follow_busy_skips"] = \
+                    stats.get("follow_busy_skips", 0) + 1
                 if st in (F6_NAME, F8_NAME):
-                    # first-shot-когорта рідкісна: мовчазний скіп ховав
-                    # би частку вибірки F6 проти F5/F7 (рев'ю v2.9 S3)
-                    stats["follow_busy_skips"] = \
-                        stats.get("follow_busy_skips", 0) + 1
                     print(f"  [FOLLOW] {st} пропуск: {coin} зайнята "
                           f"({addr[:10]}…)")
                 continue
@@ -4819,21 +5285,27 @@ def follow_on_txs(addr, coin, old, mfills, full_close):
             rev_open[fo_id] = {
                 "sig_id": fo_id, "strategy": "_FOLLOW_OUT",
                 "state": "open", "coin": coin, "side": our, "addr": addr,
-                "detect_ts": now, "detect_px": px,
-                "entry_ts": now, "entry_px": px,
+                "detect_ts": t_entry, "detect_px": px,
+                "entry_ts": t_entry, "entry_px": px,
                 "tx_pct": base["tx_pct"], "tx_usd": base["tx_usd"],
                 "ratio": base["ratio"], "pos_usd": base["pos_usd"],
                 "vault": base["vault"], "hour": hour,
                 "btc_move": btc_move, "depth": depth,
                 "algo_v": DATA_ALGO_V,
                 "first_shot": first_shot, "pair_gap": base["pair_gap"],
+                "fill_ts_ms": fill_ts_ms, "lag_s": lag_s,
+                "detect_src": detect_src, "grace": grace, "entry_src": entry_src,
                 "samples": [], "peak": -999.0, "trough": 999.0}
     # фоновий підтяг історії — СУВОРО поза strat2_lock (аудит 29.08:
     # виклик зсередини критичної секції давав self-deadlock усього модуля)
     if need_profile:
         _profile_request(addr)
     print(f"  [FOLLOW] {coin} {our} слідом за {addr[:10]}… "
-          f"(шматок {base['tx_pct']:.1f}%, ${base['tx_usd']:,.0f})")
+          f"(шматок {base['tx_pct']:.1f}%, ${base['tx_usd']:,.0f}; "
+          f"ціна {entry_src}, філ {lag_s:.1f}с тому, {detect_src})"
+          if lag_s is not None else
+          f"  [FOLLOW] {coin} {our} слідом за {addr[:10]}… "
+          f"(шматок {base['tx_pct']:.1f}%, ${base['tx_usd']:,.0f}; ціна {entry_src})")
 
 # ── F4: профілі гаманців з історії філів ────────────────
 PROFILE_ERR_TTL_S = 6 * 3600   # збій запиту = "невідомо", ретрай за 6 год
@@ -5420,6 +5892,10 @@ def run_strat2_loop():
         # done не блокує busy; після WFAIL_CAP ретраїв — дроп із логом.
         # Дублі після краху знімає дедуп по sig_id/trade_id у strat2_api.
         rev_rows, fol_rows, tw_rows = [], [], []
+        # v2.16: рішення про вхід/вихід ухвалюються під локом, а ЦІНА для них
+        # береться зі свіжого стакану ПОЗА локом (запит ~0.1–3 с; strat2_lock
+        # тримають і хуки воркерів) — списки запитів на ціну
+        rev_price, fol_exit = [], []
         with strat2_lock:
             for pid, p in list(rev_open.items()):
                 if p.get("done"):
@@ -5488,12 +5964,14 @@ def run_strat2_loop():
                     if not px: continue
                     trig = p["trigger_px"]
                     hit = px >= trig if p["side"] == "LONG" else px <= trig
-                    if hit:
-                        # консервативно: гірша з цін (тригер/поточна)
-                        p["entry_px"] = (max(px, trig) if p["side"] == "LONG"
-                                         else min(px, trig))
-                        p["entry_ts"] = now
-                        p["state"] = "open"
+                    _ah = p.get("arm_hit")
+                    if hit and (not _ah or now - (_ah.get("ts") or 0) > 30.0):
+                        # v2.16: ціна входу — зі свіжого стакану (запит поза
+                        # локом, нижче), консервативно гірша з (стакан,
+                        # тригер); застарілий arm_hit (аварія між тиками)
+                        # переставляється
+                        p["arm_hit"] = {"ts": now, "mid": px, "trig": trig}
+                        rev_price.append((pid, "arm"))
                     continue
                 # Хвилинні мітки: закриваємо лише ті хвилини, для яких
                 # ціна СВІЖА (<=30с від межі хвилини). Пропущені через
@@ -5531,11 +6009,46 @@ def run_strat2_loop():
                             and len(p["trade_row"]) != len(TWAP_HEADERS) - 1):
                         p["trade_row"] = None   # стара схема — перебудувати (рев'ю v2.15)
                     if p.get("trade_row") is None and _twap_exit(p, now) is not None:
-                        p["trade_closed_ts"] = p.get("trade_closed_ts") or now
-                        p["trade_row"] = _twap_row(p, now)
-                        _twap_freeze_exit(p)
+                        # v2.16: ціна виходу — зі свіжого стакану (запит поза
+                        # локом, нижче); рядок заморожується там же
+                        _er = p.get("exit_req")
+                        if _er and now - (_er.get("ts") or 0) > 30.0:
+                            _er = None
+                        if not _er:
+                            p["exit_req"] = {"kind": "twap", "ts": now, "mid": px}
+                            rev_price.append((pid, "exit"))
                     if p.get("trade_row") is not None:
                         tw_rows.append((pid, p["trade_row"]))
+                # v2.16: ВИРІШЕНИЙ ВИХІД заголовкової угоди реверсу — TP (R8,
+                # мід перетнув tp_px) або таймер m30 (перша хвилина з ціною у
+                # 30..33, далі — no_price); ціна виходу — зі свіжого стакану,
+                # запит поза локом. Трекер далі веде криву до m60.
+                if (p.get("row_kind") != "twap"
+                        and not p["strategy"].startswith("_")
+                        and not p.get("exit_reason")):
+                    _er = p.get("exit_req")
+                    if _er and now - (_er.get("ts") or 0) > 30.0:
+                        p.pop("exit_req", None); _er = None   # аварія між тиками
+                    if not _er:
+                        n_s = len(p["samples"])
+                        tp = p.get("tp_px")
+                        tp_hit = bool(px and tp and (px >= tp if p["side"] == "LONG"
+                                                     else px <= tp))
+                        if tp_hit and n_s < REV_HOLD_MIN:
+                            p["exit_req"] = {"kind": "tp", "ts": now, "mid": px,
+                                             "min": round((now - p["entry_ts"]) / 60.0, 2)}
+                            rev_price.append((pid, "exit"))
+                        elif n_s >= REV_HOLD_MIN:
+                            if n_s <= REV_HOLD_MIN + 3 and p["samples"][-1] != "":
+                                late = now - (p["entry_ts"] + n_s * 60.0)
+                                kind = ("timer" if (n_s == REV_HOLD_MIN and late <= 60.0)
+                                        else "timer_late")
+                                p["exit_req"] = {"kind": kind, "ts": now, "mid": px,
+                                                 "min": n_s}
+                                rev_price.append((pid, "exit"))
+                            elif n_s > REV_HOLD_MIN + 3:
+                                p["exit_reason"] = "no_price"
+                                p["exit_min"] = ""
                 if len(p["samples"]) >= _tm:
                     p["done"] = 1
                     if p["strategy"] == "_OUTCOME":
@@ -5585,34 +6098,119 @@ def run_strat2_loop():
                         if now - (last + p["timer"]) > 60:
                             reason = "silence_late"
                 if reason:
+                    # v2.16: рішення про вихід — тут; ЦІНА виходу — зі
+                    # свіжого стакану, запит поза локом (нижче); рядок
+                    # заморожується там же
+                    p["exit_pending"] = {"reason": reason, "ts": now, "mid": px}
+                    fol_exit.append(fid)
+        # ── v2.16: ціни зі стакану для вирішених входів/виходів — ПОЗА локом ──
+        if rev_price or fol_exit:
+            priced, fpriced = [], []
+            for pid, what in rev_price:
+                with strat2_lock:
+                    p = rev_open.get(pid)
+                    if p is None: continue
+                    coin, side = p["coin"], p["side"]
+                    req = p.get("arm_hit") if what == "arm" else p.get("exit_req")
+                if not req: continue
+                # відкриття LONG = BUY (аски), закриття LONG = SELL (біди)
+                bside = (("BUY" if side == "LONG" else "SELL") if what == "arm"
+                         else ("SELL" if side == "LONG" else "BUY"))
+                xpx, xsrc, xmeta = _paper_px(coin, bside, max_mid_age_ms=35_000)
+                priced.append((pid, what, xpx, xsrc, xmeta))
+            for fid in fol_exit:
+                with strat2_lock:
+                    p = follow_open.get(fid)
+                    if p is None or p.get("done") or not p.get("exit_pending"):
+                        continue
+                    coin, side = p["coin"], p["our_side"]
+                xpx, xsrc, xmeta = _paper_px(coin, "BUY" if side == "SHORT" else "SELL",
+                                             max_mid_age_ms=35_000)
+                fpriced.append((fid, xpx, xsrc, xmeta))
+            with strat2_lock:
+                for pid, what, xpx, xsrc, xmeta in priced:
+                    p = rev_open.get(pid)
+                    if p is None: continue
+                    now2 = time.time()
+                    if what == "arm":
+                        req = p.pop("arm_hit", None)
+                        if not req or p["state"] != "armed": continue
+                        trig, mid = req["trig"], req["mid"]
+                        base_px = xpx or mid
+                        # консервативно: гірша з цін (стакан / тригер)
+                        p["entry_px"] = (max(base_px, trig) if p["side"] == "LONG"
+                                         else min(base_px, trig))
+                        p["entry_ts"] = now2
+                        p["entry_src"] = xsrc if xpx else "mid"
+                        p["entry_px_mid"] = xmeta.get("mid") or mid
+                        p["px_age_ms"] = xmeta.get("px_age_ms")
+                        p["state"] = "open"
+                    else:
+                        req = p.pop("exit_req", None)
+                        if not req: continue
+                        mid = req.get("mid")
+                        base_px = xpx or mid
+                        if req["kind"] == "twap":
+                            # TWAP: вихід уже вирішений (_twap_exit) — ціна зі
+                            # стакану в трекер, рядок угоди заморожується
+                            if p.get("trade_row") is not None or p.get("trade_written"):
+                                continue
+                            tw = p.get("twap")
+                            if isinstance(tw, dict) and base_px:
+                                tw["exit_px"] = base_px
+                                tw["exit_src"] = xsrc if xpx else "mid"
+                                tw["exit_ts_ms"] = int(round(now2 * 1000))
+                            p["trade_closed_ts"] = p.get("trade_closed_ts") or now2
+                            p["trade_row"] = _twap_row(p, now2)
+                            _twap_freeze_exit(p)
+                            tw_rows.append((pid, p["trade_row"]))
+                            continue
+                        if p.get("exit_reason"): continue
+                        if not base_px: continue   # ні стакану, ні міда — наступний тик
+                        if req["kind"] == "tp" and p.get("tp_px"):
+                            # лімітка на TP: не краще за TP і не краще за стакан
+                            tp = p["tp_px"]
+                            base_px = (min(base_px, tp) if p["side"] == "LONG"
+                                       else max(base_px, tp))
+                        p["exit_px"] = base_px
+                        p["exit_src"] = xsrc if xpx else "mid"
+                        p["exit_ts_ms"] = int(round(now2 * 1000))
+                        p["exit_min"] = req["min"]
+                        p["exit_reason"] = req["kind"]
+                        p["exit_px_mid"] = xmeta.get("mid") or mid
+                        _gx = (base_px / p["entry_px"] - 1.0) * 100.0
+                        if p["side"] == "SHORT": _gx = -_gx
+                        print(f"  [REV] {p['strategy']} {p['coin']} вихід "
+                              f"{req['kind']} m{req['min']} @ {base_px:.6g} "
+                              f"({p['exit_src']}) gross {_gx:+.2f}%")
+                for fid, xpx, xsrc, xmeta in fpriced:
+                    p = follow_open.get(fid)
+                    if p is None or p.get("done"): continue
+                    req = p.pop("exit_pending", None)
+                    if not req: continue
+                    now2 = time.time()
+                    mid = req.get("mid")
+                    epx = xpx or mid
+                    if not epx: continue
+                    reason = req["reason"]
+                    if reason == "full_close":
+                        # спізнення відносно ФІЛА кита (або часу, коли
+                        # дізнались) >60 с — інша угода, поза заголовком
+                        _ft = p.get("force_fill_ts_ms")
+                        _ref = (_ft / 1000.0) if _ft else p.get("force_exit_ts")
+                        if _ref and now2 - _ref > 60.0:
+                            reason = "full_close_late"
+                    g = (epx / p["entry_px"] - 1.0) * 100.0
+                    if p["our_side"] == "SHORT": g = -g
+                    p["peak"] = max(p["peak"], g)
+                    p["trough"] = min(p["trough"], g)
                     p["done"] = 1
-                    slip = _sim_slip(p.get("depth") or 0)
-                    costs = (2 * SIM_COMMISSION + 2 * slip) * 100.0
-                    _bm = p.get("btc_move")
+                    p["exit_src"] = xsrc if xpx else "mid"
+                    p["exit_px_mid"] = xmeta.get("mid") or mid
+                    p["close_ts"] = now2
                     # заморожений фінальний рядок: exit/hold/net зафіксовані
                     # У МОМЕНТ виходу, ретраї запису їх не перерахують
-                    p["final_row"] = [_dt(p["open_ts"]), _dt(now),
-                        p["strategy"], p["coin"], p["our_side"], p["addr"],
-                        round(p["entry_px"], 8), round(px, 8), reason,
-                        round(now - p["open_ts"], 1), round(g, 4),
-                        round(costs, 4), round(g - costs, 4),
-                        round(p["peak"], 4), round(p["trough"], 4),
-                        round(p["tx_pct"], 3), round(p["tx_usd"], 0),
-                        round(p["ratio"], 2), round(p["pos_usd"], 0),
-                        p["vault"], p["hour"],
-                        (round(_bm, 3) if _bm is not None else ""),
-                        round(p["profile_gap"], 1), p.get("algo_v", ""), fid,
-                        # v2.8: перший постріл/пауза пари і профіль
-                        # швидкості на момент входу (трекери зі старого
-                        # state.json цих полів не мають -> порожньо)
-                        p.get("first_shot", ""), p.get("pair_gap", ""),
-                        *(lambda pr: [
-                            pr.get("n_fast", ""), pr.get("n_slow", ""),
-                            (pr.get("fast_pct") if pr.get("fast_pct") is not None else ""),
-                            (pr.get("unload_med_s") if pr.get("unload_med_s") is not None else ""),
-                            (pr.get("unload_mean_s") if pr.get("unload_mean_s") is not None else ""),
-                            (pr.get("window_d") if pr.get("window_d") is not None else "")]
-                          )(p.get("prof") or {})]
+                    p["final_row"] = _fol_row(p, fid, now2, epx, reason, g)
                     fol_rows.append((fid, p["final_row"]))
         written_rev, written_fol = [], []
         failed_rev, failed_fol = [], []
@@ -5685,6 +6283,72 @@ def _median(v):
     if not v: return None
     s = sorted(v); n = len(s)
     return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2.0
+
+def _stat_small(vals):
+    """v2.16: зведення по списку net (%): n / медіана / середнє / win% /
+    PnL$ при $1000 на угоду — для періодів, когорт і live/tape-зрізів."""
+    if not vals:
+        return {"n": 0, "median": None, "mean": None, "win": None, "pnl_usd": 0.0}
+    return {"n": len(vals), "median": _median(vals),
+            "mean": sum(vals) / len(vals),
+            "win": 100.0 * sum(1 for v in vals if v > 0) / len(vals),
+            "pnl_usd": round(sum(vals) * 10.0, 2)}
+
+def _period_stats(items, now):
+    """v2.16 п.5: статистика за сьогодні (від локальної півночі) / 7 днів /
+    30 днів / весь час. items = [(ts_сек, net)]."""
+    lt = time.localtime(now)
+    try:
+        midnight = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0,
+                                lt.tm_wday, lt.tm_yday, lt.tm_isdst))
+    except (OverflowError, ValueError):
+        midnight = now - 86400.0
+    bounds = (("today", midnight), ("d7", now - 7 * 86400.0),
+              ("d30", now - 30 * 86400.0), ("all", 0.0))
+    return {k: _stat_small([v for ts, v in items if ts is not None and ts >= b])
+            for k, b in bounds}
+
+def _ts_local(s):
+    """'YYYY-MM-DD HH:MM:SS' (локальний час рядка) → epoch с або None."""
+    try:
+        return time.mktime(time.strptime(str(s).strip(), "%Y-%m-%d %H:%M:%S"))
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+_settle_cache = {"key": None, "data": {}}
+
+def _load_settlements():
+    """settlements.csv (settle.py) → {ключ угоди: рядок}; кеш по mtime/size."""
+    path = os.path.join(DATA_DIR, "settlements.csv")
+    try:
+        st_ = os.stat(path)
+        key = (st_.st_mtime, st_.st_size)
+    except OSError:
+        return {}
+    if _settle_cache["key"] == key:
+        return _settle_cache["data"]
+    try:
+        import settle as _settle
+        data = _settle.load_settlements(DATA_DIR)
+    except Exception as e:
+        print(f"  [SETTLE] читання settlements.csv: {e}")
+        data = {}
+    _settle_cache["key"], _settle_cache["data"] = key, data
+    return data
+
+def _official_net(net_live, srow, fnum):
+    """v2.16 п.3: офіційний net = ГІРШИЙ з live-запису і стрічки Binance.
+    → (official, net_tape, settled, flags). Розрахований рядок без ціни зі
+    стрічки (no_tape / no_trigger) лишає live із прапорцем."""
+    if not srow:
+        return net_live, None, 0, ""
+    nt = fnum(srow.get("net_tape_pct"))
+    flags = srow.get("flags") or ""
+    if nt is None:
+        return net_live, None, 1, flags
+    if net_live is None:
+        return nt, nt, 1, flags
+    return min(net_live, nt), nt, 1, flags
 
 def strat2_api():
     now = time.time()
@@ -5876,6 +6540,7 @@ def strat2_api():
                          STRAT_SINCE.get(r.get("strategy"), DATA_ALGO_V))]
     n_before = (len(rev) + len(sigs) + len(fol) + len(outs_all)
                 + len(fouts_all) + len(tw_all) + len(tws_all))
+    rev_all = rev
     rev, sigs, fol, outs, fouts = (since_strat(rev), since_tape(sigs),
                                    since_strat(fol), since_tape(outs_all),
                                    since_tape(fouts_all))
@@ -5883,6 +6548,32 @@ def strat2_api():
     legacy_rows = (n_before - (len(rev) + len(sigs) + len(fol)
                                + len(outs) + len(fouts) + len(tw) + len(tws))
                    + legacy_old[0])
+    # v2.16: settlement (стрічка Binance) по ключу рядка; офіційний net =
+    # гірший з live і стрічки; старі R-рядки (2.10–2.15, інше правило
+    # кваліфікації) ДОПУСКАЮТЬСЯ у статистику стратегії, якщо settlement
+    # відновив епізод закриття з філів кита і він проходить НОВЕ правило
+    # (падіння ≥ поріг стратегії за <5 хв) — 7 днів даних не губляться,
+    # а популяція входів стає такою ж, як у нових рядків
+    settl = _load_settlements()
+    _rev_thr = {"R4_великий": 2.0, "R5_дуже": 3.0}
+    def _rev_adm_legacy(st):
+        adm = []
+        thr = _rev_thr.get(st, 1.0)
+        for r in rev_all:
+            if r.get("strategy") != st or _v_ok(r.get("algo_v"), STRAT_SINCE.get(st, DATA_ALGO_V)):
+                continue
+            if _vt(r.get("algo_v")) < (2, 10):
+                continue
+            s_ = settl.get(f"{r.get('sig_id')}|{st}")
+            if not s_:
+                continue
+            b_ = fnum(s_.get("dump_bucket"))
+            mv = fnum(s_.get("dump_move_pct"))   # settlement: додатний = у бік тиску кита
+            if b_ is None or not (1 <= b_ <= 5) or mv is None:
+                continue
+            if mv + 1e-9 >= thr:
+                adm.append(r)
+        return adm
     # v2.15: рядки угод пишуться у момент виходу (pending-синтез не
     # потрібен); криві 120 хв — окремий файл, по ключу угоди
     twc_all = dedup(read(TWAP_CURVE_CSV),
@@ -5939,20 +6630,27 @@ def strat2_api():
            "dup_rows": dup_rows[0]}
 
     for st in ("R1_загальний", "R2_breakout", "R3_великі", "R4_великий",
-               "R5_дуже", "R6_волт", R7_NAME):
+               "R5_дуже", "R6_волт", R7_NAME, R8_NAME):
         rows = [r for r in rev if r.get("strategy") == st]
+        adm_rows = _rev_adm_legacy(st)
+        _adm_ids = {id(r) for r in adm_rows}
+        rows += adm_rows
+        legacy_rows -= len(adm_rows)
         # половини рахуємо у ХРОНОЛОГІЇ сигналів, а не в порядку
         # завершення записів (аудит п.10)
         rows.sort(key=lambda r: r.get("date") or "")
-        nets30, trades = [], []
-        n_entered, n_late = 0, 0
+        nets30, trades, items = [], [], []
+        lives, tapes = [], []
+        n_entered, n_late, n_no_px, n_settled, n_unsettled, n_grace = 0, 0, 0, 0, 0, 0
+        by_bucket = {b: [] for b in (1, 2, 3, 4, 5)}
         curve = [[] for _ in range(REV_TRACK_MIN)]
         complete = []   # угоди з УСІМА 60 хвилинами: спільна когорта
         for r in rows:
             entered = 1 if fnum(r.get("entered"), 0) == 1 else 0
             costs = fnum(r.get("costs_pct"), 0.15) or 0.15
-            net30 = None
+            net_live = None
             late_exit = 0
+            exit_reason = r.get("exit_reason") or ""
             if entered:
                 n_entered += 1
                 row_vals = []
@@ -5963,34 +6661,76 @@ def strat2_api():
                         curve[i].append(v - costs)
                 if all(v is not None for v in row_vals):
                     complete.append([v - costs for v in row_vals])
-                n30 = fnum(r.get("m30"))
-                # m30 без ціни (збій котирувань на дедлайні): paper-вихід
-                # — перша наступна хвилина з ціною (≤3 хв), з явною
-                # позначкою запізнення (v2.14, аудит v2.13 №6) — угода
-                # не випадає з PnL-вибірки, а аналіз бачить late_exit
-                late_exit = 0
-                # лише для рядків, зібраних із цим правилом (≥2.14): старі
-                # R-рядки не міняють інтерпретацію без зміни версії
-                # (аудит v2.14, методика)
-                if n30 is None and _vt(r.get("algo_v")) >= (2, 14):
-                    for _j in (31, 32, 33):
-                        n30 = fnum(r.get(f"m{_j}"))
-                        if n30 is not None:
-                            late_exit = _j - 30
-                            break
-                net30 = (n30 - costs) if n30 is not None else None
-                if net30 is not None: nets30.append(net30)
-                if late_exit: n_late += 1
+                ex_px = fnum(r.get("exit_px")); e_px = fnum(r.get("entry_px"))
+                if ex_px and e_px and exit_reason and exit_reason != "no_price":
+                    # v2.16: вирішений вихід зі стакану (таймер m30 / TP R8)
+                    # — gross від ціни виходу, не від міда хвилини
+                    gx = (ex_px / e_px - 1.0) * 100.0
+                    if (r.get("our_side") or "") == "SHORT": gx = -gx
+                    net_live = gx - costs
+                    late_exit = 1 if exit_reason == "timer_late" else 0
+                elif exit_reason == "no_price":
+                    net_live = None
+                else:
+                    n30 = fnum(r.get("m30"))
+                    # m30 без ціни (збій котирувань на дедлайні): paper-
+                    # вихід — перша наступна хвилина з ціною (≤3 хв), з
+                    # явною позначкою запізнення (v2.14, аудит v2.13 №6)
+                    # — лише для рядків ≥2.14 (методика)
+                    if n30 is None and _vt(r.get("algo_v")) >= (2, 14):
+                        for _j in (31, 32, 33):
+                            n30 = fnum(r.get(f"m{_j}"))
+                            if n30 is not None:
+                                late_exit = _j - 30
+                                break
+                    net_live = (n30 - costs) if n30 is not None else None
+            srow = settl.get(f"{r.get('sig_id')}|{st}")
+            official, net_tape, settled, flags = _official_net(net_live, srow, fnum)
+            late = 1 if late_exit else 0
+            ratio_ = fnum(r.get("ratio"))
+            grace = fnum(r.get("grace"))
+            if grace is None:
+                grace = 1 if (ratio_ is not None and ratio_ < 2.0) else 0
+            bucket = fnum(r.get("dump_bucket"))
+            dump_dur = fnum(r.get("dump_dur_s"))
+            dump_move = fnum(r.get("dump_move_pct"))
+            if srow:
+                if bucket is None: bucket = fnum(srow.get("dump_bucket"))
+                if dump_dur is None: dump_dur = fnum(srow.get("dump_dur_s"))
+                if dump_move is None:
+                    # settlement пише рух «у бік тиску» (додатний = впала при
+                    # продажу); рядок — сирий знак (LONG кита: падіння < 0)
+                    _mv = fnum(srow.get("dump_move_pct"))
+                    if _mv is not None:
+                        dump_move = (-_mv) if (r.get("our_side") or "") == "LONG" else _mv
+            ts = _ts_local(r.get("date"))
+            if entered:
+                if exit_reason == "no_price" or (net_live is None and not settled):
+                    n_no_px += 1
+                if settled: n_settled += 1
+                elif official is not None: n_unsettled += 1
+                if late: n_late += 1
+                if grace: n_grace += 1
+                # заголовкова вибірка: офіційний net, без пізніх виходів
+                if official is not None and not late:
+                    nets30.append(official)
+                    items.append((ts, official))
+                    if net_live is not None: lives.append(net_live)
+                    if net_tape is not None: tapes.append(net_tape)
+                    if bucket is not None and int(bucket) in by_bucket:
+                        by_bucket[int(bucket)].append(official)
             # пік руху за перші 3 хв ПІСЛЯ детекту (у напрямку угоди):
             # скільки максимально дало/забрало одразу після закриття
             _m3 = [x for x in (fnum(r.get(f"m{i}")) for i in (1, 2, 3))
                    if x is not None]
             trades.append({"date": r.get("date"), "coin": r.get("coin"),
-                "side": r.get("our_side"), "net30": net30,
+                "side": r.get("our_side"), "net30": official,
+                "net_live": net_live, "net_tape": net_tape,
+                "settled": settled, "flags": flags,
                 "peak": fnum(r.get("peak_pct")),
                 "trough": fnum(r.get("trough_pct")),
                 "move": fnum(r.get("move_3m_pct")),
-                "dur": fnum(r.get("dur_s")), "ratio": fnum(r.get("ratio")),
+                "dur": fnum(r.get("dur_s")), "ratio": ratio_,
                 "shtanga": fnum(r.get("shtanga"), 0),
                 "vault": fnum(r.get("vault"), 0),
                 "hour": fnum(r.get("hour")),
@@ -5998,7 +6738,15 @@ def strat2_api():
                 "sum_usd": fnum(r.get("sum_usd")),
                 "p3u": (max(_m3) if _m3 else None),
                 "p3d": (min(_m3) if _m3 else None),
-                "late_exit": late_exit,
+                "late_exit": late_exit, "late": late,
+                "exit_reason": exit_reason, "exit_min": fnum(r.get("exit_min")),
+                "grace": int(grace), "bucket": (int(bucket) if bucket is not None else None),
+                "dump_dur": dump_dur, "dump_move": dump_move,
+                "lag": fnum(r.get("lag_s")),
+                "entry_src": r.get("entry_src") or "",
+                "exit_src": r.get("exit_src") or "",
+                "detect_src": r.get("detect_src") or "",
+                "adm": 1 if id(r) in _adm_ids else 0,
                 "entered": entered})
         half = len(nets30) // 2
         cum, acc = [], 0.0
@@ -6030,6 +6778,7 @@ def strat2_api():
                              if complete else None),
             "curve_common_n": len(complete),
             "trades": trades[-120:],
+            "n_trades_total": len(trades),
             # швидкість (v2.11 п.3): відкритих позицій на день; горизонт
             # — від ПЕРШОГО сигналу стратегії, а не першого входу
             # (інакше 1 вхід через 9 днів після старту давав «1/день»)
@@ -6037,22 +6786,56 @@ def strat2_api():
             "days": _days_st,
             "open_now": _open_by_st.get(st, 0),
             "since": STRAT_SINCE.get(st, DATA_ALGO_V),
-            "n_late": n_late,   # виходів пізніше m30 через відсутню ціну (v2.14)
+            "n_late": n_late,   # пізні виходи — поза заголовком (v2.16)
+            # v2.16: без ціни виходу; settlement; грейс; live/tape-зрізи тієї
+            # ж заголовкової вибірки; періоди; когорти за тривалістю дампу;
+            # допущені старі рядки (епізод відновлено зі стрічки філів)
+            "n_no_price": n_no_px, "n_settled": n_settled,
+            "n_unsettled": n_unsettled, "n_grace": n_grace,
+            "live": _stat_small(lives), "tape": _stat_small(tapes),
+            "periods": _period_stats(items, now),
+            "buckets": {str(b): _stat_small(v) for b, v in by_bucket.items()},
+            "n_adm_legacy": len(adm_rows),
         }
+
+    out["legacy_rows"] = legacy_rows   # v2.16: мінус допущені за settlement старі R-рядки
 
     for st in list(FOLLOW_TIMERS) + [F6_NAME, F4_NAME, F5_NAME, F8_NAME,
                                      F7_NAME, F9_NAME]:
         rows = [r for r in fol if r.get("strategy") == st]
         rows.sort(key=lambda r: r.get("date_open") or "")
-        nets, trades = [], []
+        nets, trades, items = [], [], []
+        lives, tapes = [], []
+        n_late, n_settled, n_unsettled, n_grace = 0, 0, 0, 0
         # профіль швидкості ГАМАНЦІВ цієї стратегії (v2.8): один запис
         # на гаманець (останній рядок), щоб агрегат не зважувався
         # кількістю угод одного й того ж кита
         prof_by_wallet = {}
         n_first = 0
         for r in rows:
-            net = fnum(r.get("net_pct"))
-            if net is not None: nets.append(net)
+            net_live = fnum(r.get("net_pct"))
+            reason = r.get("exit_reason") or ""
+            # v2.16: пізній вихід (silence_late / full_close_late — тиша «1 хв»
+            # виконана на 5-й, повне закриття, про яке дізнались через
+            # хвилину+) — інша угода, поза заголовком; рахуємо n_late
+            late = 1 if reason.endswith("_late") else 0
+            srow = settl.get(r.get("trade_id") or "")
+            official, net_tape, settled, flags = _official_net(net_live, srow, fnum)
+            ratio_ = fnum(r.get("ratio"))
+            grace = fnum(r.get("grace"))
+            if grace is None:
+                grace = 1 if (ratio_ is not None and ratio_ < 2.0) else 0
+            ts = _ts_local(r.get("date_open"))
+            if settled: n_settled += 1
+            elif official is not None: n_unsettled += 1
+            if late: n_late += 1
+            if grace: n_grace += 1
+            net = official if not late else None
+            if net is not None:
+                nets.append(net)
+                items.append((ts, net))
+                if net_live is not None: lives.append(net_live)
+                if net_tape is not None: tapes.append(net_tape)
             fs = fnum(r.get("first_shot"))
             if fs == 1: n_first += 1
             pf = {"n_fast": fnum(r.get("prof_n_fast")),
@@ -6064,7 +6847,13 @@ def strat2_api():
             if pf["n_fast"] is not None and r.get("whale_addr"):
                 prof_by_wallet[r.get("whale_addr").lower()] = pf
             trades.append({"date": r.get("date_open"), "coin": r.get("coin"),
-                "side": r.get("our_side"), "net30": net,
+                "side": r.get("our_side"), "net30": official,
+                "net_live": net_live, "net_tape": net_tape,
+                "settled": settled, "flags": flags, "late": late,
+                "grace": int(grace), "lag": fnum(r.get("lag_s")),
+                "entry_src": r.get("entry_src") or "",
+                "exit_src": r.get("exit_src") or "",
+                "detect_src": r.get("detect_src") or "",
                 "peak": fnum(r.get("peak_pct")),
                 "trough": fnum(r.get("trough_pct")),
                 "hold": fnum(r.get("hold_s")),
@@ -6100,12 +6889,18 @@ def strat2_api():
             "half1": _median(nets[:half]), "half2": _median(nets[half:]),
             "cum": cum, "curve": None,
             "trades": trades[-120:],
+            "n_trades_total": len(trades),
             "per_day": _rate2(st, rows, "date_open",
                               len(rows) + _open_by_st.get(st, 0))[0],
             "days": _rate2(st, rows, "date_open",
                            len(rows) + _open_by_st.get(st, 0))[1],
             "open_now": _open_by_st.get(st, 0),
             "since": STRAT_SINCE.get(st, DATA_ALGO_V),
+            # v2.16
+            "n_late": n_late, "n_settled": n_settled,
+            "n_unsettled": n_unsettled, "n_grace": n_grace,
+            "live": _stat_small(lives), "tape": _stat_small(tapes),
+            "periods": _period_stats(items, now),
             # v2.8: скільки входів були «першим пострілом» пари (у F5 —
             # усі за побудовою; у F1–F4 — частка, порівняння когорт)
             "first_shot_n": n_first,
@@ -6123,9 +6918,23 @@ def strat2_api():
     # ── TWAP-реверс T1/T2 (v2.11 п.5): headline = m60 net (вихід через
     # годину), крива 120 хв; когорти ≥1/≥1.5/≥2% — ті самі входи,
     # відфільтровані по руху за час твапу (кнопки в UI)
+    def _tw_net(r):
+        """v2.16: (official, live, tape, settled, flags) для рядка TWAP-угоди."""
+        nl = fnum(r.get("net60_pct"))
+        srow = settl.get(f"{r.get('twap_id')}|{r.get('strategy')}")
+        return _official_net(nl, srow, fnum) + (nl,)
     def _tw_block(rs):
-        nets = [x for x in (fnum(r.get("net60_pct")) for r in rs)
-                if x is not None]
+        nets, lives, tapes, items = [], [], [], []
+        n_settled = n_unsettled = 0
+        for r in rs:
+            official, nt, settled, flags, nl = _tw_net(r)
+            if settled: n_settled += 1
+            elif official is not None: n_unsettled += 1
+            if official is not None:
+                nets.append(official)
+                items.append((_ts_local(r.get("date_entry")), official))
+                if nl is not None: lives.append(nl)
+                if nt is not None: tapes.append(nt)
         curve = [[] for _ in range(TWAP_TRACK_MIN)]
         complete = []
         for r in rs:
@@ -6153,7 +6962,7 @@ def strat2_api():
         _f = lambda r, k: fnum(r.get(k), 0)
         conf_rows = [r for r in rs
                      if _f(r, "completed") == 1 and _f(r, "cancel_after_entry") == 0]
-        conf = [x for x in (fnum(r.get("net60_pct")) for r in conf_rows)
+        conf = [x for x in (_tw_net(r)[0] for r in conf_rows)
                 if x is not None]
         n_cancel = sum(1 for r in rs if _f(r, "cancel_after_entry") == 1)
         n_partial = sum(1 for r in rs
@@ -6185,19 +6994,30 @@ def strat2_api():
                 "win_confirmed": (100.0 * sum(1 for v in conf if v > 0) / len(conf))
                     if conf else None,
                 "n_cancelled": n_cancel, "n_partial": n_partial,
-                "n_unconfirmed": n_unconf, "n_candle": n_candle}
+                "n_unconfirmed": n_unconf, "n_candle": n_candle,
+                # v2.16
+                "n_settled": n_settled, "n_unsettled": n_unsettled,
+                "live": _stat_small(lives), "tape": _stat_small(tapes),
+                "periods": _period_stats(items, now)}
     for st, kind_ in ((T1_NAME, "open"), (T2_NAME, "reduce")):
         # когорти ≥1/≥1.5/≥2% — окремі стратегії зі своїми рядками (v2.13)
         fam = [r for r in tw if (r.get("strategy") or "").startswith(st)]
         fam.sort(key=lambda r: r.get("date_entry") or "")
         rows = [r for r in fam if r.get("strategy") == st]
-        sig_rows = [r for r in tws if r.get("kind") == kind_
-                    and fnum(r.get("eligible"), 0) == 1]
+        # v2.16 (рев'ю): сигнали картки — з версії логіки САМОЇ стратегії
+        # (STRAT_SINCE), а не спільної стрічки: інакше «сигналів 40, входів
+        # 3» після бампа T-стратегій
+        sig_rows = [r for r in tws_all if r.get("kind") == kind_
+                    and fnum(r.get("eligible"), 0) == 1
+                    and _v_ok(r.get("algo_v"), STRAT_SINCE.get(st, DATA_ALGO_V))]
         def _tw_trades(rs):
             # v2.14 (аудит v2.13 №4): список угод — ВЛАСНИЙ для кожної
             # когорти-стратегії (це різні входи, а не фільтр базової по руху)
             return [{"date": r.get("date_entry"), "coin": r.get("coin"),
-                "side": r.get("our_side"), "net30": fnum(r.get("net60_pct")),
+                "side": r.get("our_side"), "net30": _tw_net(r)[0],
+                "net_live": fnum(r.get("net60_pct")), "net_tape": _tw_net(r)[1],
+                "settled": _tw_net(r)[2], "flags": _tw_net(r)[3],
+                "entry_src": r.get("entry_src") or "", "exit_src": r.get("exit_src") or "",
                 "peak": fnum(r.get("peak_pct")), "trough": fnum(r.get("trough_pct")),
                 "move": fnum(r.get("move_pct")), "dur": fnum(r.get("dur_s")),
                 "usd": fnum(r.get("usd")), "pos_usd": fnum(r.get("pos_usd")),
@@ -6226,6 +7046,7 @@ def strat2_api():
                 _cn, _crows, "date_entry", len(_crows) + _open_by_st.get(_cn, 0))
             cohorts[str(thr)]["open_now"] = _open_by_st.get(_cn, 0)
             cohorts[str(thr)]["trades"] = _tw_trades(_crows)[-120:]
+            cohorts[str(thr)]["n_trades_total"] = len(_crows)
             cohorts[str(thr)]["n_late"] = sum(
                 1 for r in _crows if (r.get("exit_reason") or "").endswith("_late"))
             cohorts[str(thr)]["n_no_price"] = sum(
@@ -6258,6 +7079,13 @@ def strat2_api():
              for r in twap_reg.values()
              if r["state"] in ("entered", "dropped")],
             key=lambda x: x["end"] or 0, reverse=True)[:12]
+    # v2.16: стан settlement для хедера вкладки
+    out["settle"] = {"n": len(settl),
+                     "done": stats.get("settle_done", 0),
+                     "failed": stats.get("settle_failed", 0),
+                     "last_ok_s_ago": (round(now - stats["settle_last_ok"], 0)
+                                       if stats.get("settle_last_ok") else None),
+                     "err": stats.get("settle_err", "")}
     out["twap"] = dict(twap_stats, watching=_tw_watch, recent=_tw_recent,
                        channels={ch: {"last_id": twap_last_ids.get(ch, 0),
                                       "ok_ago_s": (round(now - s["ok_ts"], 0)
@@ -6467,7 +7295,10 @@ TWAP_HEADERS     = (["twap_id", "strategy", "date_entry", "coin", "our_side",
                      "trough_pct", "cancel_after_entry", "completed",
                      "exit_min", "exit_reason", "cancel_event_min",
                      "cancel_seen_min", "exit_ts", "exch_status", "exec_pct",
-                     "btc_move_pct", "hour", "algo_v"]
+                     "btc_move_pct", "hour", "algo_v",
+                     # v2.16: чесний вхід/вихід зі стакану
+                     "entry_ts_ms", "entry_src", "entry_px_mid",
+                     "exit_ts_ms", "exit_px", "exit_src"]
                     + [f"m{i}" for i in range(1, TWAP_HOLD_MIN + 1)]
                     + ["eol"])
 TWAP_CURVE_CSV   = os.path.join(DATA_DIR, "twap_curves.csv")
@@ -7260,6 +8091,12 @@ def _twap_enter(rec, now, px):
     btc_move = (b_now / b_ago - 1.0) * 100.0 if b_now and b_ago else None
     depth = _sim_depth(rec["coin"], our)
     move = float(rec.get("move") or 0.0)
+    # v2.16: ціна входу — зі свіжого стакану (виконувана на $1000 з нашого
+    # боку), запит ДО локу; без стакану — жива ціна поллера з позначкою
+    epx, esrc, emeta = _paper_px(rec["coin"], "SELL" if our == "SHORT" else "BUY")
+    if not epx:
+        epx, esrc = px, "mid"
+    now = time.time()   # ціна відома САМЕ зараз
     opened, busy_c = [], []
     with strat2_lock:
         for thr in TWAP_COHORTS:
@@ -7279,9 +8116,12 @@ def _twap_enter(rec, now, px):
             tr = {"sig_id": rec["id"], "strategy": strat, "state": "open",
                   "row_kind": "twap", "coin": rec["coin"], "side": our,
                   "addr": rec["addr"], "detect_ts": now, "detect_px": px,
-                  "entry_ts": now, "entry_px": px, "track_min": TWAP_TRACK_MIN,
+                  "entry_ts": now, "entry_px": epx, "track_min": TWAP_TRACK_MIN,
                   "depth": depth, "btc_move": btc_move,
+                  "costs": _sim_costs(rec["coin"], our)[0],   # v2.16: обидва боки
                   "hour": time.localtime().tm_hour, "algo_v": DATA_ALGO_V,
+                  "entry_src": esrc, "entry_px_mid": emeta.get("mid") or px,
+                  "px_age_ms": emeta.get("px_age_ms"),
                   "twap": {"src": rec["src"], "twap_side": rec["side"],
                            "usd": rec["usd"], "dur": rec["dur"], "kind": rec["kind"],
                            "kind_src": rec.get("kind_src") or "",
@@ -7302,10 +8142,11 @@ def _twap_enter(rec, now, px):
     if not opened:
         _twap_drop(rec, "busy")
         return
-    rec.update(state="entered", entry_ts=now, entry_px=px, strategy="+".join(opened))
+    rec.update(state="entered", entry_ts=now, entry_px=epx, entry_src=esrc,
+               strategy="+".join(opened))
     twap_stats["entered"] += 1
     _twap_sig_write(rec, "entered")
-    print(f"  [TWAP] ВХІД {'+'.join(opened)} {our} {rec['coin']} @ {px:.6g} | твап "
+    print(f"  [TWAP] ВХІД {'+'.join(opened)} {our} {rec['coin']} @ {epx:.6g} ({esrc}) | твап "
           f"{rec['side']} ${(rec['usd'] or 0):,.0f} за {(rec['dur'] or 0)/60:.0f} хв, "
           f"рух {rec['move']:+.2f}% | тримаю {TWAP_HOLD_MIN} хв, крива {TWAP_TRACK_MIN}"
           + (f" | зайнято: {', '.join(busy_c)}" if busy_c else ""))
@@ -7655,8 +8496,7 @@ def _twap_row(p, now=None):
     дізнався (cancelled), або перша наступна хвилина з ціною
     (timer_late / cancelled_late), чи без ціни після капу (no_price).
     Крива до 120 хв — окремо у twap_curves.csv."""
-    slip = _sim_slip(p.get("depth") or 0)
-    costs = (2 * SIM_COMMISSION + 2 * slip) * 100.0
+    costs = _p_costs(p)
     tw = p.get("twap") or {}
     s = p["samples"]
     # v2.15: вихід — з єдиного резолвера (_twap_exit); рядок пишеться у
@@ -7665,6 +8505,13 @@ def _twap_row(p, now=None):
     if ex is None:
         ex = (_twap_close_min(p), "no_price", None)
     exit_min, exit_reason, mx = ex
+    # v2.16: ціна виходу зі стакану в момент вирішеного виходу (tw.exit_px)
+    # — gross від неї; без стакану — семпл хвилини виходу, як раніше
+    ex_px = tw.get("exit_px")
+    if ex_px and mx is not None and p.get("entry_px"):
+        gx = (ex_px / p["entry_px"] - 1.0) * 100.0
+        if p["side"] == "SHORT": gx = -gx
+        mx = gx
     bm = p.get("btc_move")
     def _n(v, nd=None):
         if v is None or v == "": return ""
@@ -7688,7 +8535,11 @@ def _twap_row(p, now=None):
              tw.get("exch_status", ""),
              _n(tw.get("exec_pct")),
              (round(bm, 3) if bm is not None else ""), p.get("hour", ""),
-             p.get("algo_v", "")]
+             p.get("algo_v", ""),
+             # v2.16
+             _ms(p.get("entry_ts")), p.get("entry_src", ""),
+             _rnd(p.get("entry_px_mid"), 8), (tw.get("exit_ts_ms") or ""),
+             _rnd(ex_px, 8), tw.get("exit_src", "")]
             + [("" if x == "" else round(x, 4)) for x in s[:TWAP_HOLD_MIN]]
             + [""] * (TWAP_HOLD_MIN - min(len(s), TWAP_HOLD_MIN)))
 
@@ -8226,6 +9077,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 # TWAP-вотчер (v2.11 п.5)
                 **{f"twap_{k}": v for k, v in twap_stats.items()},
                 "twap_active": _twap_active,
+                # v2.16: здоров'я цін і стакану, пропуски, швидкий шлях,
+                # settlement
+                "px_last_ok_s_ago": (round(time.time() - stats["px_last_ok"], 1)
+                                     if stats.get("px_last_ok") else None),
+                "px_age_s":       _px_age_s(),
+                "px_fail":        stats.get("px_fail", 0),
+                "book_ok":        stats.get("book_ok", 0),
+                "book_fail":      stats.get("book_fail", 0),
+                "rev_busy_skips": stats.get("rev_busy_skips", 0),
+                "rev_stale_skips": stats.get("rev_stale_skips", 0),
+                "follow_stale_skips": stats.get("follow_stale_skips", 0),
+                "fast_retries":   stats.get("fast_retries", 0),
+                "settle_done":    stats.get("settle_done", 0),
+                "settle_failed":  stats.get("settle_failed", 0),
+                "settle_pending": stats.get("settle_pending", None),
+                "settle_last_ok_s_ago": (round(time.time() - stats["settle_last_ok"], 0)
+                                         if stats.get("settle_last_ok") else None),
+                "settle_err":     stats.get("settle_err", ""),
             })
         elif self.path == "/sim":
             with sim_lock:
@@ -8283,6 +9152,64 @@ def _on_stop(signum, frame):
     finally:
         raise SystemExit(0)
 
+# ═════════════════════════════════════════════════════════
+#  SETTLEMENT (v2.16 п.2–3): кожна закрита paper-угода (follow / rev / twap)
+#  детерміновано переоцінюється по стрічці aggTrades Binance USDⓈ-M
+#  (settle.py: денні zip з data.binance.vision + REST за останні 48 год;
+#  ціна = гірша для нас у вікні 3 с → 10 с від моменту рішення); філи кита
+#  — з HL userFillsByTime (лаг, епізод дампу для старих R-рядків).
+#  Офіційний результат = ГІРШИЙ з live-запису і стрічки (рахує strat2_api).
+#  Результати — settlements.csv у DATA_DIR (ключ = ключ рядка угоди).
+# ═════════════════════════════════════════════════════════
+SETTLE_ENABLED  = True
+SETTLE_PERIOD_S = 120     # цикл; рядки угод з'являються при виході, не частіше
+SETTLE_BATCH    = 40      # угод за цикл (кожна — до 2 zip-днів + 1 запит HL)
+SETTLE_WARMUP_S = 90      # дати боту піднятись (WS/скан/ціни) перед першим прогоном
+
+def _settle_fetch_hl(body):
+    """Філи кита для settlement — через prio-канал (проксі, власний бюджет
+    ваги), не з основної IP, де живе детекція. None = збій/бюджет."""
+    try:
+        r = hl_post_prio(body, retries=1, direct=not _prio_opener, max_wait=10.0)
+        return r if isinstance(r, list) else None
+    except Exception as e:
+        stats["settle_hl_err"] = stats.get("settle_hl_err", 0) + 1
+        if stats["settle_hl_err"] in (1, 10, 100):
+            print(f"  [SETTLE] HL fills недоступні ({stats['settle_hl_err']}): {e}")
+        return None
+
+def run_settle_worker():
+    if not SETTLE_ENABLED:
+        return
+    try:
+        import settle as _settle
+    except Exception as e:
+        print(f"  [SETTLE] модуль settle.py недоступний: {e} — розрахунок вимкнено")
+        stats["settle_err"] = f"import: {e}"
+        return
+    time.sleep(SETTLE_WARMUP_S)
+    fetchers = {"fetch_hl": _settle_fetch_hl, "hl_pace_s": 0.5, "rest_pace_s": 1.0}
+    def _log(msg):
+        print(f"  [SETTLE] {msg}")
+    while True:
+        try:
+            t0 = time.time()
+            n_done, n_skip, n_fail = _settle.settle_pending(
+                DATA_DIR, symbol_map=SYMBOL_MAP, limit=SETTLE_BATCH,
+                log=_log, fetchers=fetchers)
+            stats["settle_done"] = stats.get("settle_done", 0) + n_done
+            stats["settle_failed"] = stats.get("settle_failed", 0) + n_fail
+            stats["settle_last_ok"] = time.time()
+            stats["settle_err"] = ""
+            if n_done or n_fail:
+                _log(f"цикл {time.time() - t0:.0f}с: розраховано {n_done}, "
+                     f"пропущено {n_skip}, збоїв {n_fail}")
+                _strat2_cache["ts"] = 0.0   # API підхопить нові офіційні net
+        except Exception as e:
+            stats["settle_err"] = str(e)[:200]
+            print(f"  [SETTLE] цикл впав: {e}")
+        time.sleep(SETTLE_PERIOD_S)
+
 def main():
     est = SCAN_TOP * DELAY / WORKERS
     print(f"\n  HL TERMINAL  →  http://localhost:{PORT}")
@@ -8312,6 +9239,7 @@ def main():
     threading.Thread(target=_prio_probe,         daemon=True).start()
     threading.Thread(target=_scan_probe,         daemon=True).start()
     threading.Thread(target=run_twap_watcher,    daemon=True).start()
+    threading.Thread(target=run_settle_worker,   daemon=True).start()
     http.server.ThreadingHTTPServer(("", PORT), Handler).serve_forever()
 
 if __name__ == "__main__":

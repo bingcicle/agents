@@ -210,7 +210,7 @@ footer .fr{margin-left:auto;display:flex;gap:20px}
 .sdetail .sub{font-size:10px;color:var(--ink3);margin-top:2px}
 .sd-stats{display:flex;gap:22px;margin:12px 0;flex-wrap:wrap}
 .sd-chart{margin:10px 0 4px;position:relative}
-.sd-chart h4,.sd-tbl h4{font-family:var(--sans);font-size:10px;font-weight:600;
+.sd-chart h4,.sd-tbl h4,.sd-periods h4{font-family:var(--sans);font-size:10px;font-weight:600;
   color:var(--ink2);letter-spacing:.08em;text-transform:uppercase;margin-bottom:6px}
 .ctip{position:absolute;pointer-events:none;background:var(--raised);
   border:1px solid var(--line2);border-radius:4px;padding:4px 8px;font-size:10px;
@@ -221,6 +221,11 @@ footer .fr{margin-left:auto;display:flex;gap:20px}
   font-family:var(--mono)}
 .fbtn.on{color:var(--signal);border-color:var(--signal)}
 .sd-tbl{overflow-x:auto}
+.sd-periods{margin:6px 0 10px}
+.sd-periods table{font-size:10px;border-collapse:collapse}
+.sd-periods th,.sd-periods td{padding:3px 10px 3px 0;text-align:left;color:var(--ink2)}
+.sd-periods th{font-size:9px;color:var(--ink3);letter-spacing:.08em;text-transform:uppercase;font-weight:600}
+.sd-periods td:first-child{color:var(--ink)}
 .sd-tbl table{min-width:760px}
 .thsort{cursor:pointer;user-select:none}
 .thsort:hover{color:var(--ink)}
@@ -402,6 +407,7 @@ button:focus-visible,select:focus-visible,.scard:focus-visible{outline:2px solid
     <div class="hstat"><i>Тіней (outcome)</i><b id="svShadow">—</b></div>
     <div class="hstat"><i>Профілів F4·F7</i><b id="svProf">—</b></div>
     <div class="hstat"><i>TWAP ≤15 хв</i><b id="svTwap">—</b></div>
+    <div class="hstat"><i>Розрахунок · стрічка</i><b id="svSettle">—</b></div>
     <div class="note">paper trading · $1000/угода · net після витрат · клік по картці — деталі</div>
     <div class="note" id="svResearch" style="display:none"></div>
   </div>
@@ -674,6 +680,8 @@ function renderTable(){
 
 /* ═══ ВКЛАДКА СТРАТЕГІЙ ═══ */
 let view='term', sData=null, sSel=null, sT=null, fSht='all', fVault='all';
+let fGrace='all', rBk='all';   // v2.16: грейс-рядки і когорта тривалості дампу (R)
+function setBk(b){rBk=b;renderSDetail();}
 let sMore=false, sSortK=null, sSortD=-1;   // детальні колонки і сортування
 function usdTxt(v){if(v==null)return '—';const a=Math.abs(v);
   if(a>=1e6)return '$'+(v/1e6).toFixed(2)+'M';
@@ -683,7 +691,7 @@ function setMore(){sMore=!sMore;renderSDetail();}
 function setSort(k){if(sSortK===k){sSortD=-sSortD;}else{sSortK=k;sSortD=-1;}
   renderSDetail();}
 const S_ORDER=['R1_загальний','R2_breakout','R3_великі','R4_великий','R5_дуже',
-               'R6_волт','R7_одним','F1_1хв','F2_2хв','F3_3хв','F6_1хв_перший',
+               'R6_волт','R7_одним','R8_тп80','F1_1хв','F2_2хв','F3_3хв','F6_1хв_перший',
                'F8_ratio35','F4_розумний','F5_перший','F7_без_ратіо','F9_без_ратіо_90',
                'T1_твап_відкриття','T2_твап_скорочення'];
 const S_PROF=new Set(['F4_розумний','F5_перший','F7_без_ратіо','F9_без_ратіо_90']);   // стратегії з профілем швидкості (F8 — F6-копія, без профілю; v2.12)
@@ -840,6 +848,14 @@ function renderStrat(){
     twEl.textContent=((tw.watching||[]).length)+' стежу · '+(tw.entered||0)+' вх.'+(chErr?' ⚠️':'');
     twEl.title='TWAP ≤15 хв: постів '+(tw.posts||0)+', стартів '+(tw.starts||0)+', придатних '+(tw.eligible||0)+', скасовано '+(tw.cancelled||0)+', входів '+(tw.entered||0)+(chErr?' · канал t.me не читається':'');
   }
+  // v2.16: settlement — скільки угод переоцінено по стрічці Binance
+  const se=sData.settle||{}, seEl=document.getElementById('svSettle');
+  if(seEl){
+    seEl.textContent=(se.n||0)+' угод'+(se.err?' ⚠️':'');
+    seEl.title='Переоцінка по стрічці aggTrades Binance: розраховано '+(se.n||0)+' угод'
+      +(se.last_ok_s_ago!=null?' · останній прогін '+Math.round(se.last_ok_s_ago/60)+' хв тому':' · ще не запускався')
+      +(se.failed?' · збоїв '+se.failed:'')+(se.err?' · '+se.err:'');
+  }
   const openBy={};
   (sData.open||[]).forEach(o=>{openBy[o.strategy]=(openBy[o.strategy]||0)+1;});
   let html='';
@@ -858,7 +874,8 @@ function renderStrat(){
         <div class="snum"><i>PnL</i><b class="${pctCls(s.pnl_usd)}">${s.pnl_usd>=0?'+':''}$${Math.abs(s.pnl_usd).toFixed(0)}</b></div>
       </div>
       <div class="scard-spark">${sparkSvg(s.cum)}</div>
-      <div class="scard-halves">половини: <b class="${pctCls(s.half1)}">${pctTxt(s.half1)}</b> / <b class="${pctCls(s.half2)}">${pctTxt(s.half2)}</b>${s.kind==='rev'?' · метрика: вихід m30':(s.kind==='twap'?' · метрика: вихід m60 (крива 120 хв)':'')}</div>
+      <div class="scard-halves">половини: <b class="${pctCls(s.half1)}">${pctTxt(s.half1)}</b> / <b class="${pctCls(s.half2)}">${pctTxt(s.half2)}</b>${s.kind==='rev'?' · метрика: офіційний net · вихід m30 зі стакану'+(name==='R8_тп80'?' або TP':''):(s.kind==='twap'?' · метрика: офіційний net · вихід m60 (крива 120 хв)':' · метрика: офіційний net')}</div>
+      <div class="scard-halves">по стрічці Binance: <b>${s.n_settled||0}</b> з ${(s.n_settled||0)+(s.n_unsettled||0)}${s.live&&s.tape&&s.tape.n?' · live '+pctTxt(s.live.median)+' / стрічка '+pctTxt(s.tape.median):''}${s.n_late?' · пізніх виходів поза вибіркою: '+s.n_late:''}${s.n_grace?' · грейс-входів: '+s.n_grace:''}${s.n_no_price?' · без ціни: '+s.n_no_price:''}${s.n_adm_legacy?' · старих рядків за стрічкою: '+s.n_adm_legacy:''}</div>
       <div class="scard-halves">швидкість: <b>${s.per_day==null?'—':s.per_day.toFixed(1)}</b> угод/день${s.days?' · за '+Math.round(s.days)+' д':''} · логіка з v${s.since||'?'}</div>
       ${(S_PROF.has(name)&&s.prof&&s.prof.wallets)?`<div class="scard-halves">гаманців ${s.prof.wallets} · швидких/повільних епізодів ${s.prof.n_fast}/${s.prof.n_slow} · частка швидких (мед.) ${s.prof.fast_pct_med==null?'—':s.prof.fast_pct_med.toFixed(0)+'%'} · злив від 1-ї tx: мед. ${secTxt(s.prof.unload_med_s)}, сер. ${secTxt(s.prof.unload_mean_s)}</div>`:''}
       ${(s.kind==='follow'&&!S_FIRST.has(name)&&s.n)?`<div class="scard-halves">перших пострілів пари: ${s.first_shot_n||0} з ${s.n}${name==='F4_розумний'?' (стільки ж «є» F5)':''}</div>`:''}
@@ -871,7 +888,7 @@ function renderStrat(){
 function selStrat(n){sSel=(sSel===n?null:n);renderStrat();
   // на телефоні картка далеко від деталей — прокручуємо до них (v2.12)
   if(sSel&&matchMedia('(max-width:900px)').matches){const d=document.getElementById('sDetail');if(d)d.scrollIntoView({behavior:'smooth',block:'start'});}}
-function setF(k,v){if(k==='sht')fSht=v;else fVault=v;renderSDetail();}
+function setF(k,v){if(k==='sht')fSht=v;else if(k==='grace')fGrace=v;else fVault=v;renderSDetail();}
 
 function renderSDetail(){
   const box=document.getElementById('sDetail');
@@ -887,7 +904,11 @@ function renderSDetail(){
   if(fSht!=='all'&&isRev)
     trades=trades.filter(t=>(t.shtanga??null)===(fSht==='y'?1:0));
   if(fVault!=='all'&&!isTw) trades=trades.filter(t=>(t.vault??0)===(fVault==='y'?1:0));
-  const fb=(k,v,lbl)=>`<button class="fbtn${(k==='sht'?fSht:fVault)===v?' on':''}" onclick="setF('${k}','${v}')">${lbl}</button>`;
+  // v2.16 п.4: грейс-рядки (пара пройшла ratio-гейт лише завдяки 30-хв
+  // грейсу) вимикаються кнопкою, як волти; п.7: когорта тривалості дампу (R)
+  if(fGrace!=='all'&&!isTw) trades=trades.filter(t=>(t.grace??0)===(fGrace==='y'?1:0));
+  if(rBk!=='all'&&isRev) trades=trades.filter(t=>t.bucket===+rBk);
+  const fb=(k,v,lbl)=>`<button class="fbtn${(k==='sht'?fSht:(k==='grace'?fGrace:fVault))===v?' on':''}" onclick="setF('${k}','${v}')">${lbl}</button>`;
   // колонки як дані: спільний механізм для сортування і "детальніше"
   const C=(k,l,f,cls)=>({k,l,f,cls});
   const fmt={pct:v=>v!=null?pctTxt(v):'—',
@@ -898,9 +919,11 @@ function renderSDetail(){
   let cols=[
     C('date','Дата',t=>t.date||''),
     C('coin','Монета',t=>`<span class="side ${t.side==='LONG'?'L':'S'}">${t.side||''}</span> ${t.coin||''}${t.vault?' 🏦':''}`),
-    C('net30','Net'+(isRev?' m30':(isTw?' m60':'')),
-      t=>t.entered===0?'<span class="dim">пропуск</span>':pctTxt(t.net30),
+    C('net30','Net офіц.'+(isRev?' m30':(isTw?' m60':'')),
+      t=>t.entered===0?'<span class="dim">пропуск</span>':(t.net30==null?'<span class="dim">'+(t.exit_reason==='no_price'||(t.reason||'')==='no_price'?'без ціни':'—')+'</span>':pctTxt(t.net30)+(t.late?' <span class="dim" title="пізній вихід — поза заголовковою вибіркою">пізно</span>':'')),
       t=>t.entered===0?'':pctCls(t.net30)),
+    C('net_live','Live',t=>t.entered===0?'':pctTxt(t.net_live)),
+    C('net_tape','Стрічка',t=>t.entered===0?'':(t.settled?(t.net_tape==null?'<span class="dim" title="'+(t.flags||'')+'">нема</span>':pctTxt(t.net_tape)):'<span class="dim">чекає</span>')),
     C('peak','Peak',t=>fmt.pct(t.peak)),
     C('trough','Trough',t=>fmt.pct(t.trough)),
   ];
@@ -908,10 +931,15 @@ function renderSDetail(){
     cols.push(C('move','Рух 3хв',t=>fmt.p2(t.move)),
               C('dur','Злив, с',t=>fmt.sec(t.dur)),
               C('shtanga','Тип',t=>t.shtanga!=null?(t.shtanga?'штанга':'серед.'):'—'));
+    cols.push(C('bucket','Дамп',t=>t.bucket!=null?(t.bucket?(t.bucket+' хв'):'>5 хв')+(t.dump_move!=null?' · '+t.dump_move.toFixed(2)+'%':''):'—'));
     if(sMore) cols.push(C('ratio','Ratio',t=>fmt.r(t.ratio)),
                         C('sum_usd','Закрито $',t=>usdTxt(t.sum_usd)),
                         C('p3u','3хв ↑',t=>fmt.pct(t.p3u)),
-                        C('p3d','3хв ↓',t=>fmt.pct(t.p3d)));
+                        C('p3d','3хв ↓',t=>fmt.pct(t.p3d)),
+                        C('exit_reason','Вихід',t=>(t.exit_reason||'—')+(t.exit_min!=null?' m'+t.exit_min:'')),
+                        C('lag','Лаг філа',t=>t.lag!=null?t.lag.toFixed(1)+'с':'—'),
+                        C('entry_src','Ціна вх/вих',t=>(t.entry_src||'—')+'/'+(t.exit_src||'—')),
+                        C('grace','Грейс',t=>t.grace?'так':'ні'));
   }else if(isTw){
     cols.push(C('move','Рух TWAP',t=>fmt.p2(t.move)),
               C('usd','TWAP',t=>(t.twap_side==='buy'?'купівля ':'продаж ')+usdTxt(t.usd)),
@@ -941,6 +969,9 @@ function renderSDetail(){
                         C('wallet','Гаманець',t=>t.wallet||'—'));
     if(sMore&&S_PROF.has(sSel))
       cols.push(C('pf_unload_mean','Злив сер.',t=>secTxt(t.pf_unload_mean)));
+    if(sMore) cols.push(C('lag','Лаг філа',t=>t.lag!=null?t.lag.toFixed(1)+'с':'—'),
+                        C('entry_src','Ціна вх/вих',t=>(t.entry_src||'—')+'/'+(t.exit_src||'—')),
+                        C('grace','Грейс',t=>t.grace?'так':'ні'));
   }
   cols.push(C('hour','Год',t=>t.hour!=null?String(t.hour).padStart(2,'0')+':00':'—'),
             C('btc','BTC 3хв',t=>fmt.pct(t.btc)));
@@ -968,12 +999,15 @@ function renderSDetail(){
   const fMean=fNets.length?fNets.reduce((a,b)=>a+b,0)/fNets.length:null;
   const fWin=fNets.length?100*fNets.filter(v=>v>0).length/fNets.length:null;
   const fPnl=fNets.length?fNets.reduce((a,b)=>a+b,0)*10:null;
-  const filtersOn=(fSht!=='all'&&isRev)||(fVault!=='all'&&!isTw);
+  const filtersOn=(fSht!=='all'&&isRev)||(fVault!=='all'&&!isTw)||(fGrace!=='all'&&!isTw)||(rBk!=='all'&&isRev);
+  const bkS=(isRev&&rBk!=='all'&&s.buckets)?s.buckets[rBk]:null;   // серверна когорта дампу (усі угоди, офіційний net)
+  const per=cs.periods||{};
+  const pRow=(k,l)=>{const x=per[k]||{};return `<tr><td>${l}</td><td>${x.n||0}</td><td class="${pctCls(x.median)}">${pctTxt(x.median)}</td><td class="${pctCls(x.mean)}">${pctTxt(x.mean)}</td><td>${x.win==null?'—':x.win.toFixed(0)+'%'}</td><td class="${pctCls(x.pnl_usd)}">${x.pnl_usd==null?'—':(x.pnl_usd>=0?'+':'−')+'$'+Math.abs(x.pnl_usd).toFixed(0)}</td></tr>`;};
   box.style.display='block';
   box.innerHTML=`
     <button class="mobile-back fbtn" onclick="document.getElementById('sCards').scrollIntoView({behavior:'smooth',block:'start'})">↑ До стратегій</button>
     <h3>${(sData.titles||{})[sSel]||sSel.replace(/_/g,' ')} <span class="dim" style="font-size:11px">${sSel}</span></h3>
-    <div class="sub">${(sData.desc||{})[sSel]||''} · показано ${Math.min(trades.length,150)} з ${trades.length}${s.per_day!=null?' · швидкість '+s.per_day.toFixed(1)+' угод/день':''}</div>
+    <div class="sub">${(sData.desc||{})[sSel]||''} · показано ${Math.min(trades.length,150)} з ${trades.length}${(cs.n_trades_total||0)>((isTw&&cs.trades)?cs.trades:(s.trades||[])).length?' (усього угод '+cs.n_trades_total+', у таблиці останні '+((isTw&&cs.trades)?cs.trades:(s.trades||[])).length+')':''}${s.per_day!=null?' · швидкість '+s.per_day.toFixed(1)+' угод/день':''}</div>
     <div class="sd-stats">
       <div class="snum"><i>Вибірка</i><b>${isTw?'стратегія рух ≥'+tCoh+'% · усі paper-входи':'вся'}</b></div>
       <div class="snum"><i>Угод</i><b>${cs.n}</b></div>
@@ -983,11 +1017,25 @@ function renderSDetail(){
       <div class="snum"><i>Win</i><b>${cs.win==null?'—':cs.win.toFixed(0)+'%'}</b></div>
       <div class="snum"><i>PnL ($1k/угода)</i><b class="${pctCls(cs.pnl_usd)}">${cs.pnl_usd>=0?'+':''}$${Math.abs(cs.pnl_usd||0).toFixed(0)}</b></div>
       <div class="snum"><i>Половини</i><b><span class="${pctCls(cs.half1)}">${pctTxt(cs.half1)}</span> / <span class="${pctCls(cs.half2)}">${pctTxt(cs.half2)}</span></b></div>
+      <div class="snum"><i>Net: офіційний = гірший з live / стрічки</i><b>live <span class="${pctCls(cs.live&&cs.live.median)}">${pctTxt(cs.live&&cs.live.median)}</span> · стрічка <span class="${pctCls(cs.tape&&cs.tape.median)}">${pctTxt(cs.tape&&cs.tape.median)}</span> (n=${(cs.tape&&cs.tape.n)||0})</b></div>
+      <div class="snum"><i>Розраховано по стрічці</i><b>${cs.n_settled||0} з ${(cs.n_settled||0)+(cs.n_unsettled||0)}</b></div>
+      ${!isTw?`<div class="snum"><i>Пізні виходи · грейс · без ціни</i><b>${cs.n_late||0} · ${cs.n_grace||0} · ${cs.n_no_price||0}</b></div>`:''}
       ${isTw?`<div class="snum"><i>Підтверджено завершені · окрема вибірка</i><b>n=${cs.n_confirmed||0} · <span class="${pctCls(cs.median_confirmed)}">${pctTxt(cs.median_confirmed)}</span>${cs.win_confirmed!=null?' · win '+cs.win_confirmed.toFixed(0)+'%':''}</b></div>
       <div class="snum"><i>Скас. після входу / частково / непідтв.</i><b>${cs.n_cancelled||0} / ${cs.n_partial||0} / ${cs.n_unconfirmed||0}</b></div>
       <div class="snum"><i>Ціни зі свічок біржі</i><b>${cs.n_candle||0} з ${cs.n||0}</b></div>
       <div class="snum"><i>Швидкість</i><b>${cs.per_day==null?'—':cs.per_day.toFixed(2)+' / день'}${cs.open_now?' · у ринку '+cs.open_now:''}</b></div>`:''}
     </div>
+    <div class="sd-periods"><h4>Періоди · офіційний net (усі угоди стратегії, без пізніх виходів)</h4>
+    <table><thead><tr><th>Період</th><th>Угод</th><th>Медіана</th><th>Середнє</th><th>Win</th><th>PnL</th></tr></thead>
+    <tbody>${pRow('today','сьогодні')}${pRow('d7','7 днів')}${pRow('d30','30 днів')}${pRow('all','весь час')}</tbody></table></div>
+    ${bkS?`<div class="sd-stats" style="border-top:1px solid var(--line);padding-top:10px">
+      <div class="snum"><i>Когорта дампу</i><b style="color:var(--signal)">${rBk-1}–${rBk} хв від початку закриття до повного</b></div>
+      <div class="snum"><i>Угод</i><b>${bkS.n||0}</b></div>
+      <div class="snum"><i>Медіана</i><b class="${pctCls(bkS.median)}">${pctTxt(bkS.median)}</b></div>
+      <div class="snum"><i>Середнє</i><b class="${pctCls(bkS.mean)}">${pctTxt(bkS.mean)}</b></div>
+      <div class="snum"><i>Win</i><b>${bkS.win==null?'—':bkS.win.toFixed(0)+'%'}</b></div>
+      <div class="snum"><i>PnL</i><b class="${pctCls(bkS.pnl_usd)}">${bkS.pnl_usd==null?'—':(bkS.pnl_usd>=0?'+':'−')+'$'+Math.abs(bkS.pnl_usd).toFixed(0)}</b></div>
+    </div>`:''}
     ${filtersOn?`<div class="sd-stats" style="border-top:1px solid var(--line);padding-top:10px">
       <div class="snum"><i>Вибірка</i><b style="color:var(--amber)">зріз (по показаних)</b></div>
       <div class="snum"><i>Угод</i><b>${fNets.length}</b></div>
@@ -1014,7 +1062,7 @@ function renderSDetail(){
       // саме цієї стратегії (F4 відкривається на підмножині — його
       // власна вибірка інша; аудит v2.5 №3)
       const lbl=(isRev?'':(isTw?('когорта рух ≥'+tCoh+'% · вхід за хвилину до кінця TWAP, вихід m60 · ')
-        :(useFirst?'лише перші постріли пари (когорта F5–F9) · ':'усі follow-сигнали, НЕ лише входи цієї стратегії · ')))
+        :(useFirst?'лише перші постріли пари (когорта F5–F9) · ':'тіньова стрічка follow: один трек на активну пару кит:монета, НЕ лише входи цієї стратегії · ')))
         +(useC?('спільна когорта (усі '+maxM+' хв у кожній угоді) · n='+src.curve_common_n)
               :'вся вибірка · увага: різні хвилини = різні набори угод');
       // ширина від контейнера: 680 у viewBox на екрані 360px робить
@@ -1027,6 +1075,8 @@ function renderSDetail(){
       ${isRev?fb('sht','all','всі')+fb('sht','y','штанга')+fb('sht','n','середина')+'<span style="width:10px"></span>':''}
       ${isTw?['1.0','1.5','2.0'].map(c=>`<button class="fbtn${tCoh===c?' on':''}" onclick="setCoh('${c}')">рух ≥${c}%</button>`).join('')+'<span style="width:10px"></span>':''}
       ${isTw?'':fb('vault','all','всі')+fb('vault','y','волти')+fb('vault','n','без волтів')+'<span style="width:10px"></span>'}
+      ${isTw?'':fb('grace','all','всі')+fb('grace','y','грейс')+fb('grace','n','без грейсу')+'<span style="width:10px"></span>'}
+      ${isRev?['all','1','2','3','4','5'].map(b=>`<button class="fbtn${rBk===b?' on':''}" onclick="setBk('${b}')" title="час від початку закриття позиції кита до повного закриття">${b==='all'?'дамп: усі':(b-1)+'–'+b+' хв'}</button>`).join('')+'<span style="width:10px"></span>':''}
       <button class="fbtn${sMore?' on':''}" onclick="setMore()">детальніше</button>
     </div>
     <div class="sd-tbl"><h4>Угоди · клік по колонці — сортування</h4>

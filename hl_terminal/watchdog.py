@@ -71,6 +71,24 @@ if st is not None:
         cur["ws_dead"] = 0
         cur["ws_alerted"] = 0
 
+    # v2.16 (рев'ю): поллер цін «живий», але семпли старі (>60 с) — сліпа
+    # зона paper-угод (хвилини пишуться «», виходи чекають); дві перевірки
+    # поспіль → алерт, раз — про відновлення
+    px_age = st.get("px_age_s")
+    if px_age is None or px_age > 60:
+        if prev.get("px_stale") and not prev.get("px_alerted"):
+            alerts.append(f"ціни з allMids не оновлюються (вік семпла "
+                          f"{'н/д' if px_age is None else f'{px_age:.0f}с'}, "
+                          f"збоїв поллера {st.get('px_fail', 0)}) дві перевірки "
+                          f"поспіль — стратегії без цін")
+            cur["px_alerted"] = 1
+        cur["px_stale"] = 1
+    else:
+        if prev.get("px_alerted"):
+            alerts.append("ціни знову оновлюються ✅")
+        cur["px_stale"] = 0
+        cur["px_alerted"] = 0
+
     restarted = (st.get("uptime_min") or 0) < prev.get("uptime", 0)
     for k, name in (("tg_errors", "помилки Telegram"),
                     ("rate_limited", "429 від Hyperliquid")):
