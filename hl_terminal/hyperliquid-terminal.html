@@ -831,20 +831,28 @@ function renderStrat(){
   const rs=sData.research, rEl=document.getElementById('svResearch');
   if(rEl){
     const c=x=>(x&&x.n&&x.median!=null)?pctTxt(x.median)+' (n='+x.n+')':'—';
-    const any=rs&&Object.values(rs).some(x=>x&&x.n);
+    const rv=(rs&&rs.verified)||{}, ro=(rs&&rs.observed)||{};
+    const any=(rv.n_base||0)>0||(ro.n_base||0)>0;
     const legacy=sData.legacy_rows||0;
     // legacy показуємо і БЕЗ когорт: одразу після зміни версії логіки
     // вся статистика чесно обнуляється — без цього рядка це виглядає
     // як втрата даних, а не як фільтр (рев'ю v2.3)
+    // аудит-3 №4: ПЕРЕВІРЕНІ порівняння (офіційний net угод R1, та сама
+    // популяція, ознаки епізоду зі settlement) окремо від СПОСТЕРЕЖЕНЬ на
+    // тіньовій стрічці (мід, лише поточна версія) — вони не доказ edge
     if(any){
       rEl.style.display='';
-      rEl.textContent='Спільна стрічка, медіана m30 net: BTC ok '+c(rs.btc_on)
-        +' vs вето '+c(rs.btc_off)
-        +((rs.btc_na&&rs.btc_na.n)?' vs BTC н/д '+c(rs.btc_na):'')
-        +' · рух 0.5–1% '+c(rs.mag_05_1)
-        +' · 1–2% '+c(rs.mag_1_2)+' · ≥2% '+c(rs.mag_2p)
-        +' · штанга '+c(rs.shtanga_1)+' vs ні '+c(rs.shtanga_0)
-        +((rs.partial&&rs.partial.n)?' · часткові закриття '+c(rs.partial):'')
+      rEl.textContent='ПЕРЕВІРЕНО (офіційний net R1, n='+(rv.n_base||0)+'): рух епізоду 1–2% '+c(rv.mag_1_2)
+        +' · ≥2% '+c(rv.mag_2p)+' · штанга '+c(rv.shtanga_1)+' vs ні '+c(rv.shtanga_0)
+        +' · дамп ≤2 хв '+c(rv.bucket_1_2)+' vs 3–5 хв '+c(rv.bucket_3_5)
+        +'  ║  СПОСТЕРЕЖЕННЯ (тіньова стрічка, мід, лише поточна версія, НЕ доказ edge; n='+(ro.n_base||0)
+        +(ro.n_excluded_old?', старих поза: '+ro.n_excluded_old:'')+'): BTC ok '+c(ro.btc_on)
+        +' vs вето '+c(ro.btc_off)
+        +((ro.btc_na&&ro.btc_na.n)?' vs BTC н/д '+c(ro.btc_na):'')
+        +' · рух 0.5–1% '+c(ro.mag_05_1)
+        +' · 1–2% '+c(ro.mag_1_2)+' · ≥2% '+c(ro.mag_2p)
+        +' · штанга '+c(ro.shtanga_1)+' vs ні '+c(ro.shtanga_0)
+        +((ro.partial&&ro.partial.n)?' · часткові закриття '+c(ro.partial):'')
         +(legacy?' · поза поточною версією: '+legacy:'')
         +(sData.quarantined?' · битих рядків у карантині: '+sData.quarantined:'')
         +(sData.read_errors?' · ⚠️ ЗБОЇВ ЧИТАННЯ ФАЙЛІВ: '+sData.read_errors:'');
@@ -1051,6 +1059,7 @@ function renderSDetail(){
       <div class="snum"><i>Розраховано по стрічці</i><b>${cs.n_settled||0} з ${(cs.n_settled||0)+(cs.n_unsettled||0)}</b></div>
       <div class="snum"><i>Верифіковано (обидві оцінки)</i><b>n=${cs.n_verified||0} · <span class="${pctCls(cs.verified&&cs.verified.median)}">${pctTxt(cs.verified&&cs.verified.median)}</span>${cs.verified&&cs.verified.win!=null?' · win '+cs.verified.win.toFixed(0)+'%':''}</b></div>
       <div class="snum"><i>Лише live · лише стрічка · розбіжність</i><b>${cs.n_live_only||0} · ${cs.n_tape_only||0} · ${cs.n_mismatch||0}</b></div>
+      ${isRev?`<div class="snum"><i>Епізод live ≠ settlement · часткові закриття (settlement)</i><b>${cs.n_ep_mismatch||0} · ${cs.n_partial_close||0}</b></div>`:''}
       ${!isTw?`<div class="snum"><i>Пізні · старі F без гейта · грейс (невід.) · без ціни</i><b>${cs.n_late||0} · ${cs.n_stale||0} · ${cs.n_grace||0} (${cs.n_grace_unknown||0}) · ${cs.n_no_price||0}</b></div>`:`<div class="snum"><i>Пізні виходи (поза вибіркою)</i><b>${cs.n_late||0}</b></div>`}
       ${isTw?`<div class="snum"><i>Підтверджено завершені · окрема вибірка</i><b>n=${cs.n_confirmed||0} · <span class="${pctCls(cs.median_confirmed)}">${pctTxt(cs.median_confirmed)}</span>${cs.win_confirmed!=null?' · win '+cs.win_confirmed.toFixed(0)+'%':''}</b></div>
       <div class="snum"><i>Скас. після входу / частково / непідтв.</i><b>${cs.n_cancelled||0} / ${cs.n_partial||0} / ${cs.n_unconfirmed||0}</b></div>
@@ -1077,11 +1086,13 @@ function renderSDetail(){
       const useFirst=S_FIRST.has(sSel)&&tf&&tf.n>0;   // F5–F9 — когорта 1-х пострілів
       // аудит-2 №3: крива зі СТРІЧКИ (settlement) має пріоритет над live-семплами;
       // для F без стрічки — тіньова стрічка входів (як раніше)
-      const ownCurve=cs&&cs.curve_src==='tape'&&cs.curve&&cs.curve.some(v=>v!=null);
+      // аудит-3 №5: власна крива = ОФІЦІЙНЕ правило (за хвилиною гірша з live і стрічки,
+      // той самий склад угод, що заголовок); F без власних траєкторій — тіньова стрічка
+      const ownCurve=cs&&cs.curve_src==='official'&&cs.curve&&cs.curve.some(v=>v!=null);
       const src=ownCurve?cs:(isRev?cs:(isTw?cs:(useFirst?tf:(sData.follow_tape&&sData.follow_tape.n?sData.follow_tape:null))));
       if(!src) return '';
-      const srcLbl=ownCurve?('зі стрічки Binance (settlement, ті самі ціни/витрати, що офіційний net) · угод '+(cs.curve_tape_n||0)+' · ')
-        :((isRev||isTw)?'live-семпли міда (без переоцінки по стрічці — не доказ) · ':'');
+      const srcLbl=ownCurve?('ОФІЦІЙНА: за хвилиною гірша з live-семпла і стрічки Binance — те саме правило, що заголовок · угод live '+(cs.curve_live_n||0)+' / стрічка '+(cs.curve_tape_n||0)+' / обидві '+(cs.curve_both_n||0)+' · ')
+        :((isRev||isTw)?'live-семпли міда (без переоцінки по стрічці — не доказ) · ':'НЕПЕРЕВІРЕНЕ спостереження (мід, не стакан; не перевірка стратегії) · ');
       const maxM=isTw?(s.track_min||120):60;
       // спільна когорта: кожна хвилина з ТИХ САМИХ угод — лише тоді
       // "найкраща хвилина" є порівнянням, а не збігом різних вибірок

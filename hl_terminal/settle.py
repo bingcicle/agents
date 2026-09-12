@@ -17,7 +17,7 @@ from collections import OrderedDict
 __all__ = ["Tape", "HLFills", "exec_px", "get_trades", "symbol_for", "parse_local", "settle_follow",
            "settle_rev", "settle_twap", "settle_pending", "load_settlements", "make_ctx",
            "whale_episode", "close_episode", "hl_user_fills", "HEADERS", "SETTLE_V", "Transient",
-           "EP_GAP_MS", "CURVE_H", "TAPE_WAIT_MS"]
+           "EP_GAP_MS", "CURVE_H", "TAPE_WAIT_MS", "SIM_COMMISSION"]
 
 
 class Transient(Exception):
@@ -32,8 +32,11 @@ class Transient(Exception):
         super().__init__(msg)
         self.code = code
 
-SETTLE_V = "2"                     # v2: без stale-цін, епізод 300 с/startPosition, записані
-                                   # часи виходу, status, curve_tape; рядки v1 перераховуються
+SETTLE_V = "3"                     # v2: без stale-цін, епізод 300 с/startPosition, записані
+                                   # часи виходу, status, curve_tape; v3 (аудит-3): факти
+                                   # позиції кита (full_close/partial_close, база R7), tape_gap,
+                                   # curve_n, витрати за ногою — рядки v1/v2 перераховуються
+                                   # (сервер до того показує їх як pending, settle_old_v)
 UNLISTED_TTL_MS = 7 * 86400000     # символ, на який Binance відповів 400 (Invalid symbol):
                                    # стрічки немає — не питати тиждень (нові лістинги підхопляться)
 ZIP_URL = ("https://data.binance.vision/data/futures/um/daily/aggTrades/"
@@ -58,16 +61,22 @@ EP_GAP_MS = 300000                 # епізод кита: пауза між ф
 EP_POS_TOL = 0.01                  # епізод: допуск «позиція не виросла» — 1% від startPosition
 CURVE_H = {"fol": 60, "rev": 60, "twap": 120}   # горизонт кривої по стрічці, хв
 CURVE_MARGIN_MS = 30000            # крива остаточна, якщо розрахована після entry+H+запас
+CURVE_FULL = 0.9                   # крива «повна», якщо заповнено ≥90% точок горизонту
+COVER_EDGE_MS = 60000              # покриття вікна стрічкою: трейд у перших/останніх 60 с
+RETRY_BASE_MS = 10 * MIN_MS        # бекоф відкладеного рядка: 10 хв × 2^(n−1), стеля 6 год
+RETRY_CAP_MS = 6 * HOUR_MS
+SIM_COMMISSION = 0.0005            # Binance taker 0.05% за сторону (як у server.py)
 K1000 = ("PEPE", "BONK", "SHIB", "FLOKI", "LUNC", "DOGS", "NEIRO")
 
 HEADERS = ["key", "family", "strategy", "coin", "symbol", "settle_v", "settled_at",
            "ts_src", "entry_ts_ms", "entry_px_live", "entry_px_tape", "entry_src",
            "entry_age_ms", "exit_ts_ms", "exit_px_live", "exit_px_tape", "exit_src",
-           "exit_reason_tape", "gross_tape_pct", "costs_pct", "net_live_pct",
+           "exit_reason_tape", "gross_tape_pct", "costs_pct", "costs_live_pct", "net_live_pct",
            "net_tape_pct", "net_official_pct", "net60_tape_pct", "entry_bias_pct",
            "whale_fill_ts_ms", "whale_px", "lag_s", "dump_first_ts_ms",
            "dump_last_ts_ms", "dump_dur_s", "dump_move_pct", "dump_bucket",
-           "curve_tape", "flags", "status", "eol"]
+           "whale_pos_start", "whale_pos_after", "whale_max_fill_pct", "whale_max_fill_usd",
+           "curve_tape", "flags", "status", "curve_n", "eol"]
 
 
 # ── дрібні хелпери ──────────────────────────────────────────────────────
@@ -347,15 +356,32 @@ class Tape:
 
     def _rest_bucket(self, symbol, b0):
         """10-хв відро через REST: диск (лише повні відра) → пам'ять (і неповні —
-        на життя об'єкта). Рядки кешу: [ts, px, agg_id] (v2) або [ts, px] (v1)."""
+        на життя об'єкта). Рядки кешу: [ts, px, agg_id] (v2). Старий кеш v1
+        ([ts, px], без agg_id) НЕПРИДАТНИЙ: його рядки зберігались без id
+        угоди, тож порядок трейдів однієї мілісекунди втрачено (при читанні
+        він виходить за ціною, а не за біржею) — «останній трейд ≤ t»
+        (_tape_last_px: референс/кінець дампу) і межа вікна стають хибними.
+        Такий файл видаляється, відро тягнеться знову, якщо ще у REST-вікні."""
         key = (symbol, b0)
         v = self._get(self._lru_rest, key)
         if v is not None or key in self._miss:
             return v
         path = os.path.join(self.rest_dir, "%s-%d.json" % (symbol, b0))
         rows = _load_json(path)
-        complete = b0 + REST_BUCKET_MS <= self._now() - MIN_MS
+        if isinstance(rows, list) and any(not isinstance(r, list) or len(r) < 3 for r in rows):
+            self.log("[settle] REST-кеш %s старого формату (без agg_id) — видалено, "
+                     "відро тягнеться знову" % os.path.basename(path))
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            rows = None
+        now = self._now()
+        complete = b0 + REST_BUCKET_MS <= now - MIN_MS
         if rows is None:
+            if b0 + REST_BUCKET_MS < now - REST_MAX_AGE_MS:
+                self._miss.add(key)          # поза REST-вікном — перетягнути нема як
+                return None
             rows = self._rest_fetch(symbol, b0, b0 + REST_BUCKET_MS)
             if rows is None:
                 self._miss.add(key)
@@ -432,6 +458,36 @@ def _first_cross(symbol, t_from, t_to, level, above, cfg):
         if (px[k] >= level) if above else (px[k] <= level):
             return ts[k], px[k]
     return None
+
+
+def _covered(symbol, t_from, t_to, ctx, edge_ms=COVER_EDGE_MS):
+    """Стрічка ПОКРИВАЄ вікно [t_from, t_to]: є трейд у [t_from, t_from+edge]
+    І трейд у [t_to−edge, t_to]. Без цього «тригера не було» (no_trigger) не
+    відрізнити від «стрічки не було» (tape_gap): неповна стрічка створює
+    обидва, а вердикт має право лише на покритому вікні."""
+    tape = _tape(ctx)
+    ts, _ = tape.window(symbol, int(t_from), int(t_from) + edge_ms)
+    if not len(ts):
+        return False
+    ts, _ = tape.window(symbol, int(t_to) - edge_ms, int(t_to))
+    return bool(len(ts))
+
+
+def _leg_costs(costs_full, entry_src, exit_src):
+    """Витрати за ногами — як у server.py (аудит v2.16 №12): нога зі стакану
+    (src починається з «book») уже містить спред і вплив ордера — модельний
+    сліпаж додається ЛИШЕ до ніг за мідом/семплом. costs_full = комісія×2 +
+    сліпаж×2 (колонка costs_pct); comm = 2·SIM_COMMISSION·100 = 0.10 %."""
+    comm = 2 * SIM_COMMISSION * 100.0
+    try:
+        slip_each = max(0.0, (float(costs_full) - comm) / 2.0)
+    except (TypeError, ValueError):
+        slip_each = 0.0
+
+    def _book(src):
+        return str(src or "").startswith("book")
+    return comm + (0.0 if _book(entry_src) else slip_each) \
+                + (0.0 if _book(exit_src) else slip_each)
 
 
 # ── філи кита (Hyperliquid) ─────────────────────────────────────────────
@@ -515,10 +571,12 @@ def _ftime(f):
 
 
 def _is_close(f):
-    """Філ закриває позицію: dir з «Close», ліквідація / ADL (текст dir або
+    """Філ закриває позицію: dir з «Close», ФЛІП («Long > Short» / «Short >
+    Long» — стара позиція закрита повністю), ліквідація / ADL (текст dir або
     поле liquidation) — як класифікує live-бот."""
     d = str(f.get("dir") or "")
-    return ("Close" in d) or ("Liquidat" in d) or ("Auto-Delever" in d) or bool(f.get("liquidation"))
+    return ("Close" in d) or (" > " in d) or ("Liquidat" in d) or ("Auto-Delever" in d) \
+        or bool(f.get("liquidation"))
 
 
 def _sp_sz(f):
@@ -527,7 +585,7 @@ def _sp_sz(f):
     return (abs(sp) if sp is not None else None), (abs(sz) if sz is not None else None)
 
 
-def close_episode(fills, coin, t0_ms, close_only):
+def close_episode(fills, coin, t0_ms, close_only, grow_only=False):
     """ЄДИНЕ правило епізоду закриття кита (спільне з live-ботом, чиста функція).
     Кандидати — філи coin з time у [t0−600с, t0]. Кінець епізоду = останній
     CLOSE-філ (dir містить «Close», або ліквідація/ADL: «Liquidat» /
@@ -559,35 +617,86 @@ def close_episode(fills, coin, t0_ms, close_only):
             break
         sp_i, _ = _sp_sz(i)
         sp_j, sz_j = _sp_sz(j)
-        if sp_i is not None and sp_j is not None and sz_j is not None \
-                and abs(sp_i - (sp_j - sz_j)) > EP_POS_TOL * max(sp_j, 1e-9) + 1e-9:
-            break                            # долив / перевідкриття між філами
+        if sp_i is not None and sp_j is not None and sz_j is not None:
+            exp_i, tol = sp_j - sz_j, EP_POS_TOL * max(sp_j, 1e-9) + 1e-9
+            # grow_only (live-бот): у потоці лише ТЕЙКЕРСЬКІ філи — мейкерське
+            # закриття між ними виглядає як «незрозуміле» зменшення позиції,
+            # це той самий злив, не новий епізод; розрив лише на ЗРОСТАННІ
+            # (долив / перевідкриття). Settlement бачить усі філи — абсолютний
+            # допуск (зменшення без філа = чужий епізод / діра)
+            if (sp_i > exp_i + tol) if grow_only else (abs(sp_i - exp_i) > tol):
+                break                        # долив / перевідкриття між філами
         k -= 1
     return fs[k], fs[idx], fs[k:idx + 1]
 
 
-def _episode_cols(first, last, t0_ms):
+def _episode_cols(first, last, t0_ms, fills=()):
     """Колонки епізоду з першого/останнього філа: сирі ціни філів (не VWAP);
-    dump_move_pct > 0 = ціна пішла у бік тиску кита (продає → впала)."""
+    dump_move_pct > 0 = ціна пішла у бік тиску кита (продає → впала).
+    Факти позиції (для повторної валідації старих рядків сервером):
+    whale_pos_start = |startPosition| ПЕРШОГО філа; whale_pos_after =
+    |startPosition| − |sz| ОСТАННЬОГО (залишок після епізоду, ≥0; None без
+    полів); whale_max_fill_pct = найбільший філ епізоду / whale_pos_start
+    (None без старту); whale_max_fill_usd = px·sz того самого філа."""
     t_last, t_first = _ftime(last), _ftime(first)
     px_last, px_first = fnum(last.get("px")), fnum(first.get("px"))
     dur = (t_last - t_first) / 1000.0
     move = None
     if px_last and px_first:
         move = (px_last / px_first - 1) * 100 * (1 if last.get("side") == "B" else -1)
+    sp_first, _ = _sp_sz(first)
+    sp_last, sz_last = _sp_sz(last)
+    after = None
+    if sp_last is not None and sz_last is not None:
+        after = max(0.0, sp_last - sz_last)
+    # найбільша ТРАНЗАКЦІЯ епізоду (ордер = філи з одним hash; без hash —
+    # окремий філ): live-R7 звіряє частку ордера, не окремого філа
+    big_sz = big_usd = None
+    groups = {}
+    for i, f in enumerate(fills or (first, last)):
+        _, sz = _sp_sz(f)
+        px = fnum(f.get("px"))
+        if sz is None or px is None:
+            continue
+        h = str(f.get("hash") or "")
+        if not h or set(h[2:] if h.startswith("0x") else h) <= {"0"}:
+            h = None                          # системний філ (ліквідація/ADL): hash нульовий
+        gk = h or (("oid:%s" % f.get("oid")) if f.get("oid") is not None else None) \
+            or (("tid:%s" % f.get("tid")) if f.get("tid") is not None else None) or ("_f%d" % i)
+        g = groups.setdefault(gk, [0.0, 0.0])
+        g[0] += sz
+        g[1] += px * sz
+    for gsz, gusd in groups.values():
+        if big_sz is None or gsz > big_sz:
+            big_sz, big_usd = gsz, gusd
+    max_pct = big_sz / sp_first if (big_sz is not None and sp_first) else None
     return {"whale_fill_ts_ms": t_last, "whale_px": px_last,
             "lag_s": (t0_ms - t_last) / 1000.0,
             "dump_first_ts_ms": t_first, "dump_last_ts_ms": t_last, "dump_dur_s": dur,
             "dump_move_pct": move,
-            "dump_bucket": 0 if dur >= 300 else min(5, max(1, int(math.ceil(dur / 60.0))))}
+            "dump_bucket": 0 if dur >= 300 else min(5, max(1, int(math.ceil(dur / 60.0)))),
+            "whale_pos_start": sp_first, "whale_pos_after": after,
+            "whale_max_fill_pct": max_pct, "whale_max_fill_usd": big_usd}
+
+
+def _close_flag(ep):
+    """Прапорець епізоду за залишком позиції: full_close — залишок ≤ 1% від
+    старту (EP_POS_TOL; без старту — ≈0); partial_close — більший;
+    close_unknown — залишок невідомий (без startPosition / sz)."""
+    after, start = ep.get("whale_pos_after"), ep.get("whale_pos_start")
+    if after is None:
+        return "close_unknown"
+    tol = EP_POS_TOL * start if start else 0.0
+    return "full_close" if after <= tol + 1e-9 else "partial_close"
 
 
 def whale_episode(fills, coin, t0_ms, close_only):
     """Епізод закриття кита перед t0 (правило — close_episode) → dict колонок
     whale_fill_ts_ms / whale_px / lag_s / dump_first_ts_ms / dump_last_ts_ms /
-    dump_dur_s / dump_move_pct / dump_bucket, або {} без філів."""
-    first, last, _ = close_episode(fills, coin, t0_ms, close_only)
-    return _episode_cols(first, last, t0_ms) if first is not None else {}
+    dump_dur_s / dump_move_pct / dump_bucket / whale_pos_start /
+    whale_pos_after / whale_max_fill_pct / whale_max_fill_usd, або {} без філів."""
+    first, last, inep = close_episode(fills, coin, t0_ms, close_only)
+    return _episode_cols(first, last, t0_ms, inep) if first is not None else {}
 
 
 # ── розрахунок сімей ────────────────────────────────────────────────────
@@ -606,7 +715,8 @@ def _base(key, family, row, ctx, symbol, ts_src, costs):
     return {"key": key, "family": family, "strategy": row.get("strategy") or "",
             "coin": row.get("coin") or "", "symbol": symbol, "settle_v": SETTLE_V,
             "settled_at": _dt(ctx.get("now_ms") or int(time.time() * 1000)),
-            "ts_src": ts_src, "costs_pct": costs, "flags": [], "curve_tape": "", "eol": "^"}
+            "ts_src": ts_src, "costs_pct": costs, "costs_live_pct": costs, "flags": [],
+            "curve_tape": "", "curve_n": 0, "eol": "^"}
 
 
 def _leg(out, prefix, symbol, t_ms, side, ctx):
@@ -658,9 +768,10 @@ def _result(out, long, e_tape, x_tape, e_live, net_live, costs, tape_flag="no_ta
 def _curve(out, symbol, entry_t, e, side_out, long, costs, h, ctx):
     """Крива по стрічці: для k=1..h net (gross − costs) від ціни входу e зі
     стрічки до exec_px(entry_t + k хв, side_out); "" де трейдів немає; колонка
-    curve_tape = ";"-з'єднані "%.4f". Без входу по стрічці — порожня."""
+    curve_tape = ";"-з'єднані "%.4f", curve_n = кількість заповнених точок.
+    Без входу по стрічці — порожня (curve_n = 0)."""
     if e is None or entry_t is None:
-        out["curve_tape"] = ""
+        out["curve_tape"], out["curve_n"] = "", 0
         return
     vals = []
     for k in range(1, h + 1):
@@ -668,6 +779,7 @@ def _curve(out, symbol, entry_t, e, side_out, long, costs, h, ctx):
         n = _net(e, x, long, costs)
         vals.append("" if n is None else "%.4f" % n)
     out["curve_tape"] = ";".join(vals)
+    out["curve_n"] = sum(1 for v in vals if v)
 
 
 def _tape_last_px(symbol, t_ms, ctx):
@@ -683,7 +795,9 @@ def _tape_last_px(symbol, t_ms, ctx):
 
 
 def _whale(out, row, t0, ctx, close_only, symbol=None):
-    """Філи кита перед t0 → lag/dump-колонки; збій → flag no_fills.
+    """Філи кита перед t0 → lag/dump-колонки + факти позиції (whale_pos_* /
+    whale_max_fill_*) і прапорець full_close / partial_close / close_unknown
+    (_close_flag); збій → flag no_fills.
     Епізод — close_episode (одне правило з live-ботом). Рух епізоду
     (dump_move_pct) — як у live (server.py _rev_ref_px): від ціни ДО першого
     філа до ціни на останньому; тут референс = останній трейд Binance СТРОГО
@@ -695,11 +809,12 @@ def _whale(out, row, t0, ctx, close_only, symbol=None):
     if fills is None:
         out["flags"].append("no_fills")
         return
-    first, last, _ = close_episode(fills, row.get("coin"), t0, close_only)
+    first, last, inep = close_episode(fills, row.get("coin"), t0, close_only)
     if first is None:
         out["flags"].append("no_whale_fill")
         return
-    ep = _episode_cols(first, last, t0)
+    ep = _episode_cols(first, last, t0, inep)
+    out["flags"].append(_close_flag(ep))     # full_close / partial_close / close_unknown
     ref = end = None
     if symbol and ep.get("dump_first_ts_ms") and ep.get("dump_last_ts_ms"):
         ref = _tape_last_px(symbol, ep["dump_first_ts_ms"] - 1, ctx)
@@ -715,7 +830,8 @@ def _whale(out, row, t0, ctx, close_only, symbol=None):
 def settle_follow(row, ctx):
     """follow_trades.csv → колонки settlement або None (не закрита / без часу).
     Вхід/вихід — записані open_ts_ms/close_ts_ms (старі рядки — локальні
-    дати); крива по стрічці 60 хв."""
+    дати); крива по стрічці 60 хв. net_live — записаний net_pct рядка (як є);
+    costs_live_pct = витрати рядка (costs_pct)."""
     t_in, s1 = _ts(row, ("open_ts_ms",), "date_open")
     t_out, s2 = _ts(row, ("close_ts_ms",), "date_close")
     if t_in is None or t_out is None or not row.get("trade_id"):
@@ -769,9 +885,14 @@ def settle_rev(row, ctx):
     R2 без entry_ts_ms — реплей тригера +0.3% від референсу стрічки у 10 хв
     (не знайдено → no_trigger, результат лише live). R2 з entry_ts_ms — той
     самий реплей від date (або entry−10 хв) до записаного входу ЛИШЕ як
-    прапорець no_trigger; ціни — на записаних часах. R8 — ціна на записаному
-    виході + прапорець tp_tape_hit/miss (реплей TP по стрічці). Не-R8 — ще
-    net60 на +60 хв. Крива по стрічці 60 хв від входу."""
+    прапорець no_trigger; ціни — на записаних часах. Вердикт no_trigger має
+    право лише на ПОКРИТОМУ стрічкою вікні (_covered); інакше — tape_gap
+    (стрічки бракує: молодий рядок відкладається, як no_tape). R8 — ціна на
+    записаному виході + прапорець tp_tape_hit/miss (реплей TP по стрічці).
+    Не-R8 — ще net60 на +60 хв. Крива по стрічці 60 хв від входу.
+    net_live при виході зі стакану (v2.16 exit_px) — gross − витрати за
+    ногами (_leg_costs, як в API); m30-шлях — повні costs_pct; використані
+    витрати — колонка costs_live_pct."""
     if fnum(row.get("entered"), 0) != 1 or not row.get("sig_id"):
         return None
     strat = row.get("strategy") or ""
@@ -792,16 +913,19 @@ def settle_rev(row, ctx):
     out["entry_px_live"] = e_live
     x_live_px, x_reason = fnum(row.get("exit_px")), (row.get("exit_reason") or "")
     x_rec = _ms(row.get("exit_ts_ms")) if x_reason not in ("", "no_price") else None
+    costs_live = costs
     if e_live and x_live_px and x_reason and x_reason != "no_price":
-        # v2.16: вихід зі стакану (таймер/TP) — як рахує API
+        # v2.16: вихід зі стакану (таймер/TP) — як рахує API: витрати за ногами
+        costs_live = _leg_costs(costs, row.get("entry_src"), row.get("exit_src"))
         g_live = (x_live_px / e_live - 1) * 100.0 * (1 if long else -1)
-        net_live, out["exit_px_live"] = g_live - costs, x_live_px
+        net_live, out["exit_px_live"] = g_live - costs_live, x_live_px
     elif x_reason == "no_price":
         net_live = None
     else:
         net_live = (m30 - costs) if m30 is not None else None
         if e_live and m30 is not None:
             out["exit_px_live"] = e_live * (1 + m30 / 100.0 * (1 if long else -1))
+    out["costs_live_pct"] = costs_live
     side_in, side_out = ("BUY", "SELL") if long else ("SELL", "BUY")
     entry_t, ref_ok = (t_rec if t_rec is not None else t0), True
     if is_r2:
@@ -811,16 +935,22 @@ def settle_rev(row, ctx):
             # старий рядок без часу входу: вхід = перший трейд, що перетнув рівень
             ref_ok = p0 is not None
             hit = _first_cross(symbol, t0, t0 + R2_WINDOW_MS, level, long, ctx) if ref_ok else None
-            if ref_ok and hit is None:       # стрічка тригера не бачила — угоди по стрічці немає
+            if ref_ok and hit is None:
+                # пробою у вікні немає: на покритій стрічці — вердикт no_trigger
+                # (угоди по стрічці немає), на непокритій — tape_gap (стрічки
+                # бракує — як no_tape: молодий рядок відкладається)
                 out.update({"entry_ts_ms": t0, "entry_src": "none", "exit_reason_tape": ""})
-                out["flags"].append("no_trigger")
+                covered = _covered(symbol, t0, t0 + R2_WINDOW_MS, ctx)
+                out["flags"].append("no_trigger" if covered else "tape_gap")
                 _result(out, long, None, None, e_live, net_live, costs, tape_flag=None)
                 _whale(out, row, t0, ctx, close_only=True, symbol=symbol)
                 return out
             if hit is not None:
                 entry_t = hit[0]
         elif level and _first_cross(symbol, t0, t_rec, level, long, ctx) is None:
-            out["flags"].append("no_trigger")    # стрічка не бачила пробою до записаного входу
+            # стрічка не бачила пробою до записаного входу: прапорець лише на
+            # покритому вікні, інакше — tape_gap (ціни все одно на записаних часах)
+            out["flags"].append("no_trigger" if _covered(symbol, t0, t_rec, ctx) else "tape_gap")
     e = _leg(out, "entry", symbol, entry_t, side_in, ctx) if ref_ok else None
     if e is None:
         out["entry_ts_ms"], out["entry_src"] = entry_t, "none"
@@ -843,11 +973,14 @@ def settle_rev(row, ctx):
 
 
 def settle_twap(row, ctx):
-    """twap_trades.csv → колонки settlement або None (no_price / без часу).
-    Вихід = записаний exit_ts_ms, без нього entry + exit_min; exit_px_live =
-    записаний exit_px, без нього з m{exit_min}. Крива по стрічці 120 хв."""
+    """twap_trades.csv → колонки settlement або None (без exit_min / часу).
+    Вихід = записаний exit_ts_ms, без нього entry + exit_min (хвилина
+    закриття); exit_px_live = записаний exit_px, без нього з m{exit_min}.
+    net_live: з exit_px (v2.16) — gross − витрати за ногами (_leg_costs, як в
+    API), інакше записаний net60_pct; no_price — net_live None (стрічка є →
+    tape_only), рядок НЕ пропускається. Крива по стрічці 120 хв."""
     em = fnum(row.get("exit_min"))
-    if (row.get("exit_reason") or "") == "no_price" or em is None or not row.get("twap_id"):
+    if em is None or not row.get("twap_id"):
         return None
     t_in, src = _ts(row, ("entry_ts_ms",), "date_entry")
     if t_in is None:
@@ -860,17 +993,27 @@ def settle_twap(row, ctx):
     out = _base("%s|%s" % (row["twap_id"], row.get("strategy") or ""), "twap", row, ctx,
                 symbol, src, costs)
     e_live, x_live = fnum(row.get("entry_px")), fnum(row.get("exit_px"))
+    x_reason = row.get("exit_reason") or ""
     mx = fnum(row.get("m%d" % int(em)))
     out["entry_px_live"] = e_live
     if x_live:
         out["exit_px_live"] = x_live
     elif e_live and mx is not None:
         out["exit_px_live"] = e_live * (1 + mx / 100.0 * (1 if long else -1))
-    out["exit_reason_tape"] = row.get("exit_reason") or ""
+    out["exit_reason_tape"] = x_reason
+    costs_live = costs
+    if x_reason == "no_price":
+        net_live = None                      # ціни виходу не було — лише стрічка
+    elif e_live and x_live:
+        costs_live = _leg_costs(costs, row.get("entry_src"), row.get("exit_src"))
+        net_live = (x_live / e_live - 1) * 100.0 * (1 if long else -1) - costs_live
+    else:
+        net_live = fnum(row.get("net60_pct"))
+    out["costs_live_pct"] = costs_live
     side_in, side_out = ("BUY", "SELL") if long else ("SELL", "BUY")
     e = _leg(out, "entry", symbol, t_in, side_in, ctx)
     x = _leg(out, "exit", symbol, t_out, side_out, ctx)
-    _result(out, long, e, x, e_live, fnum(row.get("net60_pct")), costs)
+    _result(out, long, e, x, e_live, net_live, costs)
     _curve(out, symbol, t_in, e, side_out, long, costs, CURVE_H["twap"], ctx)
     _whale(out, row, t_in, ctx, close_only=False, symbol=symbol)
     return out
@@ -993,40 +1136,104 @@ def _curve_due_ms(srow):
     return int(e) + CURVE_H.get(srow.get("family"), 60) * MIN_MS + CURVE_MARGIN_MS
 
 
-def _settle_final(srow):
+def _curve_n(srow):
+    """Кількість заповнених точок кривої: колонка curve_n, а для рядків без
+    неї — підрахунок по curve_tape."""
+    n = fnum(srow.get("curve_n"))
+    if n is not None:
+        return int(n)
+    c = srow.get("curve_tape") or ""
+    return sum(1 for v in str(c).split(";") if v) if c else 0
+
+
+def _curve_complete(srow):
+    """Крива по стрічці достатньо повна: заповнено ≥ CURVE_FULL (90%) точок
+    горизонту сім'ї (60 хв R/F, 120 хв TWAP)."""
+    h = CURVE_H.get(srow.get("family"), 60)
+    return _curve_n(srow) >= CURVE_FULL * h
+
+
+def _settle_final(srow, now_ms=None):
     """Рядок settlements остаточний: поточна версія розрахунку І розрахований
-    після горизонту кривої (інакше крива обірвана — перерахунок, коли дозріє)."""
+    після горизонту кривої І (крива повна АБО угода старша за TAPE_WAIT_MS —
+    стрічка вже не доповниться) — інакше крива обірвана / діркувата
+    (REST-відро ще неповне, zip ще не викладений): перерахунок за
+    _resettle_due. Без часу входу / settled_at судити нема з чого — остаточний;
+    unlisted — стрічки не буде, чекати повної кривої нема чого."""
     if srow.get("settle_v") != SETTLE_V:
         return False
     due, at = _curve_due_ms(srow), parse_local(srow.get("settled_at"))
-    return due is None or at is None or at >= due
+    if due is None or at is None:
+        return True
+    if at < due:
+        return False
+    if _curve_complete(srow) or "unlisted" in (srow.get("flags") or ""):
+        return True
+    now = now_ms if now_ms is not None else int(time.time() * 1000)
+    return now - int(fnum(srow.get("entry_ts_ms"))) >= TAPE_WAIT_MS
+
+
+def _resettle_due(srow, now_ms):
+    """Чи (пере)раховувати рядок settlements зараз: стара версія — так;
+    остаточний — ні; крива ще не дозріла (now < entry+H+запас) — ні, чекати
+    горизонту; розрахований ДО горизонту — так (один раз, коли дозрів);
+    розрахований після горизонту з неповною кривою — з подвоюваними паузами:
+    лише коли now − settled_at ≥ max(1 год, settled_at − entry) (≈7 спроб до
+    72 год, далі рядок остаточний за віком)."""
+    if _settle_final(srow, now_ms):
+        return False
+    if srow.get("settle_v") != SETTLE_V:
+        return True
+    due, at = _curve_due_ms(srow), parse_local(srow.get("settled_at"))
+    if due is None or at is None:
+        return True
+    if now_ms < due:
+        return False
+    if at < due:
+        return True
+    return now_ms - at >= max(HOUR_MS, at - int(fnum(srow.get("entry_ts_ms"))))
 
 
 def _tape_pending(out, now_ms):
-    """Стрічки немає (вхід або вихід без трейдів), а угода молодша за
-    TAPE_WAIT_MS (72 год) — zip ще не викладений / REST-прогалина: не фіксувати,
-    спробувати наступним циклом. no_trigger — вердикт стрічки, не її брак;
-    unlisted — символу на Binance немає, чекати нема чого."""
+    """Стрічки бракує (вхід без трейдів — no_tape, вікно тригера не покрите —
+    tape_gap, або вихід без трейдів), а угода молодша за TAPE_WAIT_MS (72 год)
+    — zip ще не викладений / REST-прогалина: не фіксувати, спробувати пізніше.
+    no_trigger сам по собі — вердикт покритої стрічки, не її брак; unlisted —
+    символу на Binance немає, чекати нема чого."""
     fl = out.get("flags") or []
-    if "no_trigger" in fl or "unlisted" in fl:
+    if "unlisted" in fl:
         return False
-    missing = ("no_tape" in fl) or (out.get("entry_px_tape") is not None
-                                    and out.get("exit_px_tape") is None)
+    missing = ("no_tape" in fl) or ("tape_gap" in fl) or (
+        out.get("entry_px_tape") is not None and out.get("exit_px_tape") is None)
     if not missing:
         return False
     t = fnum(out.get("entry_ts_ms"))
     return t is not None and now_ms - t < TAPE_WAIT_MS
 
 
+def _backoff_ms(n_fail):
+    """Пауза перед повторною спробою після n_fail збоїв поспіль:
+    10 хв × 2^(n_fail−1), стеля 6 год."""
+    return min(RETRY_CAP_MS, RETRY_BASE_MS * (2 ** max(0, min(n_fail - 1, 12))))
+
+
 def settle_pending(data_dir, symbol_map=None, limit=None, force=False, log=print,
                    fetchers=None, now_ms=None, since=None):
-    """Розрахувати ще не розраховані закриті угоди (НОВІШІ першими).
+    """Розрахувати ще не розраховані закриті угоди.
     → (n_done, n_skipped, n_failed); окремий битий рядок логується, не валить
     прогін. force — перерахувати все заново (новий запис ключа виграє).
-    Рядок без стрічки (вхід/вихід) молодший за 72 год — не фіксується
-    (n_failed, рахується у limit спроб), старший — фіксується назавжди.
-    Рядок, розрахований до горизонту кривої (entry + 60/120 хв), або старої
-    версії SETTLE_V — перераховується, коли горизонт минув."""
+    Рядок без стрічки (вхід/вихід/вікно тригера) молодший за 72 год — не
+    фіксується (n_failed), старший — фіксується назавжди. Перерахунок рядків
+    старої версії / з недозрілою чи неповною кривою — _resettle_due.
+    БЕКОФ: settle_pending.retry {key: (next_retry_ms, n_fail)} — відкладений
+    рядок або збій (Transient/інший) → наступна спроба через 10 хв × 2^(n−1)
+    (стеля 6 год); до того кандидат пропускається БЕЗ витрати спроби
+    (settle_pending.last_waiting); успішний запис знімає ключ.
+    last_pending = усі кандидати (бек-лог для /status).
+    ЧЕРГА: limit — лише на СПРОБИ (рядки, що дають None, без мережі);
+    перші ceil(limit/2) спроб — НОВІШІ першими (свіжі угоди отримують
+    офіційний net за хвилини), решта — СТАРІШІ першими (бек-лог не голодує);
+    без limit — усе, новіші першими."""
     ctx = make_ctx(data_dir, symbol_map, fetchers, now_ms, log)
     now = now_ms if now_ms is not None else int(time.time() * 1000)
     prev = {} if force else load_settlements(data_dir)
@@ -1042,55 +1249,86 @@ def settle_pending(data_dir, symbol_map=None, limit=None, force=False, log=print
             if since and (row.get(dcol) or "")[:10] < since:
                 continue
             sr = prev.get(key)
-            if sr is not None:
-                if _settle_final(sr):
-                    continue                 # розраховано остаточно
-                due = _curve_due_ms(sr)
-                if sr.get("settle_v") == SETTLE_V and due is not None and now < due:
-                    continue                 # крива ще не дозріла — перерахунок пізніше
+            if sr is not None and not _resettle_due(sr, now):
+                continue                     # остаточно / ще не дозріло / пауза
             if (row.get("algo_v") or "").strip() and _vt(row.get("algo_v")) < MIN_ALGO_V:
                 n_old += 1               # рядки до 2.10 ніде не показуються — не рахуємо
                 continue
             cands.append((_ts(row, ms_cols, dcol)[0] or 0, key, fn, row))
-    # НОВІШІ першими: свіжі угоди отримують офіційний net за хвилини, бек-лог
-    # доїжджає далі; limit — лише на СПРОБИ (рядки, що дають None, без мережі)
-    cands.sort(key=lambda c: c[0], reverse=True)
-    settle_pending.last_pending = len(cands)     # бек-лог (/status)
+    cands.sort(key=lambda c: c[0], reverse=True)      # новіші першими
+    retry = settle_pending.retry
+    keys = set(c[1] for c in cands)
+    for k in [k for k in retry if k not in keys]:
+        retry.pop(k)                                  # ключ уже не в черзі
+    ready = cands if force else [c for c in cands if retry.get(c[1], (0, 0))[0] <= now]
+    settle_pending.last_pending = len(cands)          # бек-лог (/status)
+    settle_pending.last_waiting = len(cands) - len(ready)   # у бекофі
     n_done = n_skip = n_fail = n_try = 0
-    for _, key, fn, row in cands:
-        if limit and n_try >= int(limit):
-            break
-        try:
-            out = fn(row, ctx)
-            if out is None:
-                n_skip += 1
+    lim = int(limit) if limit else None
+    done_ix = set()
+
+    def _defer(key):
+        nf = retry.get(key, (0, 0))[1] + 1
+        retry[key] = (now + _backoff_ms(nf), nf)
+        return nf
+
+    def _run(ix_iter, cap):
+        nonlocal n_done, n_skip, n_fail, n_try
+        for ix in ix_iter:
+            if ix in done_ix:
                 continue
-            n_try += 1
-            if out.get("symbol") and ctx["tape"].is_unlisted(out["symbol"]) \
-                    and "unlisted" not in out["flags"]:
-                out["flags"].append("unlisted")  # стрічки не буде — фіксуємо як live_only
-            if _tape_pending(out, now):
+            if cap is not None and n_try >= cap:
+                break
+            done_ix.add(ix)
+            _, key, fn, row = ready[ix]
+            try:
+                out = fn(row, ctx)
+                if out is None:
+                    n_skip += 1
+                    continue
+                n_try += 1
+                if out.get("symbol") and ctx["tape"].is_unlisted(out["symbol"]) \
+                        and "unlisted" not in out["flags"]:
+                    out["flags"].append("unlisted")  # стрічки не буде — фіксуємо як live_only
+                if _tape_pending(out, now):
+                    n_fail += 1
+                    nf = _defer(key)
+                    log("[settle] %s: стрічка ще недоступна — відкладено (спроба %d, повтор "
+                        "через %d хв)" % (key, nf, _backoff_ms(nf) // MIN_MS))
+                    continue
+                append_settlement(data_dir, out)
+                retry.pop(key, None)
+                n_done += 1
+            except Transient as e:
+                # джерело недоступне (мережа/429) — рядок не фіксуємо,
+                # наступна спроба після бекофу. Вичерпаний БЮДЖЕТ циклу
+                # (code="budget": кап HL-запитів у боті) — не вина рядка:
+                # без бекофу, наступний цикл спробує знову
                 n_fail += 1
-                log("[settle] %s: стрічка ще недоступна — відкладено" % key)
-                continue
-            append_settlement(data_dir, out)
-            n_done += 1
-        except Transient as e:
-            # джерело недоступне (мережа/429/бюджет) — рядок не фіксуємо,
-            # наступний цикл спробує знову
-            n_fail += 1
-            n_try += 1
-            log("[settle] %s: відкладено — %s" % (key, e))
-        except Exception as e:
-            n_fail += 1
-            n_try += 1
-            log("[settle] збій %s: %r" % (key, e))
+                n_try += 1
+                if getattr(e, "code", None) != "budget":
+                    _defer(key)
+                log("[settle] %s: відкладено — %s" % (key, e))
+            except Exception as e:
+                n_fail += 1
+                n_try += 1
+                _defer(key)
+                log("[settle] збій %s: %r" % (key, e))
+
+    _run(range(len(ready)), (lim + 1) // 2 if lim else None)   # новіші першими
+    _run(range(len(ready) - 1, -1, -1), lim)                    # решта — старіші першими
     if n_old:
         log("[settle] пропущено рядків до v%s: %d" % (".".join(map(str, MIN_ALGO_V)), n_old))
     _prune_tape(data_dir, log)
-    log("[settle] done=%d skipped=%d failed=%d tape=%s hl=%s"
-        % (n_done, n_skip, n_fail, ctx["tape"].stats, ctx["hl"].stats))
+    log("[settle] done=%d skipped=%d failed=%d waiting=%d tape=%s hl=%s"
+        % (n_done, n_skip, n_fail, settle_pending.last_waiting, ctx["tape"].stats,
+           ctx["hl"].stats))
     return n_done, n_skip, n_fail
+
+
+settle_pending.retry = {}          # key → (next_retry_ms, n_fail): бекоф відкладених рядків
+settle_pending.last_pending = 0    # кандидатів у черзі (бек-лог)
+settle_pending.last_waiting = 0    # з них у бекофі (пропущені без витрати спроби)
 
 
 def main(argv=None):
