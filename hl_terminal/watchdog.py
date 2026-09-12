@@ -89,6 +89,23 @@ if st is not None:
         cur["px_stale"] = 0
         cur["px_alerted"] = 0
 
+    # v2.20 (аудит v2.19 №2): потік цін Binance (bookTicker) — тригери R2/TP
+    # R8/семпли Binance-трекерів без нього сліпі; та сама логіка, що для allMids
+    bn_age = st.get("bn_px_age_s")
+    if bn_age is None or bn_age > 60:
+        if prev.get("bn_px_stale") and not prev.get("bn_px_alerted"):
+            alerts.append(f"ціни Binance (bookTicker) не оновлюються (вік "
+                          f"{'н/д' if bn_age is None else f'{bn_age:.0f}с'}, збоїв "
+                          f"{st.get('bn_px_fail', 0)}) дві перевірки поспіль — "
+                          f"Binance-трекери без тригерів/семплів")
+            cur["bn_px_alerted"] = 1
+        cur["bn_px_stale"] = 1
+    else:
+        if prev.get("bn_px_alerted"):
+            alerts.append("ціни Binance знову оновлюються ✅")
+        cur["bn_px_stale"] = 0
+        cur["bn_px_alerted"] = 0
+
     restarted = (st.get("uptime_min") or 0) < prev.get("uptime", 0)
     for k, name in (("tg_errors", "помилки Telegram"),
                     ("rate_limited", "429 від Hyperliquid")):

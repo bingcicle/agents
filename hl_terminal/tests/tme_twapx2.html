@@ -1,0 +1,802 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>TWAPs | Hyper | первый парсер в СНГ,остальные доходяги решили просто спиздить. – Telegram</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, minimum-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <meta name="format-detection" content="telephone=no" />
+    <meta http-equiv="X-UA-Compatible"
+     content="IE=edge" />
+    <meta name="MobileOptimized" content="176" />
+    <meta name="HandheldFriendly" content="True" />
+    
+<meta property="og:title" content="TWAPs | Hyper | первый парсер в СНГ,остальные доходяги решили просто спиздить.">
+<meta property="og:image" content="https://cdn4.telesco.pe/file/uc0g05NkyAVs7xMge06k2Kuwlp6E9R-k4s3shVejYLssAwy6Qjmt8YPcVSM6ycMUaORAr0im9q5z88UheVw5mfi-W0xLRQ5M3Fc6Cv8il_9tyChYQ7WfsKIXE0ptQXsXocyXpLVro9TGiZox7WW27ZTds74T0qj1bK2zwgrDRJCBF46OWpxMU1ixQsYfOnquwHiRKt1P2x37Hro3nJd3YPnMc49tHtZhYTzqcE3kktO1nvemHz5--hiCl92C_MWCmq5tbdCULIJLBhk4J6zOpAsaFfQV-vABkFoBJEzzL39T5lyuOCYax15WEcwIG4wy-SFs5z8FT8jTCyhqK9bqqA.jpg">
+<meta property="og:site_name" content="Telegram">
+<meta property="og:description" content="">
+
+<meta property="twitter:title" content="TWAPs | Hyper | первый парсер в СНГ,остальные доходяги решили просто спиздить.">
+<meta property="twitter:image" content="https://cdn4.telesco.pe/file/uc0g05NkyAVs7xMge06k2Kuwlp6E9R-k4s3shVejYLssAwy6Qjmt8YPcVSM6ycMUaORAr0im9q5z88UheVw5mfi-W0xLRQ5M3Fc6Cv8il_9tyChYQ7WfsKIXE0ptQXsXocyXpLVro9TGiZox7WW27ZTds74T0qj1bK2zwgrDRJCBF46OWpxMU1ixQsYfOnquwHiRKt1P2x37Hro3nJd3YPnMc49tHtZhYTzqcE3kktO1nvemHz5--hiCl92C_MWCmq5tbdCULIJLBhk4J6zOpAsaFfQV-vABkFoBJEzzL39T5lyuOCYax15WEcwIG4wy-SFs5z8FT8jTCyhqK9bqqA.jpg">
+<meta property="twitter:site" content="@Telegram">
+
+<meta property="al:ios:app_store_id" content="686449807">
+<meta property="al:ios:app_name" content="Telegram Messenger">
+<meta property="al:ios:url" content="tg://resolve?domain=TWAPx">
+
+<meta property="al:android:url" content="tg://resolve?domain=TWAPx">
+<meta property="al:android:app_name" content="Telegram">
+<meta property="al:android:package" content="org.telegram.messenger">
+
+<meta name="twitter:card" content="summary">
+<meta name="twitter:site" content="@Telegram">
+<meta name="twitter:description" content="
+">
+
+    <link rel="prev" href="/s/TWAPx?before=44717">
+<link rel="canonical" href="/s/TWAPx?before=44737">
+
+    <script>window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches&&document.documentElement&&document.documentElement.classList&&document.documentElement.classList.add('theme_dark');</script>
+    <link rel="icon" type="image/svg+xml" href="//telegram.org/img/website_icon.svg?4">
+<link rel="apple-touch-icon" sizes="180x180" href="//telegram.org/img/apple-touch-icon.png">
+<link rel="icon" type="image/png" sizes="32x32" href="//telegram.org/img/favicon-32x32.png">
+<link rel="icon" type="image/png" sizes="16x16" href="//telegram.org/img/favicon-16x16.png">
+<link rel="alternate icon" href="//telegram.org/img/favicon.ico" type="image/x-icon" />
+    <link href="//telegram.org/css/font-roboto.css?1" rel="stylesheet" type="text/css">
+    <link href="//telegram.org/css/widget-frame.css?75" rel="stylesheet" media="screen">
+    <link href="//telegram.org/css/telegram-web.css?39" rel="stylesheet" media="screen">
+    <script>TBaseUrl='/';</script>
+    <style>        .user-color-12 {
+          --user-line-gradient: repeating-linear-gradient(-45deg, #3391d4 0px, #3391d4 5px, #7dd3f0 5px, #7dd3f0 10px);
+          --user-accent-color: #3391d4;
+          --user-background: #3391d41f;
+        }        .user-color-10 {
+          --user-line-gradient: repeating-linear-gradient(-45deg, #27a910 0px, #27a910 5px, #a7dc57 5px, #a7dc57 10px);
+          --user-accent-color: #27a910;
+          --user-background: #27a9101f;
+        }        .user-color-8 {
+          --user-line-gradient: repeating-linear-gradient(-45deg, #e0802b 0px, #e0802b 5px, #fac534 5px, #fac534 10px);
+          --user-accent-color: #e0802b;
+          --user-background: #e0802b1f;
+        }        .user-color-7 {
+          --user-line-gradient: repeating-linear-gradient(-45deg, #e15052 0px, #e15052 5px, #f9ae63 5px, #f9ae63 10px);
+          --user-accent-color: #e15052;
+          --user-background: #e150521f;
+        }        .user-color-9 {
+          --user-line-gradient: repeating-linear-gradient(-45deg, #a05ff3 0px, #a05ff3 5px, #f48fff 5px, #f48fff 10px);
+          --user-accent-color: #a05ff3;
+          --user-background: #a05ff31f;
+        }        .user-color-11 {
+          --user-line-gradient: repeating-linear-gradient(-45deg, #27acce 0px, #27acce 5px, #82e8d6 5px, #82e8d6 10px);
+          --user-accent-color: #27acce;
+          --user-background: #27acce1f;
+        }        .user-color-13 {
+          --user-line-gradient: repeating-linear-gradient(-45deg, #dd4371 0px, #dd4371 5px, #ffbe9f 5px, #ffbe9f 10px);
+          --user-accent-color: #dd4371;
+          --user-background: #dd43711f;
+        }        .user-color-14 {
+          --user-line-gradient: repeating-linear-gradient(-45deg, #247bed 0px, #247bed 5px, #f04856 5px, #f04856 10px, #ffffff 10px, #ffffff 15px);
+          --user-accent-color: #247bed;
+          --user-background: #247bed1f;
+        }        .user-color-15 {
+          --user-line-gradient: repeating-linear-gradient(-45deg, #d67722 0px, #d67722 5px, #1ea011 5px, #1ea011 10px, #ffffff 10px, #ffffff 15px);
+          --user-accent-color: #d67722;
+          --user-background: #d677221f;
+        }        .user-color-16 {
+          --user-line-gradient: repeating-linear-gradient(-45deg, #179e42 0px, #179e42 5px, #e84a3f 5px, #e84a3f 10px, #ffffff 10px, #ffffff 15px);
+          --user-accent-color: #179e42;
+          --user-background: #179e421f;
+        }        .user-color-17 {
+          --user-line-gradient: repeating-linear-gradient(-45deg, #2894af 0px, #2894af 5px, #6fc456 5px, #6fc456 10px, #ffffff 10px, #ffffff 15px);
+          --user-accent-color: #2894af;
+          --user-background: #2894af1f;
+        }        .user-color-18 {
+          --user-line-gradient: repeating-linear-gradient(-45deg, #0c9ab3 0px, #0c9ab3 5px, #ffad95 5px, #ffad95 10px, #ffe6b5 10px, #ffe6b5 15px);
+          --user-accent-color: #0c9ab3;
+          --user-background: #0c9ab31f;
+        }        .user-color-19 {
+          --user-line-gradient: repeating-linear-gradient(-45deg, #7757d6 0px, #7757d6 5px, #f79610 5px, #f79610 10px, #ffde8e 10px, #ffde8e 15px);
+          --user-accent-color: #7757d6;
+          --user-background: #7757d61f;
+        }        .user-color-20 {
+          --user-line-gradient: repeating-linear-gradient(-45deg, #1585cf 0px, #1585cf 5px, #f2ab1d 5px, #f2ab1d 10px, #ffffff 10px, #ffffff 15px);
+          --user-accent-color: #1585cf;
+          --user-background: #1585cf1f;
+        }        body.dark .user-color-12, html.theme_dark .user-color-12 {
+          --user-line-gradient: repeating-linear-gradient(-45deg, #52bfff 0px, #52bfff 5px, #0b5494 5px, #0b5494 10px);
+          --user-accent-color: #52bfff;
+          --user-background: #52bfff1f;
+        }        body.dark .user-color-10, html.theme_dark .user-color-10 {
+          --user-line-gradient: repeating-linear-gradient(-45deg, #a7eb6e 0px, #a7eb6e 5px, #167e2d 5px, #167e2d 10px);
+          --user-accent-color: #a7eb6e;
+          --user-background: #a7eb6e1f;
+        }        body.dark .user-color-8, html.theme_dark .user-color-8 {
+          --user-line-gradient: repeating-linear-gradient(-45deg, #ecb04e 0px, #ecb04e 5px, #c35714 5px, #c35714 10px);
+          --user-accent-color: #ecb04e;
+          --user-background: #ecb04e1f;
+        }        body.dark .user-color-7, html.theme_dark .user-color-7 {
+          --user-line-gradient: repeating-linear-gradient(-45deg, #ff9380 0px, #ff9380 5px, #992f37 5px, #992f37 10px);
+          --user-accent-color: #ff9380;
+          --user-background: #ff93801f;
+        }        body.dark .user-color-9, html.theme_dark .user-color-9 {
+          --user-line-gradient: repeating-linear-gradient(-45deg, #c697ff 0px, #c697ff 5px, #5e31c8 5px, #5e31c8 10px);
+          --user-accent-color: #c697ff;
+          --user-background: #c697ff1f;
+        }        body.dark .user-color-11, html.theme_dark .user-color-11 {
+          --user-line-gradient: repeating-linear-gradient(-45deg, #40d8d0 0px, #40d8d0 5px, #045c7f 5px, #045c7f 10px);
+          --user-accent-color: #40d8d0;
+          --user-background: #40d8d01f;
+        }        body.dark .user-color-13, html.theme_dark .user-color-13 {
+          --user-line-gradient: repeating-linear-gradient(-45deg, #ff86a6 0px, #ff86a6 5px, #8e366e 5px, #8e366e 10px);
+          --user-accent-color: #ff86a6;
+          --user-background: #ff86a61f;
+        }        body.dark .user-color-14, html.theme_dark .user-color-14 {
+          --user-line-gradient: repeating-linear-gradient(-45deg, #3fa2fe 0px, #3fa2fe 5px, #e5424f 5px, #e5424f 10px, #ffffff 10px, #ffffff 15px);
+          --user-accent-color: #3fa2fe;
+          --user-background: #3fa2fe1f;
+        }        body.dark .user-color-15, html.theme_dark .user-color-15 {
+          --user-line-gradient: repeating-linear-gradient(-45deg, #ff905e 0px, #ff905e 5px, #32a527 5px, #32a527 10px, #ffffff 10px, #ffffff 15px);
+          --user-accent-color: #ff905e;
+          --user-background: #ff905e1f;
+        }        body.dark .user-color-16, html.theme_dark .user-color-16 {
+          --user-line-gradient: repeating-linear-gradient(-45deg, #66d364 0px, #66d364 5px, #d5444f 5px, #d5444f 10px, #ffffff 10px, #ffffff 15px);
+          --user-accent-color: #66d364;
+          --user-background: #66d3641f;
+        }        body.dark .user-color-17, html.theme_dark .user-color-17 {
+          --user-line-gradient: repeating-linear-gradient(-45deg, #22bce2 0px, #22bce2 5px, #3da240 5px, #3da240 10px, #ffffff 10px, #ffffff 15px);
+          --user-accent-color: #22bce2;
+          --user-background: #22bce21f;
+        }        body.dark .user-color-18, html.theme_dark .user-color-18 {
+          --user-line-gradient: repeating-linear-gradient(-45deg, #22bce2 0px, #22bce2 5px, #ff9778 5px, #ff9778 10px, #ffda6b 10px, #ffda6b 15px);
+          --user-accent-color: #22bce2;
+          --user-background: #22bce21f;
+        }        body.dark .user-color-19, html.theme_dark .user-color-19 {
+          --user-line-gradient: repeating-linear-gradient(-45deg, #9791ff 0px, #9791ff 5px, #f2731d 5px, #f2731d 10px, #ffdb59 10px, #ffdb59 15px);
+          --user-accent-color: #9791ff;
+          --user-background: #9791ff1f;
+        }        body.dark .user-color-20, html.theme_dark .user-color-20 {
+          --user-line-gradient: repeating-linear-gradient(-45deg, #3da6eb 0px, #3da6eb 5px, #eea51d 5px, #eea51d 10px, #ffffff 10px, #ffffff 15px);
+          --user-accent-color: #3da6eb;
+          --user-background: #3da6eb1f;
+        }.user-color-6, .user-color-4, .user-color-2, .user-color-0, .user-color-1, .user-color-3, .user-color-5,   .user-color-default {
+    --user-accent-color: var(--accent-color);
+    --user-accent-background: var(--accent-background);
+    --user-line-gradient: linear-gradient(45deg, var(--accent-color), var(--accent-color));
+  }</style>
+  </head>
+  <body class="widget_frame_base tgme_webpreview emoji_image thin_box_shadow tme_mode no_transitions">
+    <div class="tgme_background_wrap">
+      <canvas id="tgme_background" class="tgme_background" width="50" height="50" data-colors="dbddbb,6ba587,d5d88d,88b884"></canvas>
+      <div class="tgme_background_pattern"></div>
+    </div>
+    <header class="tgme_header search_collapsed">
+  <div class="tgme_container">
+    <div class="tgme_header_search">
+      <form class="tgme_header_search_form" action="/s/TWAPx">
+        <svg class="tgme_header_search_form_icon" width="20" height="20" viewBox="0 0 20 20"><g fill="none" stroke="#7D7F81" stroke-width="1.4"><circle cx="9" cy="9" r="6"></circle><path d="M13.5,13.5 L17,17" stroke-linecap="round"></path></g></svg>
+        <input class="tgme_header_search_form_input js-header_search" placeholder="Search" name="q" autocomplete="off" value="" />
+        <a href="/s/TWAPx" class="tgme_header_search_form_clear"><svg class="tgme_action_button_icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" width="20" height="20"><g class="icon_body" fill="none" stroke-linecap="round" stroke-linejoin="round" stroke="#000000" stroke-width="1.5"><path d="M6 14l8-8m0 8L6 6" stroke-dasharray="0,11.314" stroke-dashoffset="5.657"/><path d="M26 14l8-8m0 8l-8-8" stroke-dasharray="0.371,10.943" stroke-dashoffset="5.842"/><path d="M46 14l8-8m0 8l-8-8" stroke-dasharray="1.982,9.332" stroke-dashoffset="6.647756"/><path d="M66 14l8-8m0 8l-8-8" stroke-dasharray="5.173,6.14" stroke-dashoffset="8.243"/><path d="M86 14l8-8m0 8l-8-8" stroke-dasharray="7.866,3.448" stroke-dashoffset="9.59"/><path d="M106 14l8-8m0 8l-8-8" stroke-dasharray="9.471,1.843" stroke-dashoffset="10.392"/><path d="M126 14l8-8m0 8l-8-8" stroke-dasharray="10.417,0.896" stroke-dashoffset="10.866"/><path d="M146 14l8-8m0 8l-8-8" stroke-dasharray="10.961,0.353" stroke-dashoffset="11.137"/><path d="M166 14l8-8m0 8l-8-8" stroke-dasharray="11.234,0.08" stroke-dashoffset="11.274"/><path d="M186 14l8-8m0 8l-8-8"/></g></svg></a>
+      </form>
+    </div>
+    <div class="tgme_header_right_column">
+      <section class="tgme_right_column">
+        <div class="tgme_channel_info">
+          <div class="tgme_channel_info_header">
+            <i class="tgme_page_photo_image bgcolor1" data-content="Tс"><img src="https://cdn4.telesco.pe/file/CbMqT_zwWzSJSQQl52b0WJD-TMuVoDSZJdSOZZVkjbcA8P0zwWXQY0GzeADVJaxZOEkvsJyXVr4dW5PhdBYTmCkU1FLtIt5tdrcQN9AVOK3VLPguVH-6O9I_P8EWQ7AOiRelKQENRKyE59ZVLocT_p3v-X7Lli_D_usBxpPxcOJ3O-2iCdz4r0y7RS-ytc0nWS01duD5wHaVfbo0RyOJCZxroL8cgURSMch73HYIOJrjat3ec07X0qQaUZzRFFwfgT6FbpIrvzDw2vE215gm33KLJz_9r_uZUcBxWkmZCDYNf3ADISWSHoQ-80mVXQgEsMZHu0AtykV_8LgOIYH4dw.jpg"></i>
+            <div class="tgme_channel_info_header_title_wrap">
+              <div class="tgme_channel_info_header_title"><span dir="auto">TWAPs | Hyper | первый парсер в СНГ,остальные доходяги решили просто спиздить.</span></div>
+              <div class="tgme_channel_info_header_labels"></div>
+            </div>
+            <div class="tgme_channel_info_header_username"><a href="https://t.me/TWAPx">@TWAPx</a></div>
+          </div>
+          <div class="tgme_channel_info_counters"><div class="tgme_channel_info_counter"><span class="counter_value">1.53K</span> <span class="counter_type">subscribers</span></div><div class="tgme_channel_info_counter"><span class="counter_value">1</span> <span class="counter_type">photo</span></div><div class="tgme_channel_info_counter"><span class="counter_value">20.1K</span> <span class="counter_type">links</span></div></div>
+          
+          <a class="tgme_channel_download_telegram" href="//telegram.org/dl?tme=6bb07fb3e29672965f_5621530157539347226">
+            <svg class="tgme_channel_download_telegram_icon" width="21px" height="18px" viewBox="0 0 21 18"><g fill="none"><path fill="#ffffff" d="M0.554,7.092 L19.117,0.078 C19.737,-0.156 20.429,0.156 20.663,0.776 C20.745,0.994 20.763,1.23 20.713,1.457 L17.513,16.059 C17.351,16.799 16.62,17.268 15.88,17.105 C15.696,17.065 15.523,16.987 15.37,16.877 L8.997,12.271 C8.614,11.994 8.527,11.458 8.805,11.074 C8.835,11.033 8.869,10.994 8.905,10.958 L15.458,4.661 C15.594,4.53 15.598,4.313 15.467,4.176 C15.354,4.059 15.174,4.037 15.036,4.125 L6.104,9.795 C5.575,10.131 4.922,10.207 4.329,10.002 L0.577,8.704 C0.13,8.55 -0.107,8.061 0.047,7.614 C0.131,7.374 0.316,7.182 0.554,7.092 Z"></path></g></svg>Download Telegram
+          </a>
+          <div class="tgme_footer">
+            <div class="tgme_footer_column">
+              <h5><a href="//telegram.org/faq">About</a></h5>
+            </div>
+            <div class="tgme_footer_column">
+              <h5><a href="//telegram.org/blog">Blog</a></h5>
+            </div>
+            <div class="tgme_footer_column">
+              <h5><a href="//telegram.org/apps">Apps</a></h5>
+            </div>
+            <div class="tgme_footer_column">
+              <h5><a href="//core.telegram.org/">Platform</a></h5>
+            </div>
+          </div>
+        </div>
+      </section>
+    </div>
+    <div class="tgme_header_info">
+      <a class="tgme_channel_join_telegram" href="//telegram.org/dl?tme=6bb07fb3e29672965f_5621530157539347226">
+        <svg class="tgme_channel_join_telegram_icon" width="19px" height="16px" viewBox="0 0 19 16"><g fill="none"><path fill="#ffffff" d="M0.465,6.638 L17.511,0.073 C18.078,-0.145 18.714,0.137 18.932,0.704 C19.009,0.903 19.026,1.121 18.981,1.33 L16.042,15.001 C15.896,15.679 15.228,16.111 14.549,15.965 C14.375,15.928 14.211,15.854 14.068,15.748 L8.223,11.443 C7.874,11.185 7.799,10.694 8.057,10.345 C8.082,10.311 8.109,10.279 8.139,10.249 L14.191,4.322 C14.315,4.201 14.317,4.002 14.195,3.878 C14.091,3.771 13.926,3.753 13.8,3.834 L5.602,9.138 C5.112,9.456 4.502,9.528 3.952,9.333 L0.486,8.112 C0.077,7.967 -0.138,7.519 0.007,7.11 C0.083,6.893 0.25,6.721 0.465,6.638 Z"></path></g></svg>Join
+      </a>
+      <a class="tgme_header_link" href="https://t.me/TWAPx">
+        <i class="tgme_page_photo_image bgcolor1" data-content="Tс"><img src="https://cdn4.telesco.pe/file/CbMqT_zwWzSJSQQl52b0WJD-TMuVoDSZJdSOZZVkjbcA8P0zwWXQY0GzeADVJaxZOEkvsJyXVr4dW5PhdBYTmCkU1FLtIt5tdrcQN9AVOK3VLPguVH-6O9I_P8EWQ7AOiRelKQENRKyE59ZVLocT_p3v-X7Lli_D_usBxpPxcOJ3O-2iCdz4r0y7RS-ytc0nWS01duD5wHaVfbo0RyOJCZxroL8cgURSMch73HYIOJrjat3ec07X0qQaUZzRFFwfgT6FbpIrvzDw2vE215gm33KLJz_9r_uZUcBxWkmZCDYNf3ADISWSHoQ-80mVXQgEsMZHu0AtykV_8LgOIYH4dw.jpg"></i>
+        <div class="tgme_header_title_wrap">
+          <div class="tgme_header_title"><span dir="auto">TWAPs | Hyper | первый парсер в СНГ,остальные доходяги решили просто спиздить.</span></div>
+          <div class="tgme_header_labels"></div>
+        </div>
+        <div class="tgme_header_counter">1.53K subscribers</div>
+      </a>
+    </div>
+  </div>
+</header>
+<main class="tgme_main" data-url="/TWAPx">
+  <div class="tgme_container">
+    <section class="tgme_channel_history js-message_history">
+      <div class="tgme_widget_message_centered js-messages_more_wrap"><a href="/s/TWAPx?before=44717" class="tme_messages_more js-messages_more" data-before="44717"></a></div><div class="tgme_widget_message_wrap js-widget_message_wrap"><div class="tgme_widget_message text_not_supported_wrap js-widget_message" data-post="TWAPx/44717" data-view="eyJjIjotMzY2MzE3MDc4NSwicCI6NDQ3MTcsInQiOjE3ODg4ODEyNjAsImgiOiI1ODYwYTJjOWM2M2M0NGZkZGEifQ">
+  <div class="tgme_widget_message_user"><a href="https://t.me/TWAPx"><i class="tgme_widget_message_user_photo bgcolor1" data-content="T"><img src="https://cdn4.telesco.pe/file/CbMqT_zwWzSJSQQl52b0WJD-TMuVoDSZJdSOZZVkjbcA8P0zwWXQY0GzeADVJaxZOEkvsJyXVr4dW5PhdBYTmCkU1FLtIt5tdrcQN9AVOK3VLPguVH-6O9I_P8EWQ7AOiRelKQENRKyE59ZVLocT_p3v-X7Lli_D_usBxpPxcOJ3O-2iCdz4r0y7RS-ytc0nWS01duD5wHaVfbo0RyOJCZxroL8cgURSMch73HYIOJrjat3ec07X0qQaUZzRFFwfgT6FbpIrvzDw2vE215gm33KLJz_9r_uZUcBxWkmZCDYNf3ADISWSHoQ-80mVXQgEsMZHu0AtykV_8LgOIYH4dw.jpg"></i></a></div>
+  <div class="tgme_widget_message_bubble">
+    
+        <i class="tgme_widget_message_bubble_tail">
+      <svg class="bubble_icon" width="9px" height="20px" viewBox="0 0 9 20">
+        <g fill="none">
+          <path class="background" fill="#ffffff" d="M8,1 L9,1 L9,20 L8,20 L8,18 C7.807,15.161 7.124,12.233 5.950,9.218 C5.046,6.893 3.504,4.733 1.325,2.738 L1.325,2.738 C0.917,2.365 0.89,1.732 1.263,1.325 C1.452,1.118 1.72,1 2,1 L8,1 Z"></path>
+          <path class="border_1x" fill="#d7e3ec" d="M9,1 L2,1 C1.72,1 1.452,1.118 1.263,1.325 C0.89,1.732 0.917,2.365 1.325,2.738 C3.504,4.733 5.046,6.893 5.95,9.218 C7.124,12.233 7.807,15.161 8,18 L8,20 L9,20 L9,1 Z M2,0 L9,0 L9,20 L7,20 L7,20 L7.002,18.068 C6.816,15.333 6.156,12.504 5.018,9.58 C4.172,7.406 2.72,5.371 0.649,3.475 C-0.165,2.729 -0.221,1.464 0.525,0.649 C0.904,0.236 1.439,0 2,0 Z"></path>
+          <path class="border_2x" d="M9,1 L2,1 C1.72,1 1.452,1.118 1.263,1.325 C0.89,1.732 0.917,2.365 1.325,2.738 C3.504,4.733 5.046,6.893 5.95,9.218 C7.124,12.233 7.807,15.161 8,18 L8,20 L9,20 L9,1 Z M2,0.5 L9,0.5 L9,20 L7.5,20 L7.5,20 L7.501,18.034 C7.312,15.247 6.64,12.369 5.484,9.399 C4.609,7.15 3.112,5.052 0.987,3.106 C0.376,2.547 0.334,1.598 0.894,0.987 C1.178,0.677 1.579,0.5 2,0.5 Z"></path>
+          <path class="border_3x" d="M9,1 L2,1 C1.72,1 1.452,1.118 1.263,1.325 C0.89,1.732 0.917,2.365 1.325,2.738 C3.504,4.733 5.046,6.893 5.95,9.218 C7.124,12.233 7.807,15.161 8,18 L8,20 L9,20 L9,1 Z M2,0.667 L9,0.667 L9,20 L7.667,20 L7.667,20 L7.668,18.023 C7.477,15.218 6.802,12.324 5.64,9.338 C4.755,7.064 3.243,4.946 1.1,2.983 C0.557,2.486 0.52,1.643 1.017,1.1 C1.269,0.824 1.626,0.667 2,0.667 Z"></path>
+        </g>
+      </svg>
+    </i>
+    <div class="tgme_widget_message_author accent_color"><a class="tgme_widget_message_owner_name" href="https://t.me/TWAPx"><span dir="auto">TWAPs | Hyper | первый парсер в СНГ,остальные доходяги решили просто спиздить.</span></a></div>
+
+
+<div class="tgme_widget_message_text js-message_text" dir="auto"><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F9FA9.png')"><b>🟩</b></i> <b>&#036;1.01M покупка </b><a href="https://www.mexc.com/ru-RU/futures/NEAR_USDT" target="_blank" rel="noopener" onclick="return confirm('Open this link?\n\n'+this.href);"><b>NEAR</b></a><b> в течении 15 минут</b><br/><br/>Цена: &#036;2.36<br/>Объем: &#036;37.12M (2.71%)<br/>Субъект: <code>0xbf732ea04197942783e34730ed6e0f6099575d58</code><br/><a href="?q=%236099575d58">#6099575d58</a><br/><br/>Создан в: 15:01:06 (UTC)</div>
+<div class="tgme_widget_message_footer compact js-message_footer">
+  
+  <div class="tgme_widget_message_info short js-message_info">
+    <span class="tgme_widget_message_views">15</span><span class="copyonly"> views</span><span class="tgme_widget_message_meta"><a class="tgme_widget_message_date" href="https://t.me/TWAPx/44717"><time datetime="2026-09-08T15:01:26+00:00" class="time">15:01</time></a></span>
+  </div>
+</div>
+  </div>
+  <div class="tgme_widget_message_inline_keyboard"><div class="tgme_widget_message_inline_row"><a class="tgme_widget_message_inline_button url_button" href="https://app.hyperliquid.xyz/explorer/tx/0xed904a01b058e338ef0a0443f634eb02064e00e74b5c020a9158f5546f5cbd23" target="_blank" rel="noopener" onclick="return confirm('Open this link?\n\n'+this.href);"><span class="tgme_widget_message_inline_button_text" dir="auto"><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F9497.png')"><b>🔗</b></i> Explorer</span></a><a class="tgme_widget_message_inline_button url_button" href="https://hypurrscan.io/address/0xbf732ea04197942783e34730ed6e0f6099575d58" target="_blank" rel="noopener" onclick="return confirm('Open this link?\n\n'+this.href);"><span class="tgme_widget_message_inline_button_text" dir="auto"><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F91A4.png')"><b>👤</b></i> Hypurrscan</span></a></div></div>
+</div></div><div class="tgme_widget_message_wrap js-widget_message_wrap"><div class="tgme_widget_message text_not_supported_wrap js-widget_message" data-post="TWAPx/44718" data-view="eyJjIjotMzY2MzE3MDc4NSwicCI6NDQ3MTgsInQiOjE3ODg4ODEyNjAsImgiOiI4NzYwNWU1YWM1NjkxYWMwMWQifQ">
+  <div class="tgme_widget_message_user"><a href="https://t.me/TWAPx"><i class="tgme_widget_message_user_photo bgcolor1" data-content="T"><img src="https://cdn4.telesco.pe/file/CbMqT_zwWzSJSQQl52b0WJD-TMuVoDSZJdSOZZVkjbcA8P0zwWXQY0GzeADVJaxZOEkvsJyXVr4dW5PhdBYTmCkU1FLtIt5tdrcQN9AVOK3VLPguVH-6O9I_P8EWQ7AOiRelKQENRKyE59ZVLocT_p3v-X7Lli_D_usBxpPxcOJ3O-2iCdz4r0y7RS-ytc0nWS01duD5wHaVfbo0RyOJCZxroL8cgURSMch73HYIOJrjat3ec07X0qQaUZzRFFwfgT6FbpIrvzDw2vE215gm33KLJz_9r_uZUcBxWkmZCDYNf3ADISWSHoQ-80mVXQgEsMZHu0AtykV_8LgOIYH4dw.jpg"></i></a></div>
+  <div class="tgme_widget_message_bubble">
+    
+        <i class="tgme_widget_message_bubble_tail">
+      <svg class="bubble_icon" width="9px" height="20px" viewBox="0 0 9 20">
+        <g fill="none">
+          <path class="background" fill="#ffffff" d="M8,1 L9,1 L9,20 L8,20 L8,18 C7.807,15.161 7.124,12.233 5.950,9.218 C5.046,6.893 3.504,4.733 1.325,2.738 L1.325,2.738 C0.917,2.365 0.89,1.732 1.263,1.325 C1.452,1.118 1.72,1 2,1 L8,1 Z"></path>
+          <path class="border_1x" fill="#d7e3ec" d="M9,1 L2,1 C1.72,1 1.452,1.118 1.263,1.325 C0.89,1.732 0.917,2.365 1.325,2.738 C3.504,4.733 5.046,6.893 5.95,9.218 C7.124,12.233 7.807,15.161 8,18 L8,20 L9,20 L9,1 Z M2,0 L9,0 L9,20 L7,20 L7,20 L7.002,18.068 C6.816,15.333 6.156,12.504 5.018,9.58 C4.172,7.406 2.72,5.371 0.649,3.475 C-0.165,2.729 -0.221,1.464 0.525,0.649 C0.904,0.236 1.439,0 2,0 Z"></path>
+          <path class="border_2x" d="M9,1 L2,1 C1.72,1 1.452,1.118 1.263,1.325 C0.89,1.732 0.917,2.365 1.325,2.738 C3.504,4.733 5.046,6.893 5.95,9.218 C7.124,12.233 7.807,15.161 8,18 L8,20 L9,20 L9,1 Z M2,0.5 L9,0.5 L9,20 L7.5,20 L7.5,20 L7.501,18.034 C7.312,15.247 6.64,12.369 5.484,9.399 C4.609,7.15 3.112,5.052 0.987,3.106 C0.376,2.547 0.334,1.598 0.894,0.987 C1.178,0.677 1.579,0.5 2,0.5 Z"></path>
+          <path class="border_3x" d="M9,1 L2,1 C1.72,1 1.452,1.118 1.263,1.325 C0.89,1.732 0.917,2.365 1.325,2.738 C3.504,4.733 5.046,6.893 5.95,9.218 C7.124,12.233 7.807,15.161 8,18 L8,20 L9,20 L9,1 Z M2,0.667 L9,0.667 L9,20 L7.667,20 L7.667,20 L7.668,18.023 C7.477,15.218 6.802,12.324 5.64,9.338 C4.755,7.064 3.243,4.946 1.1,2.983 C0.557,2.486 0.52,1.643 1.017,1.1 C1.269,0.824 1.626,0.667 2,0.667 Z"></path>
+        </g>
+      </svg>
+    </i>
+    <div class="tgme_widget_message_author accent_color"><a class="tgme_widget_message_owner_name" href="https://t.me/TWAPx"><span dir="auto">TWAPs | Hyper | первый парсер в СНГ,остальные доходяги решили просто спиздить.</span></a></div>
+
+
+<div class="tgme_widget_message_text js-message_text" dir="auto"><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F9FA9.png')"><b>🟩</b></i> <b>&#036;300.03K покупка </b><a href="https://www.mexc.com/ru-RU/futures/PONS_USDT" target="_blank" rel="noopener" onclick="return confirm('Open this link?\n\n'+this.href);"><b>PONS</b></a><b> в течении 10.5 часа</b><br/><br/>Цена: &#036;0.752375<br/>Объем: &#036;115.90M (0.26%)<br/>Субъект: <code>0x72774e2fe1992d5da8c6e9cef73fd2ab980c0b98</code><br/><a href="?q=%23ab980c0b98">#ab980c0b98</a><br/><br/>Создан в: 15:01:09 (UTC)</div>
+<div class="tgme_widget_message_footer compact js-message_footer">
+  
+  <div class="tgme_widget_message_info short js-message_info">
+    <span class="tgme_widget_message_views">15</span><span class="copyonly"> views</span><span class="tgme_widget_message_meta"><a class="tgme_widget_message_date" href="https://t.me/TWAPx/44718"><time datetime="2026-09-08T15:01:47+00:00" class="time">15:01</time></a></span>
+  </div>
+</div>
+  </div>
+  <div class="tgme_widget_message_inline_keyboard"><div class="tgme_widget_message_inline_row"><a class="tgme_widget_message_inline_button url_button" href="https://app.hyperliquid.xyz/explorer/tx/0x69af1a76de1a86746b280443f635170203ae005c791da5460d77c5c99d1e605f" target="_blank" rel="noopener" onclick="return confirm('Open this link?\n\n'+this.href);"><span class="tgme_widget_message_inline_button_text" dir="auto"><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F9497.png')"><b>🔗</b></i> Explorer</span></a><a class="tgme_widget_message_inline_button url_button" href="https://hypurrscan.io/address/0x72774e2fe1992d5da8c6e9cef73fd2ab980c0b98" target="_blank" rel="noopener" onclick="return confirm('Open this link?\n\n'+this.href);"><span class="tgme_widget_message_inline_button_text" dir="auto"><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F91A4.png')"><b>👤</b></i> Hypurrscan</span></a></div></div>
+</div></div><div class="tgme_widget_message_wrap js-widget_message_wrap"><div class="tgme_widget_message text_not_supported_wrap js-widget_message" data-post="TWAPx/44719" data-view="eyJjIjotMzY2MzE3MDc4NSwicCI6NDQ3MTksInQiOjE3ODg4ODEyNjAsImgiOiIwZTgxOTBlZDhlYWFkMTE5YTIifQ">
+  <div class="tgme_widget_message_user"><a href="https://t.me/TWAPx"><i class="tgme_widget_message_user_photo bgcolor1" data-content="T"><img src="https://cdn4.telesco.pe/file/CbMqT_zwWzSJSQQl52b0WJD-TMuVoDSZJdSOZZVkjbcA8P0zwWXQY0GzeADVJaxZOEkvsJyXVr4dW5PhdBYTmCkU1FLtIt5tdrcQN9AVOK3VLPguVH-6O9I_P8EWQ7AOiRelKQENRKyE59ZVLocT_p3v-X7Lli_D_usBxpPxcOJ3O-2iCdz4r0y7RS-ytc0nWS01duD5wHaVfbo0RyOJCZxroL8cgURSMch73HYIOJrjat3ec07X0qQaUZzRFFwfgT6FbpIrvzDw2vE215gm33KLJz_9r_uZUcBxWkmZCDYNf3ADISWSHoQ-80mVXQgEsMZHu0AtykV_8LgOIYH4dw.jpg"></i></a></div>
+  <div class="tgme_widget_message_bubble">
+    
+        <i class="tgme_widget_message_bubble_tail">
+      <svg class="bubble_icon" width="9px" height="20px" viewBox="0 0 9 20">
+        <g fill="none">
+          <path class="background" fill="#ffffff" d="M8,1 L9,1 L9,20 L8,20 L8,18 C7.807,15.161 7.124,12.233 5.950,9.218 C5.046,6.893 3.504,4.733 1.325,2.738 L1.325,2.738 C0.917,2.365 0.89,1.732 1.263,1.325 C1.452,1.118 1.72,1 2,1 L8,1 Z"></path>
+          <path class="border_1x" fill="#d7e3ec" d="M9,1 L2,1 C1.72,1 1.452,1.118 1.263,1.325 C0.89,1.732 0.917,2.365 1.325,2.738 C3.504,4.733 5.046,6.893 5.95,9.218 C7.124,12.233 7.807,15.161 8,18 L8,20 L9,20 L9,1 Z M2,0 L9,0 L9,20 L7,20 L7,20 L7.002,18.068 C6.816,15.333 6.156,12.504 5.018,9.58 C4.172,7.406 2.72,5.371 0.649,3.475 C-0.165,2.729 -0.221,1.464 0.525,0.649 C0.904,0.236 1.439,0 2,0 Z"></path>
+          <path class="border_2x" d="M9,1 L2,1 C1.72,1 1.452,1.118 1.263,1.325 C0.89,1.732 0.917,2.365 1.325,2.738 C3.504,4.733 5.046,6.893 5.95,9.218 C7.124,12.233 7.807,15.161 8,18 L8,20 L9,20 L9,1 Z M2,0.5 L9,0.5 L9,20 L7.5,20 L7.5,20 L7.501,18.034 C7.312,15.247 6.64,12.369 5.484,9.399 C4.609,7.15 3.112,5.052 0.987,3.106 C0.376,2.547 0.334,1.598 0.894,0.987 C1.178,0.677 1.579,0.5 2,0.5 Z"></path>
+          <path class="border_3x" d="M9,1 L2,1 C1.72,1 1.452,1.118 1.263,1.325 C0.89,1.732 0.917,2.365 1.325,2.738 C3.504,4.733 5.046,6.893 5.95,9.218 C7.124,12.233 7.807,15.161 8,18 L8,20 L9,20 L9,1 Z M2,0.667 L9,0.667 L9,20 L7.667,20 L7.667,20 L7.668,18.023 C7.477,15.218 6.802,12.324 5.64,9.338 C4.755,7.064 3.243,4.946 1.1,2.983 C0.557,2.486 0.52,1.643 1.017,1.1 C1.269,0.824 1.626,0.667 2,0.667 Z"></path>
+        </g>
+      </svg>
+    </i>
+    <div class="tgme_widget_message_author accent_color"><a class="tgme_widget_message_owner_name" href="https://t.me/TWAPx"><span dir="auto">TWAPs | Hyper | первый парсер в СНГ,остальные доходяги решили просто спиздить.</span></a></div>
+
+
+<div class="tgme_widget_message_text js-message_text" dir="auto"><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F9FA9.png')"><b>🟩</b></i> <b>&#036;176.78K покупка </b><a href="https://www.mexc.com/ru-RU/futures/ZEC_USDT" target="_blank" rel="noopener" onclick="return confirm('Open this link?\n\n'+this.href);"><b>ZEC</b></a><b> в течении 24 часов</b><br/><br/>Цена: &#036;1,178.55<br/>Объем: &#036;326.36M (0.05%)<br/>Субъект: <code>0xa41f6abca0cb06a105f12a682e1995efa0c1d50a</code><br/><a href="?q=%23efa0c1d50a">#efa0c1d50a</a><br/><br/>Создан в: 15:02:58 (UTC)</div>
+<div class="tgme_widget_message_footer compact js-message_footer">
+  
+  <div class="tgme_widget_message_info short js-message_info">
+    <span class="tgme_widget_message_views">15</span><span class="copyonly"> views</span><span class="tgme_widget_message_meta"><a class="tgme_widget_message_date" href="https://t.me/TWAPx/44719"><time datetime="2026-09-08T15:03:11+00:00" class="time">15:03</time></a></span>
+  </div>
+</div>
+  </div>
+  <div class="tgme_widget_message_inline_keyboard"><div class="tgme_widget_message_inline_row"><a class="tgme_widget_message_inline_button url_button" href="https://app.hyperliquid.xyz/explorer/tx/0x3169cf1bd438feb732e30443f63b1202023900016f3c1d89d5327a6e933cd8a1" target="_blank" rel="noopener" onclick="return confirm('Open this link?\n\n'+this.href);"><span class="tgme_widget_message_inline_button_text" dir="auto"><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F9497.png')"><b>🔗</b></i> Explorer</span></a><a class="tgme_widget_message_inline_button url_button" href="https://hypurrscan.io/address/0xa41f6abca0cb06a105f12a682e1995efa0c1d50a" target="_blank" rel="noopener" onclick="return confirm('Open this link?\n\n'+this.href);"><span class="tgme_widget_message_inline_button_text" dir="auto"><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F91A4.png')"><b>👤</b></i> Hypurrscan</span></a></div></div>
+</div></div><div class="tgme_widget_message_wrap js-widget_message_wrap"><div class="tgme_widget_message text_not_supported_wrap js-widget_message" data-post="TWAPx/44720" data-view="eyJjIjotMzY2MzE3MDc4NSwicCI6NDQ3MjAsInQiOjE3ODg4ODEyNjAsImgiOiI5ZTZmZTBiYjM3ZWM2YWQ2OWYifQ">
+  <div class="tgme_widget_message_user"><a href="https://t.me/TWAPx"><i class="tgme_widget_message_user_photo bgcolor1" data-content="T"><img src="https://cdn4.telesco.pe/file/CbMqT_zwWzSJSQQl52b0WJD-TMuVoDSZJdSOZZVkjbcA8P0zwWXQY0GzeADVJaxZOEkvsJyXVr4dW5PhdBYTmCkU1FLtIt5tdrcQN9AVOK3VLPguVH-6O9I_P8EWQ7AOiRelKQENRKyE59ZVLocT_p3v-X7Lli_D_usBxpPxcOJ3O-2iCdz4r0y7RS-ytc0nWS01duD5wHaVfbo0RyOJCZxroL8cgURSMch73HYIOJrjat3ec07X0qQaUZzRFFwfgT6FbpIrvzDw2vE215gm33KLJz_9r_uZUcBxWkmZCDYNf3ADISWSHoQ-80mVXQgEsMZHu0AtykV_8LgOIYH4dw.jpg"></i></a></div>
+  <div class="tgme_widget_message_bubble">
+    
+        <i class="tgme_widget_message_bubble_tail">
+      <svg class="bubble_icon" width="9px" height="20px" viewBox="0 0 9 20">
+        <g fill="none">
+          <path class="background" fill="#ffffff" d="M8,1 L9,1 L9,20 L8,20 L8,18 C7.807,15.161 7.124,12.233 5.950,9.218 C5.046,6.893 3.504,4.733 1.325,2.738 L1.325,2.738 C0.917,2.365 0.89,1.732 1.263,1.325 C1.452,1.118 1.72,1 2,1 L8,1 Z"></path>
+          <path class="border_1x" fill="#d7e3ec" d="M9,1 L2,1 C1.72,1 1.452,1.118 1.263,1.325 C0.89,1.732 0.917,2.365 1.325,2.738 C3.504,4.733 5.046,6.893 5.95,9.218 C7.124,12.233 7.807,15.161 8,18 L8,20 L9,20 L9,1 Z M2,0 L9,0 L9,20 L7,20 L7,20 L7.002,18.068 C6.816,15.333 6.156,12.504 5.018,9.58 C4.172,7.406 2.72,5.371 0.649,3.475 C-0.165,2.729 -0.221,1.464 0.525,0.649 C0.904,0.236 1.439,0 2,0 Z"></path>
+          <path class="border_2x" d="M9,1 L2,1 C1.72,1 1.452,1.118 1.263,1.325 C0.89,1.732 0.917,2.365 1.325,2.738 C3.504,4.733 5.046,6.893 5.95,9.218 C7.124,12.233 7.807,15.161 8,18 L8,20 L9,20 L9,1 Z M2,0.5 L9,0.5 L9,20 L7.5,20 L7.5,20 L7.501,18.034 C7.312,15.247 6.64,12.369 5.484,9.399 C4.609,7.15 3.112,5.052 0.987,3.106 C0.376,2.547 0.334,1.598 0.894,0.987 C1.178,0.677 1.579,0.5 2,0.5 Z"></path>
+          <path class="border_3x" d="M9,1 L2,1 C1.72,1 1.452,1.118 1.263,1.325 C0.89,1.732 0.917,2.365 1.325,2.738 C3.504,4.733 5.046,6.893 5.95,9.218 C7.124,12.233 7.807,15.161 8,18 L8,20 L9,20 L9,1 Z M2,0.667 L9,0.667 L9,20 L7.667,20 L7.667,20 L7.668,18.023 C7.477,15.218 6.802,12.324 5.64,9.338 C4.755,7.064 3.243,4.946 1.1,2.983 C0.557,2.486 0.52,1.643 1.017,1.1 C1.269,0.824 1.626,0.667 2,0.667 Z"></path>
+        </g>
+      </svg>
+    </i>
+    <div class="tgme_widget_message_author accent_color"><a class="tgme_widget_message_owner_name" href="https://t.me/TWAPx"><span dir="auto">TWAPs | Hyper | первый парсер в СНГ,остальные доходяги решили просто спиздить.</span></a></div>
+
+
+<div class="tgme_widget_message_text js-message_text" dir="auto"><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F9FA9.png')"><b>🟩</b></i> <b>&#036;125.06K покупка </b><a href="https://www.mexc.com/ru-RU/futures/TAO_USDT" target="_blank" rel="noopener" onclick="return confirm('Open this link?\n\n'+this.href);"><b>TAO</b></a><b> в течении 5 минут</b><br/><br/>Цена: &#036;258.27<br/>Объем: &#036;33.05M (0.38%)<br/>Субъект: <code>0x94b60c2a5db13689bb06a73657ac1216424de5b3</code><br/><a href="?q=%2316424de5b3">#16424de5b3</a><br/><br/>Создан в: 15:03:41 (UTC)</div>
+<div class="tgme_widget_message_footer compact js-message_footer">
+  
+  <div class="tgme_widget_message_info short js-message_info">
+    <span class="tgme_widget_message_views">15</span><span class="copyonly"> views</span><span class="tgme_widget_message_meta"><a class="tgme_widget_message_date" href="https://t.me/TWAPx/44720"><time datetime="2026-09-08T15:03:57+00:00" class="time">15:03</time></a></span>
+  </div>
+</div>
+  </div>
+  <div class="tgme_widget_message_inline_keyboard"><div class="tgme_widget_message_inline_row"><a class="tgme_widget_message_inline_button url_button" href="https://app.hyperliquid.xyz/explorer/tx/0x5d31bc66989685ae5eab0443f63d5302036a004c3399a48000fa67b9579a5f99" target="_blank" rel="noopener" onclick="return confirm('Open this link?\n\n'+this.href);"><span class="tgme_widget_message_inline_button_text" dir="auto"><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F9497.png')"><b>🔗</b></i> Explorer</span></a><a class="tgme_widget_message_inline_button url_button" href="https://hypurrscan.io/address/0x94b60c2a5db13689bb06a73657ac1216424de5b3" target="_blank" rel="noopener" onclick="return confirm('Open this link?\n\n'+this.href);"><span class="tgme_widget_message_inline_button_text" dir="auto"><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F91A4.png')"><b>👤</b></i> Hypurrscan</span></a></div></div>
+</div></div><div class="tgme_widget_message_wrap js-widget_message_wrap"><div class="tgme_widget_message text_not_supported_wrap js-widget_message" data-post="TWAPx/44721" data-view="eyJjIjotMzY2MzE3MDc4NSwicCI6NDQ3MjEsInQiOjE3ODg4ODEyNjAsImgiOiI3MGY3MDE2ZmU0NjM5MGY4ZmQifQ">
+  <div class="tgme_widget_message_user"><a href="https://t.me/TWAPx"><i class="tgme_widget_message_user_photo bgcolor1" data-content="T"><img src="https://cdn4.telesco.pe/file/CbMqT_zwWzSJSQQl52b0WJD-TMuVoDSZJdSOZZVkjbcA8P0zwWXQY0GzeADVJaxZOEkvsJyXVr4dW5PhdBYTmCkU1FLtIt5tdrcQN9AVOK3VLPguVH-6O9I_P8EWQ7AOiRelKQENRKyE59ZVLocT_p3v-X7Lli_D_usBxpPxcOJ3O-2iCdz4r0y7RS-ytc0nWS01duD5wHaVfbo0RyOJCZxroL8cgURSMch73HYIOJrjat3ec07X0qQaUZzRFFwfgT6FbpIrvzDw2vE215gm33KLJz_9r_uZUcBxWkmZCDYNf3ADISWSHoQ-80mVXQgEsMZHu0AtykV_8LgOIYH4dw.jpg"></i></a></div>
+  <div class="tgme_widget_message_bubble">
+    
+        <i class="tgme_widget_message_bubble_tail">
+      <svg class="bubble_icon" width="9px" height="20px" viewBox="0 0 9 20">
+        <g fill="none">
+          <path class="background" fill="#ffffff" d="M8,1 L9,1 L9,20 L8,20 L8,18 C7.807,15.161 7.124,12.233 5.950,9.218 C5.046,6.893 3.504,4.733 1.325,2.738 L1.325,2.738 C0.917,2.365 0.89,1.732 1.263,1.325 C1.452,1.118 1.72,1 2,1 L8,1 Z"></path>
+          <path class="border_1x" fill="#d7e3ec" d="M9,1 L2,1 C1.72,1 1.452,1.118 1.263,1.325 C0.89,1.732 0.917,2.365 1.325,2.738 C3.504,4.733 5.046,6.893 5.95,9.218 C7.124,12.233 7.807,15.161 8,18 L8,20 L9,20 L9,1 Z M2,0 L9,0 L9,20 L7,20 L7,20 L7.002,18.068 C6.816,15.333 6.156,12.504 5.018,9.58 C4.172,7.406 2.72,5.371 0.649,3.475 C-0.165,2.729 -0.221,1.464 0.525,0.649 C0.904,0.236 1.439,0 2,0 Z"></path>
+          <path class="border_2x" d="M9,1 L2,1 C1.72,1 1.452,1.118 1.263,1.325 C0.89,1.732 0.917,2.365 1.325,2.738 C3.504,4.733 5.046,6.893 5.95,9.218 C7.124,12.233 7.807,15.161 8,18 L8,20 L9,20 L9,1 Z M2,0.5 L9,0.5 L9,20 L7.5,20 L7.5,20 L7.501,18.034 C7.312,15.247 6.64,12.369 5.484,9.399 C4.609,7.15 3.112,5.052 0.987,3.106 C0.376,2.547 0.334,1.598 0.894,0.987 C1.178,0.677 1.579,0.5 2,0.5 Z"></path>
+          <path class="border_3x" d="M9,1 L2,1 C1.72,1 1.452,1.118 1.263,1.325 C0.89,1.732 0.917,2.365 1.325,2.738 C3.504,4.733 5.046,6.893 5.95,9.218 C7.124,12.233 7.807,15.161 8,18 L8,20 L9,20 L9,1 Z M2,0.667 L9,0.667 L9,20 L7.667,20 L7.667,20 L7.668,18.023 C7.477,15.218 6.802,12.324 5.64,9.338 C4.755,7.064 3.243,4.946 1.1,2.983 C0.557,2.486 0.52,1.643 1.017,1.1 C1.269,0.824 1.626,0.667 2,0.667 Z"></path>
+        </g>
+      </svg>
+    </i>
+    <div class="tgme_widget_message_author accent_color"><a class="tgme_widget_message_owner_name" href="https://t.me/TWAPx"><span dir="auto">TWAPs | Hyper | первый парсер в СНГ,остальные доходяги решили просто спиздить.</span></a></div>
+
+
+<div class="tgme_widget_message_text js-message_text" dir="auto"><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F9FA9.png')"><b>🟩</b></i> <b>&#036;1.37M покупка </b><a href="https://www.mexc.com/ru-RU/futures/HYPE_USDT" target="_blank" rel="noopener" onclick="return confirm('Open this link?\n\n'+this.href);"><b>HYPE</b></a><b> в течении 30 минут</b><br/><br/>Цена: &#036;83.83<br/>Объем: &#036;428.64M (0.32%)<br/>Субъект: <code>0xb75a08e82a1bf0fcceb89bbdaf9aae00be8ca29a</code><br/><a href="?q=%2300be8ca29a">#00be8ca29a</a><br/><br/>Создан в: 15:04:02 (UTC)</div>
+<div class="tgme_widget_message_footer compact js-message_footer">
+  
+  <div class="tgme_widget_message_info short js-message_info">
+    <span class="tgme_widget_message_views">16</span><span class="copyonly"> views</span><span class="tgme_widget_message_meta"><a class="tgme_widget_message_date" href="https://t.me/TWAPx/44721"><time datetime="2026-09-08T15:04:15+00:00" class="time">15:04</time></a></span>
+  </div>
+</div>
+  </div>
+  <div class="tgme_widget_message_inline_keyboard"><div class="tgme_widget_message_inline_row"><a class="tgme_widget_message_inline_button url_button" href="https://app.hyperliquid.xyz/explorer/tx/0xebc8b9b7881dc8aeed420443f63e8402116d009d2310e7808f91650a4711a299" target="_blank" rel="noopener" onclick="return confirm('Open this link?\n\n'+this.href);"><span class="tgme_widget_message_inline_button_text" dir="auto"><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F9497.png')"><b>🔗</b></i> Explorer</span></a><a class="tgme_widget_message_inline_button url_button" href="https://hypurrscan.io/address/0xb75a08e82a1bf0fcceb89bbdaf9aae00be8ca29a" target="_blank" rel="noopener" onclick="return confirm('Open this link?\n\n'+this.href);"><span class="tgme_widget_message_inline_button_text" dir="auto"><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F91A4.png')"><b>👤</b></i> Hypurrscan</span></a></div></div>
+</div></div><div class="tgme_widget_message_wrap js-widget_message_wrap"><div class="tgme_widget_message text_not_supported_wrap js-widget_message" data-post="TWAPx/44722" data-view="eyJjIjotMzY2MzE3MDc4NSwicCI6NDQ3MjIsInQiOjE3ODg4ODEyNjAsImgiOiI2OWM2ZjM2ZDFkZDU5YWRjMzUifQ">
+  <div class="tgme_widget_message_user"><a href="https://t.me/TWAPx"><i class="tgme_widget_message_user_photo bgcolor1" data-content="T"><img src="https://cdn4.telesco.pe/file/CbMqT_zwWzSJSQQl52b0WJD-TMuVoDSZJdSOZZVkjbcA8P0zwWXQY0GzeADVJaxZOEkvsJyXVr4dW5PhdBYTmCkU1FLtIt5tdrcQN9AVOK3VLPguVH-6O9I_P8EWQ7AOiRelKQENRKyE59ZVLocT_p3v-X7Lli_D_usBxpPxcOJ3O-2iCdz4r0y7RS-ytc0nWS01duD5wHaVfbo0RyOJCZxroL8cgURSMch73HYIOJrjat3ec07X0qQaUZzRFFwfgT6FbpIrvzDw2vE215gm33KLJz_9r_uZUcBxWkmZCDYNf3ADISWSHoQ-80mVXQgEsMZHu0AtykV_8LgOIYH4dw.jpg"></i></a></div>
+  <div class="tgme_widget_message_bubble">
+    
+        <i class="tgme_widget_message_bubble_tail">
+      <svg class="bubble_icon" width="9px" height="20px" viewBox="0 0 9 20">
+        <g fill="none">
+          <path class="background" fill="#ffffff" d="M8,1 L9,1 L9,20 L8,20 L8,18 C7.807,15.161 7.124,12.233 5.950,9.218 C5.046,6.893 3.504,4.733 1.325,2.738 L1.325,2.738 C0.917,2.365 0.89,1.732 1.263,1.325 C1.452,1.118 1.72,1 2,1 L8,1 Z"></path>
+          <path class="border_1x" fill="#d7e3ec" d="M9,1 L2,1 C1.72,1 1.452,1.118 1.263,1.325 C0.89,1.732 0.917,2.365 1.325,2.738 C3.504,4.733 5.046,6.893 5.95,9.218 C7.124,12.233 7.807,15.161 8,18 L8,20 L9,20 L9,1 Z M2,0 L9,0 L9,20 L7,20 L7,20 L7.002,18.068 C6.816,15.333 6.156,12.504 5.018,9.58 C4.172,7.406 2.72,5.371 0.649,3.475 C-0.165,2.729 -0.221,1.464 0.525,0.649 C0.904,0.236 1.439,0 2,0 Z"></path>
+          <path class="border_2x" d="M9,1 L2,1 C1.72,1 1.452,1.118 1.263,1.325 C0.89,1.732 0.917,2.365 1.325,2.738 C3.504,4.733 5.046,6.893 5.95,9.218 C7.124,12.233 7.807,15.161 8,18 L8,20 L9,20 L9,1 Z M2,0.5 L9,0.5 L9,20 L7.5,20 L7.5,20 L7.501,18.034 C7.312,15.247 6.64,12.369 5.484,9.399 C4.609,7.15 3.112,5.052 0.987,3.106 C0.376,2.547 0.334,1.598 0.894,0.987 C1.178,0.677 1.579,0.5 2,0.5 Z"></path>
+          <path class="border_3x" d="M9,1 L2,1 C1.72,1 1.452,1.118 1.263,1.325 C0.89,1.732 0.917,2.365 1.325,2.738 C3.504,4.733 5.046,6.893 5.95,9.218 C7.124,12.233 7.807,15.161 8,18 L8,20 L9,20 L9,1 Z M2,0.667 L9,0.667 L9,20 L7.667,20 L7.667,20 L7.668,18.023 C7.477,15.218 6.802,12.324 5.64,9.338 C4.755,7.064 3.243,4.946 1.1,2.983 C0.557,2.486 0.52,1.643 1.017,1.1 C1.269,0.824 1.626,0.667 2,0.667 Z"></path>
+        </g>
+      </svg>
+    </i>
+    <div class="tgme_widget_message_author accent_color"><a class="tgme_widget_message_owner_name" href="https://t.me/TWAPx"><span dir="auto">TWAPs | Hyper | первый парсер в СНГ,остальные доходяги решили просто спиздить.</span></a></div>
+
+<a class="tgme_widget_message_reply user-color-default" href="https://t.me/TWAPx/44628" ">
+<div class="tgme_widget_message_author accent_color">
+  <span class="tgme_widget_message_author_name" dir="auto">TWAPs | Hyper | первый парсер в СНГ,остальные доходяги решили просто спиздить.</span>
+</div>
+<div class="tgme_widget_message_text js-message_reply_text" dir="auto"><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F9FA9.png')"><b>🟩</b></i> &#036;331.32K покупка ARB в течении 3.5 часа  Цена: &#036;0.173400 Объем: &#036;34.97M (0.95%) Субъект: 0x3bcae23e8c380dab4732e9a159c0456f12d866f3 #6f12d866f3  Создан в: 11:35:05 (UTC)</div>
+</a>
+<div class="tgme_widget_message_text js-message_text" dir="auto"><b><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/E29C85.png')"><b>✅</b></i> TWAP завершён</b><br/>Статус: finished<br/>Исполнено: 100.00%<br/>Размер: 1910708.30 / 1910708.30 ARB<br/>TwapId: <code>2196818</code><br/>Субъект: <code>0x3bcae23e8c380dab4732e9a159c0456f12d866f3</code><br/><br/>Цена в начале:  &#036;0.173400<br/>Цена в конце: &#036;0.168450 <i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F94B4.png')"><b>🔴</b></i> (-2.85%)</div>
+<div class="tgme_widget_message_footer compact js-message_footer">
+  
+  <div class="tgme_widget_message_info short js-message_info">
+    <span class="tgme_widget_message_views">11</span><span class="copyonly"> views</span><span class="tgme_widget_message_meta"><a class="tgme_widget_message_date" href="https://t.me/TWAPx/44722"><time datetime="2026-09-08T15:07:20+00:00" class="time">15:07</time></a></span>
+  </div>
+</div>
+  </div>
+  <div class="tgme_widget_message_inline_keyboard"><div class="tgme_widget_message_inline_row"><a class="tgme_widget_message_inline_button url_button" href="https://app.hyperliquid.xyz/explorer/tx/0xc8e9f4bad71fb04bca630443f391840204dd00a07212cf1d6cb2a00d96138a36" target="_blank" rel="noopener" onclick="return confirm('Open this link?\n\n'+this.href);"><span class="tgme_widget_message_inline_button_text" dir="auto"><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F9497.png')"><b>🔗</b></i> Explorer</span></a><a class="tgme_widget_message_inline_button url_button" href="https://hypurrscan.io/address/0x3bcae23e8c380dab4732e9a159c0456f12d866f3" target="_blank" rel="noopener" onclick="return confirm('Open this link?\n\n'+this.href);"><span class="tgme_widget_message_inline_button_text" dir="auto"><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F91A4.png')"><b>👤</b></i> Hypurrscan</span></a></div></div>
+</div></div><div class="tgme_widget_message_wrap js-widget_message_wrap"><div class="tgme_widget_message text_not_supported_wrap js-widget_message" data-post="TWAPx/44723" data-view="eyJjIjotMzY2MzE3MDc4NSwicCI6NDQ3MjMsInQiOjE3ODg4ODEyNjAsImgiOiI1YjA4ODUyZGMyOGJjNTJmMWQifQ">
+  <div class="tgme_widget_message_user"><a href="https://t.me/TWAPx"><i class="tgme_widget_message_user_photo bgcolor1" data-content="T"><img src="https://cdn4.telesco.pe/file/CbMqT_zwWzSJSQQl52b0WJD-TMuVoDSZJdSOZZVkjbcA8P0zwWXQY0GzeADVJaxZOEkvsJyXVr4dW5PhdBYTmCkU1FLtIt5tdrcQN9AVOK3VLPguVH-6O9I_P8EWQ7AOiRelKQENRKyE59ZVLocT_p3v-X7Lli_D_usBxpPxcOJ3O-2iCdz4r0y7RS-ytc0nWS01duD5wHaVfbo0RyOJCZxroL8cgURSMch73HYIOJrjat3ec07X0qQaUZzRFFwfgT6FbpIrvzDw2vE215gm33KLJz_9r_uZUcBxWkmZCDYNf3ADISWSHoQ-80mVXQgEsMZHu0AtykV_8LgOIYH4dw.jpg"></i></a></div>
+  <div class="tgme_widget_message_bubble">
+    
+        <i class="tgme_widget_message_bubble_tail">
+      <svg class="bubble_icon" width="9px" height="20px" viewBox="0 0 9 20">
+        <g fill="none">
+          <path class="background" fill="#ffffff" d="M8,1 L9,1 L9,20 L8,20 L8,18 C7.807,15.161 7.124,12.233 5.950,9.218 C5.046,6.893 3.504,4.733 1.325,2.738 L1.325,2.738 C0.917,2.365 0.89,1.732 1.263,1.325 C1.452,1.118 1.72,1 2,1 L8,1 Z"></path>
+          <path class="border_1x" fill="#d7e3ec" d="M9,1 L2,1 C1.72,1 1.452,1.118 1.263,1.325 C0.89,1.732 0.917,2.365 1.325,2.738 C3.504,4.733 5.046,6.893 5.95,9.218 C7.124,12.233 7.807,15.161 8,18 L8,20 L9,20 L9,1 Z M2,0 L9,0 L9,20 L7,20 L7,20 L7.002,18.068 C6.816,15.333 6.156,12.504 5.018,9.58 C4.172,7.406 2.72,5.371 0.649,3.475 C-0.165,2.729 -0.221,1.464 0.525,0.649 C0.904,0.236 1.439,0 2,0 Z"></path>
+          <path class="border_2x" d="M9,1 L2,1 C1.72,1 1.452,1.118 1.263,1.325 C0.89,1.732 0.917,2.365 1.325,2.738 C3.504,4.733 5.046,6.893 5.95,9.218 C7.124,12.233 7.807,15.161 8,18 L8,20 L9,20 L9,1 Z M2,0.5 L9,0.5 L9,20 L7.5,20 L7.5,20 L7.501,18.034 C7.312,15.247 6.64,12.369 5.484,9.399 C4.609,7.15 3.112,5.052 0.987,3.106 C0.376,2.547 0.334,1.598 0.894,0.987 C1.178,0.677 1.579,0.5 2,0.5 Z"></path>
+          <path class="border_3x" d="M9,1 L2,1 C1.72,1 1.452,1.118 1.263,1.325 C0.89,1.732 0.917,2.365 1.325,2.738 C3.504,4.733 5.046,6.893 5.95,9.218 C7.124,12.233 7.807,15.161 8,18 L8,20 L9,20 L9,1 Z M2,0.667 L9,0.667 L9,20 L7.667,20 L7.667,20 L7.668,18.023 C7.477,15.218 6.802,12.324 5.64,9.338 C4.755,7.064 3.243,4.946 1.1,2.983 C0.557,2.486 0.52,1.643 1.017,1.1 C1.269,0.824 1.626,0.667 2,0.667 Z"></path>
+        </g>
+      </svg>
+    </i>
+    <div class="tgme_widget_message_author accent_color"><a class="tgme_widget_message_owner_name" href="https://t.me/TWAPx"><span dir="auto">TWAPs | Hyper | первый парсер в СНГ,остальные доходяги решили просто спиздить.</span></a></div>
+
+<a class="tgme_widget_message_reply user-color-default" href="https://t.me/TWAPx/44715" ">
+<div class="tgme_widget_message_author accent_color">
+  <span class="tgme_widget_message_author_name" dir="auto">TWAPs | Hyper | первый парсер в СНГ,остальные доходяги решили просто спиздить.</span>
+</div>
+<div class="tgme_widget_message_text js-message_reply_text" dir="auto"><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F9FA9.png')"><b>🟩</b></i> &#036;150.11K покупка NEAR в течении 5 минут  Цена: &#036;2.37 Объем: &#036;36.68M (0.41%) Субъект: 0x94b60c2a5db13689bb06a73657ac1216424de5b3 #16424de5b3  Создан в: 15:00:12 (UTC)</div>
+</a>
+<div class="tgme_widget_message_text js-message_text" dir="auto"><b><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/E29C85.png')"><b>✅</b></i> TWAP завершён</b><br/>Статус: finished<br/>Исполнено: 100.00%<br/>Размер: 63430.30 / 63430.30 NEAR<br/>TwapId: <code>2197443</code><br/>Субъект: <code>0x94b60c2a5db13689bb06a73657ac1216424de5b3</code><br/><br/>Цена в начале:  &#036;2.37<br/>Цена в конце: &#036;2.39 <i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F9FA2.png')"><b>🟢</b></i> (+1.17%)</div>
+<div class="tgme_widget_message_footer compact js-message_footer">
+  
+  <div class="tgme_widget_message_info short js-message_info">
+    <span class="tgme_widget_message_views">11</span><span class="copyonly"> views</span><span class="tgme_widget_message_meta"><a class="tgme_widget_message_date" href="https://t.me/TWAPx/44723"><time datetime="2026-09-08T15:07:31+00:00" class="time">15:07</time></a></span>
+  </div>
+</div>
+  </div>
+  <div class="tgme_widget_message_inline_keyboard"><div class="tgme_widget_message_inline_row"><a class="tgme_widget_message_inline_button url_button" href="https://app.hyperliquid.xyz/explorer/tx/0xa8da787aedf8c041aa540443f63205020636006088fbdf134ca323cdacfc9a2c" target="_blank" rel="noopener" onclick="return confirm('Open this link?\n\n'+this.href);"><span class="tgme_widget_message_inline_button_text" dir="auto"><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F9497.png')"><b>🔗</b></i> Explorer</span></a><a class="tgme_widget_message_inline_button url_button" href="https://hypurrscan.io/address/0x94b60c2a5db13689bb06a73657ac1216424de5b3" target="_blank" rel="noopener" onclick="return confirm('Open this link?\n\n'+this.href);"><span class="tgme_widget_message_inline_button_text" dir="auto"><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F91A4.png')"><b>👤</b></i> Hypurrscan</span></a></div></div>
+</div></div><div class="tgme_widget_message_wrap js-widget_message_wrap"><div class="tgme_widget_message text_not_supported_wrap js-widget_message" data-post="TWAPx/44724" data-view="eyJjIjotMzY2MzE3MDc4NSwicCI6NDQ3MjQsInQiOjE3ODg4ODEyNjAsImgiOiI0MTM0MjJjZDUzZTVjNGIwMDgifQ">
+  <div class="tgme_widget_message_user"><a href="https://t.me/TWAPx"><i class="tgme_widget_message_user_photo bgcolor1" data-content="T"><img src="https://cdn4.telesco.pe/file/CbMqT_zwWzSJSQQl52b0WJD-TMuVoDSZJdSOZZVkjbcA8P0zwWXQY0GzeADVJaxZOEkvsJyXVr4dW5PhdBYTmCkU1FLtIt5tdrcQN9AVOK3VLPguVH-6O9I_P8EWQ7AOiRelKQENRKyE59ZVLocT_p3v-X7Lli_D_usBxpPxcOJ3O-2iCdz4r0y7RS-ytc0nWS01duD5wHaVfbo0RyOJCZxroL8cgURSMch73HYIOJrjat3ec07X0qQaUZzRFFwfgT6FbpIrvzDw2vE215gm33KLJz_9r_uZUcBxWkmZCDYNf3ADISWSHoQ-80mVXQgEsMZHu0AtykV_8LgOIYH4dw.jpg"></i></a></div>
+  <div class="tgme_widget_message_bubble">
+    
+        <i class="tgme_widget_message_bubble_tail">
+      <svg class="bubble_icon" width="9px" height="20px" viewBox="0 0 9 20">
+        <g fill="none">
+          <path class="background" fill="#ffffff" d="M8,1 L9,1 L9,20 L8,20 L8,18 C7.807,15.161 7.124,12.233 5.950,9.218 C5.046,6.893 3.504,4.733 1.325,2.738 L1.325,2.738 C0.917,2.365 0.89,1.732 1.263,1.325 C1.452,1.118 1.72,1 2,1 L8,1 Z"></path>
+          <path class="border_1x" fill="#d7e3ec" d="M9,1 L2,1 C1.72,1 1.452,1.118 1.263,1.325 C0.89,1.732 0.917,2.365 1.325,2.738 C3.504,4.733 5.046,6.893 5.95,9.218 C7.124,12.233 7.807,15.161 8,18 L8,20 L9,20 L9,1 Z M2,0 L9,0 L9,20 L7,20 L7,20 L7.002,18.068 C6.816,15.333 6.156,12.504 5.018,9.58 C4.172,7.406 2.72,5.371 0.649,3.475 C-0.165,2.729 -0.221,1.464 0.525,0.649 C0.904,0.236 1.439,0 2,0 Z"></path>
+          <path class="border_2x" d="M9,1 L2,1 C1.72,1 1.452,1.118 1.263,1.325 C0.89,1.732 0.917,2.365 1.325,2.738 C3.504,4.733 5.046,6.893 5.95,9.218 C7.124,12.233 7.807,15.161 8,18 L8,20 L9,20 L9,1 Z M2,0.5 L9,0.5 L9,20 L7.5,20 L7.5,20 L7.501,18.034 C7.312,15.247 6.64,12.369 5.484,9.399 C4.609,7.15 3.112,5.052 0.987,3.106 C0.376,2.547 0.334,1.598 0.894,0.987 C1.178,0.677 1.579,0.5 2,0.5 Z"></path>
+          <path class="border_3x" d="M9,1 L2,1 C1.72,1 1.452,1.118 1.263,1.325 C0.89,1.732 0.917,2.365 1.325,2.738 C3.504,4.733 5.046,6.893 5.95,9.218 C7.124,12.233 7.807,15.161 8,18 L8,20 L9,20 L9,1 Z M2,0.667 L9,0.667 L9,20 L7.667,20 L7.667,20 L7.668,18.023 C7.477,15.218 6.802,12.324 5.64,9.338 C4.755,7.064 3.243,4.946 1.1,2.983 C0.557,2.486 0.52,1.643 1.017,1.1 C1.269,0.824 1.626,0.667 2,0.667 Z"></path>
+        </g>
+      </svg>
+    </i>
+    <div class="tgme_widget_message_author accent_color"><a class="tgme_widget_message_owner_name" href="https://t.me/TWAPx"><span dir="auto">TWAPs | Hyper | первый парсер в СНГ,остальные доходяги решили просто спиздить.</span></a></div>
+
+<a class="tgme_widget_message_reply user-color-default" href="https://t.me/TWAPx/44721" ">
+<div class="tgme_widget_message_author accent_color">
+  <span class="tgme_widget_message_author_name" dir="auto">TWAPs | Hyper | первый парсер в СНГ,остальные доходяги решили просто спиздить.</span>
+</div>
+<div class="tgme_widget_message_text js-message_reply_text" dir="auto"><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F9FA9.png')"><b>🟩</b></i> &#036;1.37M покупка HYPE в течении 30 минут  Цена: &#036;83.83 Объем: &#036;428.64M (0.32%) Субъект: 0xb75a08e82a1bf0fcceb89bbdaf9aae00be8ca29a #00be8ca29a  Создан в: 15:04:02 (UTC)</div>
+</a>
+<div class="tgme_widget_message_text js-message_text" dir="auto"><b><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/E29D8C.png')"><b>❌</b></i> TWAP отменён (частично)</b><br/>Статус: terminated<br/>Исполнено: 3.28%<br/>Размер: 536.53 / 16364.40 HYPE<br/>TwapId: <code>2197460</code><br/>Субъект: <code>0xb75a08e82a1bf0fcceb89bbdaf9aae00be8ca29a</code><br/><br/>Цена в начале:  &#036;83.83<br/>Цена в конце: &#036;83.69 <i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F94B4.png')"><b>🔴</b></i> (-0.16%)</div>
+<div class="tgme_widget_message_footer compact js-message_footer">
+  
+  <div class="tgme_widget_message_info short js-message_info">
+    <span class="tgme_widget_message_views">13</span><span class="copyonly"> views</span><span class="tgme_widget_message_meta"><a class="tgme_widget_message_date" href="https://t.me/TWAPx/44724"><time datetime="2026-09-08T15:07:41+00:00" class="time">15:07</time></a></span>
+  </div>
+</div>
+  </div>
+  <div class="tgme_widget_message_inline_keyboard"><div class="tgme_widget_message_inline_row"><a class="tgme_widget_message_inline_button url_button" href="https://app.hyperliquid.xyz/explorer/tx/0xebc8b9b7881dc8aeed420443f63e8402116d009d2310e7808f91650a4711a299" target="_blank" rel="noopener" onclick="return confirm('Open this link?\n\n'+this.href);"><span class="tgme_widget_message_inline_button_text" dir="auto"><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F9497.png')"><b>🔗</b></i> Explorer</span></a><a class="tgme_widget_message_inline_button url_button" href="https://hypurrscan.io/address/0xb75a08e82a1bf0fcceb89bbdaf9aae00be8ca29a" target="_blank" rel="noopener" onclick="return confirm('Open this link?\n\n'+this.href);"><span class="tgme_widget_message_inline_button_text" dir="auto"><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F91A4.png')"><b>👤</b></i> Hypurrscan</span></a></div></div>
+</div></div><div class="tgme_widget_message_wrap js-widget_message_wrap"><div class="tgme_widget_message text_not_supported_wrap js-widget_message" data-post="TWAPx/44725" data-view="eyJjIjotMzY2MzE3MDc4NSwicCI6NDQ3MjUsInQiOjE3ODg4ODEyNjAsImgiOiI0MTJlNzllNGFhMDJjMDlmMzIifQ">
+  <div class="tgme_widget_message_user"><a href="https://t.me/TWAPx"><i class="tgme_widget_message_user_photo bgcolor1" data-content="T"><img src="https://cdn4.telesco.pe/file/CbMqT_zwWzSJSQQl52b0WJD-TMuVoDSZJdSOZZVkjbcA8P0zwWXQY0GzeADVJaxZOEkvsJyXVr4dW5PhdBYTmCkU1FLtIt5tdrcQN9AVOK3VLPguVH-6O9I_P8EWQ7AOiRelKQENRKyE59ZVLocT_p3v-X7Lli_D_usBxpPxcOJ3O-2iCdz4r0y7RS-ytc0nWS01duD5wHaVfbo0RyOJCZxroL8cgURSMch73HYIOJrjat3ec07X0qQaUZzRFFwfgT6FbpIrvzDw2vE215gm33KLJz_9r_uZUcBxWkmZCDYNf3ADISWSHoQ-80mVXQgEsMZHu0AtykV_8LgOIYH4dw.jpg"></i></a></div>
+  <div class="tgme_widget_message_bubble">
+    
+        <i class="tgme_widget_message_bubble_tail">
+      <svg class="bubble_icon" width="9px" height="20px" viewBox="0 0 9 20">
+        <g fill="none">
+          <path class="background" fill="#ffffff" d="M8,1 L9,1 L9,20 L8,20 L8,18 C7.807,15.161 7.124,12.233 5.950,9.218 C5.046,6.893 3.504,4.733 1.325,2.738 L1.325,2.738 C0.917,2.365 0.89,1.732 1.263,1.325 C1.452,1.118 1.72,1 2,1 L8,1 Z"></path>
+          <path class="border_1x" fill="#d7e3ec" d="M9,1 L2,1 C1.72,1 1.452,1.118 1.263,1.325 C0.89,1.732 0.917,2.365 1.325,2.738 C3.504,4.733 5.046,6.893 5.95,9.218 C7.124,12.233 7.807,15.161 8,18 L8,20 L9,20 L9,1 Z M2,0 L9,0 L9,20 L7,20 L7,20 L7.002,18.068 C6.816,15.333 6.156,12.504 5.018,9.58 C4.172,7.406 2.72,5.371 0.649,3.475 C-0.165,2.729 -0.221,1.464 0.525,0.649 C0.904,0.236 1.439,0 2,0 Z"></path>
+          <path class="border_2x" d="M9,1 L2,1 C1.72,1 1.452,1.118 1.263,1.325 C0.89,1.732 0.917,2.365 1.325,2.738 C3.504,4.733 5.046,6.893 5.95,9.218 C7.124,12.233 7.807,15.161 8,18 L8,20 L9,20 L9,1 Z M2,0.5 L9,0.5 L9,20 L7.5,20 L7.5,20 L7.501,18.034 C7.312,15.247 6.64,12.369 5.484,9.399 C4.609,7.15 3.112,5.052 0.987,3.106 C0.376,2.547 0.334,1.598 0.894,0.987 C1.178,0.677 1.579,0.5 2,0.5 Z"></path>
+          <path class="border_3x" d="M9,1 L2,1 C1.72,1 1.452,1.118 1.263,1.325 C0.89,1.732 0.917,2.365 1.325,2.738 C3.504,4.733 5.046,6.893 5.95,9.218 C7.124,12.233 7.807,15.161 8,18 L8,20 L9,20 L9,1 Z M2,0.667 L9,0.667 L9,20 L7.667,20 L7.667,20 L7.668,18.023 C7.477,15.218 6.802,12.324 5.64,9.338 C4.755,7.064 3.243,4.946 1.1,2.983 C0.557,2.486 0.52,1.643 1.017,1.1 C1.269,0.824 1.626,0.667 2,0.667 Z"></path>
+        </g>
+      </svg>
+    </i>
+    <div class="tgme_widget_message_author accent_color"><a class="tgme_widget_message_owner_name" href="https://t.me/TWAPx"><span dir="auto">TWAPs | Hyper | первый парсер в СНГ,остальные доходяги решили просто спиздить.</span></a></div>
+
+<a class="tgme_widget_message_reply user-color-default" href="https://t.me/TWAPx/44720" ">
+<div class="tgme_widget_message_author accent_color">
+  <span class="tgme_widget_message_author_name" dir="auto">TWAPs | Hyper | первый парсер в СНГ,остальные доходяги решили просто спиздить.</span>
+</div>
+<div class="tgme_widget_message_text js-message_reply_text" dir="auto"><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F9FA9.png')"><b>🟩</b></i> &#036;125.06K покупка TAO в течении 5 минут  Цена: &#036;258.27 Объем: &#036;33.05M (0.38%) Субъект: 0x94b60c2a5db13689bb06a73657ac1216424de5b3 #16424de5b3  Создан в: 15:03:41 (UTC)</div>
+</a>
+<div class="tgme_widget_message_text js-message_text" dir="auto"><b><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/E29C85.png')"><b>✅</b></i> TWAP завершён</b><br/>Статус: finished<br/>Исполнено: 100.00%<br/>Размер: 484.23 / 484.23 TAO<br/>TwapId: <code>2197459</code><br/>Субъект: <code>0x94b60c2a5db13689bb06a73657ac1216424de5b3</code><br/><br/>Цена в начале:  &#036;258.27<br/>Цена в конце: &#036;260.89 <i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F9FA2.png')"><b>🟢</b></i> (+1.02%)</div>
+<div class="tgme_widget_message_footer compact js-message_footer">
+  
+  <div class="tgme_widget_message_info short js-message_info">
+    <span class="tgme_widget_message_views">12</span><span class="copyonly"> views</span><span class="tgme_widget_message_meta"><a class="tgme_widget_message_date" href="https://t.me/TWAPx/44725"><time datetime="2026-09-08T15:10:56+00:00" class="time">15:10</time></a></span>
+  </div>
+</div>
+  </div>
+  <div class="tgme_widget_message_inline_keyboard"><div class="tgme_widget_message_inline_row"><a class="tgme_widget_message_inline_button url_button" href="https://app.hyperliquid.xyz/explorer/tx/0x5d31bc66989685ae5eab0443f63d5302036a004c3399a48000fa67b9579a5f99" target="_blank" rel="noopener" onclick="return confirm('Open this link?\n\n'+this.href);"><span class="tgme_widget_message_inline_button_text" dir="auto"><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F9497.png')"><b>🔗</b></i> Explorer</span></a><a class="tgme_widget_message_inline_button url_button" href="https://hypurrscan.io/address/0x94b60c2a5db13689bb06a73657ac1216424de5b3" target="_blank" rel="noopener" onclick="return confirm('Open this link?\n\n'+this.href);"><span class="tgme_widget_message_inline_button_text" dir="auto"><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F91A4.png')"><b>👤</b></i> Hypurrscan</span></a></div></div>
+</div></div><div class="tgme_widget_message_wrap js-widget_message_wrap"><div class="tgme_widget_message text_not_supported_wrap js-widget_message" data-post="TWAPx/44726" data-view="eyJjIjotMzY2MzE3MDc4NSwicCI6NDQ3MjYsInQiOjE3ODg4ODEyNjAsImgiOiIxMmNhMGJlY2RiNTEwZWZiOTEifQ">
+  <div class="tgme_widget_message_user"><a href="https://t.me/TWAPx"><i class="tgme_widget_message_user_photo bgcolor1" data-content="T"><img src="https://cdn4.telesco.pe/file/CbMqT_zwWzSJSQQl52b0WJD-TMuVoDSZJdSOZZVkjbcA8P0zwWXQY0GzeADVJaxZOEkvsJyXVr4dW5PhdBYTmCkU1FLtIt5tdrcQN9AVOK3VLPguVH-6O9I_P8EWQ7AOiRelKQENRKyE59ZVLocT_p3v-X7Lli_D_usBxpPxcOJ3O-2iCdz4r0y7RS-ytc0nWS01duD5wHaVfbo0RyOJCZxroL8cgURSMch73HYIOJrjat3ec07X0qQaUZzRFFwfgT6FbpIrvzDw2vE215gm33KLJz_9r_uZUcBxWkmZCDYNf3ADISWSHoQ-80mVXQgEsMZHu0AtykV_8LgOIYH4dw.jpg"></i></a></div>
+  <div class="tgme_widget_message_bubble">
+    
+        <i class="tgme_widget_message_bubble_tail">
+      <svg class="bubble_icon" width="9px" height="20px" viewBox="0 0 9 20">
+        <g fill="none">
+          <path class="background" fill="#ffffff" d="M8,1 L9,1 L9,20 L8,20 L8,18 C7.807,15.161 7.124,12.233 5.950,9.218 C5.046,6.893 3.504,4.733 1.325,2.738 L1.325,2.738 C0.917,2.365 0.89,1.732 1.263,1.325 C1.452,1.118 1.72,1 2,1 L8,1 Z"></path>
+          <path class="border_1x" fill="#d7e3ec" d="M9,1 L2,1 C1.72,1 1.452,1.118 1.263,1.325 C0.89,1.732 0.917,2.365 1.325,2.738 C3.504,4.733 5.046,6.893 5.95,9.218 C7.124,12.233 7.807,15.161 8,18 L8,20 L9,20 L9,1 Z M2,0 L9,0 L9,20 L7,20 L7,20 L7.002,18.068 C6.816,15.333 6.156,12.504 5.018,9.58 C4.172,7.406 2.72,5.371 0.649,3.475 C-0.165,2.729 -0.221,1.464 0.525,0.649 C0.904,0.236 1.439,0 2,0 Z"></path>
+          <path class="border_2x" d="M9,1 L2,1 C1.72,1 1.452,1.118 1.263,1.325 C0.89,1.732 0.917,2.365 1.325,2.738 C3.504,4.733 5.046,6.893 5.95,9.218 C7.124,12.233 7.807,15.161 8,18 L8,20 L9,20 L9,1 Z M2,0.5 L9,0.5 L9,20 L7.5,20 L7.5,20 L7.501,18.034 C7.312,15.247 6.64,12.369 5.484,9.399 C4.609,7.15 3.112,5.052 0.987,3.106 C0.376,2.547 0.334,1.598 0.894,0.987 C1.178,0.677 1.579,0.5 2,0.5 Z"></path>
+          <path class="border_3x" d="M9,1 L2,1 C1.72,1 1.452,1.118 1.263,1.325 C0.89,1.732 0.917,2.365 1.325,2.738 C3.504,4.733 5.046,6.893 5.95,9.218 C7.124,12.233 7.807,15.161 8,18 L8,20 L9,20 L9,1 Z M2,0.667 L9,0.667 L9,20 L7.667,20 L7.667,20 L7.668,18.023 C7.477,15.218 6.802,12.324 5.64,9.338 C4.755,7.064 3.243,4.946 1.1,2.983 C0.557,2.486 0.52,1.643 1.017,1.1 C1.269,0.824 1.626,0.667 2,0.667 Z"></path>
+        </g>
+      </svg>
+    </i>
+    <div class="tgme_widget_message_author accent_color"><a class="tgme_widget_message_owner_name" href="https://t.me/TWAPx"><span dir="auto">TWAPs | Hyper | первый парсер в СНГ,остальные доходяги решили просто спиздить.</span></a></div>
+
+
+<div class="tgme_widget_message_text js-message_text" dir="auto"><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F9FA9.png')"><b>🟩</b></i> <b>&#036;299.87K покупка </b><a href="https://www.mexc.com/ru-RU/futures/PONS_USDT" target="_blank" rel="noopener" onclick="return confirm('Open this link?\n\n'+this.href);"><b>PONS</b></a><b> в течении 10.5 часа</b><br/><br/>Цена: &#036;0.760865<br/>Объем: &#036;113.97M (0.26%)<br/>Субъект: <code>0x72774e2fe1992d5da8c6e9cef73fd2ab980c0b98</code><br/><a href="?q=%23ab980c0b98">#ab980c0b98</a><br/><br/>Создан в: 15:11:04 (UTC)</div>
+<div class="tgme_widget_message_footer compact js-message_footer">
+  
+  <div class="tgme_widget_message_info short js-message_info">
+    <span class="tgme_widget_message_views">12</span><span class="copyonly"> views</span><span class="tgme_widget_message_meta"><a class="tgme_widget_message_date" href="https://t.me/TWAPx/44726"><time datetime="2026-09-08T15:11:17+00:00" class="time">15:11</time></a></span>
+  </div>
+</div>
+  </div>
+  <div class="tgme_widget_message_inline_keyboard"><div class="tgme_widget_message_inline_row"><a class="tgme_widget_message_inline_button url_button" href="https://app.hyperliquid.xyz/explorer/tx/0x9dc05bb5eb1072d89f3a0443f65529020d24009b861391aa41890708aa144cc3" target="_blank" rel="noopener" onclick="return confirm('Open this link?\n\n'+this.href);"><span class="tgme_widget_message_inline_button_text" dir="auto"><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F9497.png')"><b>🔗</b></i> Explorer</span></a><a class="tgme_widget_message_inline_button url_button" href="https://hypurrscan.io/address/0x72774e2fe1992d5da8c6e9cef73fd2ab980c0b98" target="_blank" rel="noopener" onclick="return confirm('Open this link?\n\n'+this.href);"><span class="tgme_widget_message_inline_button_text" dir="auto"><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F91A4.png')"><b>👤</b></i> Hypurrscan</span></a></div></div>
+</div></div><div class="tgme_widget_message_wrap js-widget_message_wrap"><div class="tgme_widget_message text_not_supported_wrap js-widget_message" data-post="TWAPx/44727" data-view="eyJjIjotMzY2MzE3MDc4NSwicCI6NDQ3MjcsInQiOjE3ODg4ODEyNjAsImgiOiI0N2ZmNjc0MDQyMDIyYWJmZDYifQ">
+  <div class="tgme_widget_message_user"><a href="https://t.me/TWAPx"><i class="tgme_widget_message_user_photo bgcolor1" data-content="T"><img src="https://cdn4.telesco.pe/file/CbMqT_zwWzSJSQQl52b0WJD-TMuVoDSZJdSOZZVkjbcA8P0zwWXQY0GzeADVJaxZOEkvsJyXVr4dW5PhdBYTmCkU1FLtIt5tdrcQN9AVOK3VLPguVH-6O9I_P8EWQ7AOiRelKQENRKyE59ZVLocT_p3v-X7Lli_D_usBxpPxcOJ3O-2iCdz4r0y7RS-ytc0nWS01duD5wHaVfbo0RyOJCZxroL8cgURSMch73HYIOJrjat3ec07X0qQaUZzRFFwfgT6FbpIrvzDw2vE215gm33KLJz_9r_uZUcBxWkmZCDYNf3ADISWSHoQ-80mVXQgEsMZHu0AtykV_8LgOIYH4dw.jpg"></i></a></div>
+  <div class="tgme_widget_message_bubble">
+    
+        <i class="tgme_widget_message_bubble_tail">
+      <svg class="bubble_icon" width="9px" height="20px" viewBox="0 0 9 20">
+        <g fill="none">
+          <path class="background" fill="#ffffff" d="M8,1 L9,1 L9,20 L8,20 L8,18 C7.807,15.161 7.124,12.233 5.950,9.218 C5.046,6.893 3.504,4.733 1.325,2.738 L1.325,2.738 C0.917,2.365 0.89,1.732 1.263,1.325 C1.452,1.118 1.72,1 2,1 L8,1 Z"></path>
+          <path class="border_1x" fill="#d7e3ec" d="M9,1 L2,1 C1.72,1 1.452,1.118 1.263,1.325 C0.89,1.732 0.917,2.365 1.325,2.738 C3.504,4.733 5.046,6.893 5.95,9.218 C7.124,12.233 7.807,15.161 8,18 L8,20 L9,20 L9,1 Z M2,0 L9,0 L9,20 L7,20 L7,20 L7.002,18.068 C6.816,15.333 6.156,12.504 5.018,9.58 C4.172,7.406 2.72,5.371 0.649,3.475 C-0.165,2.729 -0.221,1.464 0.525,0.649 C0.904,0.236 1.439,0 2,0 Z"></path>
+          <path class="border_2x" d="M9,1 L2,1 C1.72,1 1.452,1.118 1.263,1.325 C0.89,1.732 0.917,2.365 1.325,2.738 C3.504,4.733 5.046,6.893 5.95,9.218 C7.124,12.233 7.807,15.161 8,18 L8,20 L9,20 L9,1 Z M2,0.5 L9,0.5 L9,20 L7.5,20 L7.5,20 L7.501,18.034 C7.312,15.247 6.64,12.369 5.484,9.399 C4.609,7.15 3.112,5.052 0.987,3.106 C0.376,2.547 0.334,1.598 0.894,0.987 C1.178,0.677 1.579,0.5 2,0.5 Z"></path>
+          <path class="border_3x" d="M9,1 L2,1 C1.72,1 1.452,1.118 1.263,1.325 C0.89,1.732 0.917,2.365 1.325,2.738 C3.504,4.733 5.046,6.893 5.95,9.218 C7.124,12.233 7.807,15.161 8,18 L8,20 L9,20 L9,1 Z M2,0.667 L9,0.667 L9,20 L7.667,20 L7.667,20 L7.668,18.023 C7.477,15.218 6.802,12.324 5.64,9.338 C4.755,7.064 3.243,4.946 1.1,2.983 C0.557,2.486 0.52,1.643 1.017,1.1 C1.269,0.824 1.626,0.667 2,0.667 Z"></path>
+        </g>
+      </svg>
+    </i>
+    <div class="tgme_widget_message_author accent_color"><a class="tgme_widget_message_owner_name" href="https://t.me/TWAPx"><span dir="auto">TWAPs | Hyper | первый парсер в СНГ,остальные доходяги решили просто спиздить.</span></a></div>
+
+
+<div class="tgme_widget_message_text js-message_text" dir="auto"><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F9FA9.png')"><b>🟩</b></i> <b>&#036;100.01K покупка </b><a href="https://www.mexc.com/ru-RU/futures/ZEC_USDT" target="_blank" rel="noopener" onclick="return confirm('Open this link?\n\n'+this.href);"><b>ZEC</b></a><b> в течении 48 часов</b><br/><br/>Цена: &#036;1,179.90<br/>Объем: &#036;322.66M (0.03%)<br/>Субъект: <code>0x0e233f27d5c026a88ba11fe08dc9e13efedfa32e</code><br/><a href="?q=%233efedfa32e">#3efedfa32e</a><br/><br/>Создан в: 15:11:16 (UTC)</div>
+<div class="tgme_widget_message_footer compact js-message_footer">
+  
+  <div class="tgme_widget_message_info short js-message_info">
+    <span class="tgme_widget_message_views">14</span><span class="copyonly"> views</span><span class="tgme_widget_message_meta"><a class="tgme_widget_message_date" href="https://t.me/TWAPx/44727"><time datetime="2026-09-08T15:11:30+00:00" class="time">15:11</time></a></span>
+  </div>
+</div>
+  </div>
+  <div class="tgme_widget_message_inline_keyboard"><div class="tgme_widget_message_inline_row"><a class="tgme_widget_message_inline_button url_button" href="https://app.hyperliquid.xyz/explorer/tx/0xd054219e39ef58eed1cd0443f655c502038d0083d4e277c0741cccf0f8e332d9" target="_blank" rel="noopener" onclick="return confirm('Open this link?\n\n'+this.href);"><span class="tgme_widget_message_inline_button_text" dir="auto"><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F9497.png')"><b>🔗</b></i> Explorer</span></a><a class="tgme_widget_message_inline_button url_button" href="https://hypurrscan.io/address/0x0e233f27d5c026a88ba11fe08dc9e13efedfa32e" target="_blank" rel="noopener" onclick="return confirm('Open this link?\n\n'+this.href);"><span class="tgme_widget_message_inline_button_text" dir="auto"><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F91A4.png')"><b>👤</b></i> Hypurrscan</span></a></div></div>
+</div></div><div class="tgme_widget_message_wrap js-widget_message_wrap"><div class="tgme_widget_message text_not_supported_wrap js-widget_message" data-post="TWAPx/44728" data-view="eyJjIjotMzY2MzE3MDc4NSwicCI6NDQ3MjgsInQiOjE3ODg4ODEyNjAsImgiOiI1NjM5Y2JhNjZmMzgzZmZlZTEifQ">
+  <div class="tgme_widget_message_user"><a href="https://t.me/TWAPx"><i class="tgme_widget_message_user_photo bgcolor1" data-content="T"><img src="https://cdn4.telesco.pe/file/CbMqT_zwWzSJSQQl52b0WJD-TMuVoDSZJdSOZZVkjbcA8P0zwWXQY0GzeADVJaxZOEkvsJyXVr4dW5PhdBYTmCkU1FLtIt5tdrcQN9AVOK3VLPguVH-6O9I_P8EWQ7AOiRelKQENRKyE59ZVLocT_p3v-X7Lli_D_usBxpPxcOJ3O-2iCdz4r0y7RS-ytc0nWS01duD5wHaVfbo0RyOJCZxroL8cgURSMch73HYIOJrjat3ec07X0qQaUZzRFFwfgT6FbpIrvzDw2vE215gm33KLJz_9r_uZUcBxWkmZCDYNf3ADISWSHoQ-80mVXQgEsMZHu0AtykV_8LgOIYH4dw.jpg"></i></a></div>
+  <div class="tgme_widget_message_bubble">
+    
+        <i class="tgme_widget_message_bubble_tail">
+      <svg class="bubble_icon" width="9px" height="20px" viewBox="0 0 9 20">
+        <g fill="none">
+          <path class="background" fill="#ffffff" d="M8,1 L9,1 L9,20 L8,20 L8,18 C7.807,15.161 7.124,12.233 5.950,9.218 C5.046,6.893 3.504,4.733 1.325,2.738 L1.325,2.738 C0.917,2.365 0.89,1.732 1.263,1.325 C1.452,1.118 1.72,1 2,1 L8,1 Z"></path>
+          <path class="border_1x" fill="#d7e3ec" d="M9,1 L2,1 C1.72,1 1.452,1.118 1.263,1.325 C0.89,1.732 0.917,2.365 1.325,2.738 C3.504,4.733 5.046,6.893 5.95,9.218 C7.124,12.233 7.807,15.161 8,18 L8,20 L9,20 L9,1 Z M2,0 L9,0 L9,20 L7,20 L7,20 L7.002,18.068 C6.816,15.333 6.156,12.504 5.018,9.58 C4.172,7.406 2.72,5.371 0.649,3.475 C-0.165,2.729 -0.221,1.464 0.525,0.649 C0.904,0.236 1.439,0 2,0 Z"></path>
+          <path class="border_2x" d="M9,1 L2,1 C1.72,1 1.452,1.118 1.263,1.325 C0.89,1.732 0.917,2.365 1.325,2.738 C3.504,4.733 5.046,6.893 5.95,9.218 C7.124,12.233 7.807,15.161 8,18 L8,20 L9,20 L9,1 Z M2,0.5 L9,0.5 L9,20 L7.5,20 L7.5,20 L7.501,18.034 C7.312,15.247 6.64,12.369 5.484,9.399 C4.609,7.15 3.112,5.052 0.987,3.106 C0.376,2.547 0.334,1.598 0.894,0.987 C1.178,0.677 1.579,0.5 2,0.5 Z"></path>
+          <path class="border_3x" d="M9,1 L2,1 C1.72,1 1.452,1.118 1.263,1.325 C0.89,1.732 0.917,2.365 1.325,2.738 C3.504,4.733 5.046,6.893 5.95,9.218 C7.124,12.233 7.807,15.161 8,18 L8,20 L9,20 L9,1 Z M2,0.667 L9,0.667 L9,20 L7.667,20 L7.667,20 L7.668,18.023 C7.477,15.218 6.802,12.324 5.64,9.338 C4.755,7.064 3.243,4.946 1.1,2.983 C0.557,2.486 0.52,1.643 1.017,1.1 C1.269,0.824 1.626,0.667 2,0.667 Z"></path>
+        </g>
+      </svg>
+    </i>
+    <div class="tgme_widget_message_author accent_color"><a class="tgme_widget_message_owner_name" href="https://t.me/TWAPx"><span dir="auto">TWAPs | Hyper | первый парсер в СНГ,остальные доходяги решили просто спиздить.</span></a></div>
+
+
+<div class="tgme_widget_message_text js-message_text" dir="auto"><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F9FA9.png')"><b>🟩</b></i> <b>&#036;150.02K покупка </b><a href="https://www.mexc.com/ru-RU/futures/AERO_USDT" target="_blank" rel="noopener" onclick="return confirm('Open this link?\n\n'+this.href);"><b>AERO</b></a><b> в течении 30 минут</b><br/><br/>Цена: &#036;0.641155<br/>Объем: &#036;13.61M (1.10%)<br/>Субъект: <code>0xb1e3bd05552290e8122b77ee73d244f4bfaeb750</code><br/><a href="?q=%23f4bfaeb750">#f4bfaeb750</a><br/><br/>Создан в: 15:15:40 (UTC)</div>
+<div class="tgme_widget_message_footer compact js-message_footer">
+  
+  <div class="tgme_widget_message_info short js-message_info">
+    <span class="tgme_widget_message_views">13</span><span class="copyonly"> views</span><span class="tgme_widget_message_meta"><a class="tgme_widget_message_date" href="https://t.me/TWAPx/44728"><time datetime="2026-09-08T15:15:54+00:00" class="time">15:15</time></a></span>
+  </div>
+</div>
+  </div>
+  <div class="tgme_widget_message_inline_keyboard"><div class="tgme_widget_message_inline_row"><a class="tgme_widget_message_inline_button url_button" href="https://app.hyperliquid.xyz/explorer/tx/0xa44dcb128bed242ea5c70443f663b3020f8700f826e04300481676654ae0fe19" target="_blank" rel="noopener" onclick="return confirm('Open this link?\n\n'+this.href);"><span class="tgme_widget_message_inline_button_text" dir="auto"><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F9497.png')"><b>🔗</b></i> Explorer</span></a><a class="tgme_widget_message_inline_button url_button" href="https://hypurrscan.io/address/0xb1e3bd05552290e8122b77ee73d244f4bfaeb750" target="_blank" rel="noopener" onclick="return confirm('Open this link?\n\n'+this.href);"><span class="tgme_widget_message_inline_button_text" dir="auto"><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F91A4.png')"><b>👤</b></i> Hypurrscan</span></a></div></div>
+</div></div><div class="tgme_widget_message_wrap js-widget_message_wrap"><div class="tgme_widget_message text_not_supported_wrap js-widget_message" data-post="TWAPx/44729" data-view="eyJjIjotMzY2MzE3MDc4NSwicCI6NDQ3MjksInQiOjE3ODg4ODEyNjAsImgiOiIzZWZiYjkyMjVjYzBlYzViM2YifQ">
+  <div class="tgme_widget_message_user"><a href="https://t.me/TWAPx"><i class="tgme_widget_message_user_photo bgcolor1" data-content="T"><img src="https://cdn4.telesco.pe/file/CbMqT_zwWzSJSQQl52b0WJD-TMuVoDSZJdSOZZVkjbcA8P0zwWXQY0GzeADVJaxZOEkvsJyXVr4dW5PhdBYTmCkU1FLtIt5tdrcQN9AVOK3VLPguVH-6O9I_P8EWQ7AOiRelKQENRKyE59ZVLocT_p3v-X7Lli_D_usBxpPxcOJ3O-2iCdz4r0y7RS-ytc0nWS01duD5wHaVfbo0RyOJCZxroL8cgURSMch73HYIOJrjat3ec07X0qQaUZzRFFwfgT6FbpIrvzDw2vE215gm33KLJz_9r_uZUcBxWkmZCDYNf3ADISWSHoQ-80mVXQgEsMZHu0AtykV_8LgOIYH4dw.jpg"></i></a></div>
+  <div class="tgme_widget_message_bubble">
+    
+        <i class="tgme_widget_message_bubble_tail">
+      <svg class="bubble_icon" width="9px" height="20px" viewBox="0 0 9 20">
+        <g fill="none">
+          <path class="background" fill="#ffffff" d="M8,1 L9,1 L9,20 L8,20 L8,18 C7.807,15.161 7.124,12.233 5.950,9.218 C5.046,6.893 3.504,4.733 1.325,2.738 L1.325,2.738 C0.917,2.365 0.89,1.732 1.263,1.325 C1.452,1.118 1.72,1 2,1 L8,1 Z"></path>
+          <path class="border_1x" fill="#d7e3ec" d="M9,1 L2,1 C1.72,1 1.452,1.118 1.263,1.325 C0.89,1.732 0.917,2.365 1.325,2.738 C3.504,4.733 5.046,6.893 5.95,9.218 C7.124,12.233 7.807,15.161 8,18 L8,20 L9,20 L9,1 Z M2,0 L9,0 L9,20 L7,20 L7,20 L7.002,18.068 C6.816,15.333 6.156,12.504 5.018,9.58 C4.172,7.406 2.72,5.371 0.649,3.475 C-0.165,2.729 -0.221,1.464 0.525,0.649 C0.904,0.236 1.439,0 2,0 Z"></path>
+          <path class="border_2x" d="M9,1 L2,1 C1.72,1 1.452,1.118 1.263,1.325 C0.89,1.732 0.917,2.365 1.325,2.738 C3.504,4.733 5.046,6.893 5.95,9.218 C7.124,12.233 7.807,15.161 8,18 L8,20 L9,20 L9,1 Z M2,0.5 L9,0.5 L9,20 L7.5,20 L7.5,20 L7.501,18.034 C7.312,15.247 6.64,12.369 5.484,9.399 C4.609,7.15 3.112,5.052 0.987,3.106 C0.376,2.547 0.334,1.598 0.894,0.987 C1.178,0.677 1.579,0.5 2,0.5 Z"></path>
+          <path class="border_3x" d="M9,1 L2,1 C1.72,1 1.452,1.118 1.263,1.325 C0.89,1.732 0.917,2.365 1.325,2.738 C3.504,4.733 5.046,6.893 5.95,9.218 C7.124,12.233 7.807,15.161 8,18 L8,20 L9,20 L9,1 Z M2,0.667 L9,0.667 L9,20 L7.667,20 L7.667,20 L7.668,18.023 C7.477,15.218 6.802,12.324 5.64,9.338 C4.755,7.064 3.243,4.946 1.1,2.983 C0.557,2.486 0.52,1.643 1.017,1.1 C1.269,0.824 1.626,0.667 2,0.667 Z"></path>
+        </g>
+      </svg>
+    </i>
+    <div class="tgme_widget_message_author accent_color"><a class="tgme_widget_message_owner_name" href="https://t.me/TWAPx"><span dir="auto">TWAPs | Hyper | первый парсер в СНГ,остальные доходяги решили просто спиздить.</span></a></div>
+
+
+<div class="tgme_widget_message_text js-message_text" dir="auto"><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F9FA9.png')"><b>🟩</b></i> <b>&#036;150.04K покупка </b><a href="https://www.mexc.com/ru-RU/futures/XPL_USDT" target="_blank" rel="noopener" onclick="return confirm('Open this link?\n\n'+this.href);"><b>XPL</b></a><b> в течении 30 минут</b><br/><br/>Цена: &#036;0.098463<br/>Объем: &#036;18.15M (0.83%)<br/>Субъект: <code>0xb1e3bd05552290e8122b77ee73d244f4bfaeb750</code><br/><a href="?q=%23f4bfaeb750">#f4bfaeb750</a><br/><br/>Создан в: 15:16:19 (UTC)</div>
+<div class="tgme_widget_message_footer compact js-message_footer">
+  
+  <div class="tgme_widget_message_info short js-message_info">
+    <span class="tgme_widget_message_views">10</span><span class="copyonly"> views</span><span class="tgme_widget_message_meta"><a class="tgme_widget_message_date" href="https://t.me/TWAPx/44729"><time datetime="2026-09-08T15:16:40+00:00" class="time">15:16</time></a></span>
+  </div>
+</div>
+  </div>
+  <div class="tgme_widget_message_inline_keyboard"><div class="tgme_widget_message_inline_row"><a class="tgme_widget_message_inline_button url_button" href="https://app.hyperliquid.xyz/explorer/tx/0x2d5fa3285f0112a62ed90443f665d502035f000dfa043178d1284e7b1e04ec90" target="_blank" rel="noopener" onclick="return confirm('Open this link?\n\n'+this.href);"><span class="tgme_widget_message_inline_button_text" dir="auto"><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F9497.png')"><b>🔗</b></i> Explorer</span></a><a class="tgme_widget_message_inline_button url_button" href="https://hypurrscan.io/address/0xb1e3bd05552290e8122b77ee73d244f4bfaeb750" target="_blank" rel="noopener" onclick="return confirm('Open this link?\n\n'+this.href);"><span class="tgme_widget_message_inline_button_text" dir="auto"><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F91A4.png')"><b>👤</b></i> Hypurrscan</span></a></div></div>
+</div></div><div class="tgme_widget_message_wrap js-widget_message_wrap"><div class="tgme_widget_message text_not_supported_wrap js-widget_message" data-post="TWAPx/44730" data-view="eyJjIjotMzY2MzE3MDc4NSwicCI6NDQ3MzAsInQiOjE3ODg4ODEyNjAsImgiOiJkYzViYWQzMTgyZWVjZjI4YjQifQ">
+  <div class="tgme_widget_message_user"><a href="https://t.me/TWAPx"><i class="tgme_widget_message_user_photo bgcolor1" data-content="T"><img src="https://cdn4.telesco.pe/file/CbMqT_zwWzSJSQQl52b0WJD-TMuVoDSZJdSOZZVkjbcA8P0zwWXQY0GzeADVJaxZOEkvsJyXVr4dW5PhdBYTmCkU1FLtIt5tdrcQN9AVOK3VLPguVH-6O9I_P8EWQ7AOiRelKQENRKyE59ZVLocT_p3v-X7Lli_D_usBxpPxcOJ3O-2iCdz4r0y7RS-ytc0nWS01duD5wHaVfbo0RyOJCZxroL8cgURSMch73HYIOJrjat3ec07X0qQaUZzRFFwfgT6FbpIrvzDw2vE215gm33KLJz_9r_uZUcBxWkmZCDYNf3ADISWSHoQ-80mVXQgEsMZHu0AtykV_8LgOIYH4dw.jpg"></i></a></div>
+  <div class="tgme_widget_message_bubble">
+    
+        <i class="tgme_widget_message_bubble_tail">
+      <svg class="bubble_icon" width="9px" height="20px" viewBox="0 0 9 20">
+        <g fill="none">
+          <path class="background" fill="#ffffff" d="M8,1 L9,1 L9,20 L8,20 L8,18 C7.807,15.161 7.124,12.233 5.950,9.218 C5.046,6.893 3.504,4.733 1.325,2.738 L1.325,2.738 C0.917,2.365 0.89,1.732 1.263,1.325 C1.452,1.118 1.72,1 2,1 L8,1 Z"></path>
+          <path class="border_1x" fill="#d7e3ec" d="M9,1 L2,1 C1.72,1 1.452,1.118 1.263,1.325 C0.89,1.732 0.917,2.365 1.325,2.738 C3.504,4.733 5.046,6.893 5.95,9.218 C7.124,12.233 7.807,15.161 8,18 L8,20 L9,20 L9,1 Z M2,0 L9,0 L9,20 L7,20 L7,20 L7.002,18.068 C6.816,15.333 6.156,12.504 5.018,9.58 C4.172,7.406 2.72,5.371 0.649,3.475 C-0.165,2.729 -0.221,1.464 0.525,0.649 C0.904,0.236 1.439,0 2,0 Z"></path>
+          <path class="border_2x" d="M9,1 L2,1 C1.72,1 1.452,1.118 1.263,1.325 C0.89,1.732 0.917,2.365 1.325,2.738 C3.504,4.733 5.046,6.893 5.95,9.218 C7.124,12.233 7.807,15.161 8,18 L8,20 L9,20 L9,1 Z M2,0.5 L9,0.5 L9,20 L7.5,20 L7.5,20 L7.501,18.034 C7.312,15.247 6.64,12.369 5.484,9.399 C4.609,7.15 3.112,5.052 0.987,3.106 C0.376,2.547 0.334,1.598 0.894,0.987 C1.178,0.677 1.579,0.5 2,0.5 Z"></path>
+          <path class="border_3x" d="M9,1 L2,1 C1.72,1 1.452,1.118 1.263,1.325 C0.89,1.732 0.917,2.365 1.325,2.738 C3.504,4.733 5.046,6.893 5.95,9.218 C7.124,12.233 7.807,15.161 8,18 L8,20 L9,20 L9,1 Z M2,0.667 L9,0.667 L9,20 L7.667,20 L7.667,20 L7.668,18.023 C7.477,15.218 6.802,12.324 5.64,9.338 C4.755,7.064 3.243,4.946 1.1,2.983 C0.557,2.486 0.52,1.643 1.017,1.1 C1.269,0.824 1.626,0.667 2,0.667 Z"></path>
+        </g>
+      </svg>
+    </i>
+    <div class="tgme_widget_message_author accent_color"><a class="tgme_widget_message_owner_name" href="https://t.me/TWAPx"><span dir="auto">TWAPs | Hyper | первый парсер в СНГ,остальные доходяги решили просто спиздить.</span></a></div>
+
+<a class="tgme_widget_message_reply user-color-default" href="https://t.me/TWAPx/44717" ">
+<div class="tgme_widget_message_author accent_color">
+  <span class="tgme_widget_message_author_name" dir="auto">TWAPs | Hyper | первый парсер в СНГ,остальные доходяги решили просто спиздить.</span>
+</div>
+<div class="tgme_widget_message_text js-message_reply_text" dir="auto"><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F9FA9.png')"><b>🟩</b></i> &#036;1.01M покупка NEAR в течении 15 минут  Цена: &#036;2.36 Объем: &#036;37.12M (2.71%) Субъект: 0xbf732ea04197942783e34730ed6e0f6099575d58 #6099575d58  Создан в: 15:01:06 (UTC)</div>
+</a>
+<div class="tgme_widget_message_text js-message_text" dir="auto"><b><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/E29C85.png')"><b>✅</b></i> TWAP завершён</b><br/>Статус: finished<br/>Исполнено: 100.00%<br/>Размер: 425876.20 / 425876.20 NEAR<br/>TwapId: <code>2197450</code><br/>Субъект: <code>0xbf732ea04197942783e34730ed6e0f6099575d58</code><br/><br/>Цена в начале:  &#036;2.36<br/>Цена в конце: &#036;2.42 <i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F9FA2.png')"><b>🟢</b></i> (+2.46%)</div>
+<div class="tgme_widget_message_footer compact js-message_footer">
+  
+  <div class="tgme_widget_message_info short js-message_info">
+    <span class="tgme_widget_message_views">8</span><span class="copyonly"> views</span><span class="tgme_widget_message_meta"><a class="tgme_widget_message_date" href="https://t.me/TWAPx/44730"><time datetime="2026-09-08T15:17:12+00:00" class="time">15:17</time></a></span>
+  </div>
+</div>
+  </div>
+  <div class="tgme_widget_message_inline_keyboard"><div class="tgme_widget_message_inline_row"><a class="tgme_widget_message_inline_button url_button" href="https://app.hyperliquid.xyz/explorer/tx/0xed904a01b058e338ef0a0443f634eb02064e00e74b5c020a9158f5546f5cbd23" target="_blank" rel="noopener" onclick="return confirm('Open this link?\n\n'+this.href);"><span class="tgme_widget_message_inline_button_text" dir="auto"><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F9497.png')"><b>🔗</b></i> Explorer</span></a><a class="tgme_widget_message_inline_button url_button" href="https://hypurrscan.io/address/0xbf732ea04197942783e34730ed6e0f6099575d58" target="_blank" rel="noopener" onclick="return confirm('Open this link?\n\n'+this.href);"><span class="tgme_widget_message_inline_button_text" dir="auto"><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F91A4.png')"><b>👤</b></i> Hypurrscan</span></a></div></div>
+</div></div><div class="tgme_widget_message_wrap js-widget_message_wrap"><div class="tgme_widget_message text_not_supported_wrap js-widget_message" data-post="TWAPx/44731" data-view="eyJjIjotMzY2MzE3MDc4NSwicCI6NDQ3MzEsInQiOjE3ODg4ODEyNjAsImgiOiI4MTg5ZTgwNTI5NWY1ZWE3MjIifQ">
+  <div class="tgme_widget_message_user"><a href="https://t.me/TWAPx"><i class="tgme_widget_message_user_photo bgcolor1" data-content="T"><img src="https://cdn4.telesco.pe/file/CbMqT_zwWzSJSQQl52b0WJD-TMuVoDSZJdSOZZVkjbcA8P0zwWXQY0GzeADVJaxZOEkvsJyXVr4dW5PhdBYTmCkU1FLtIt5tdrcQN9AVOK3VLPguVH-6O9I_P8EWQ7AOiRelKQENRKyE59ZVLocT_p3v-X7Lli_D_usBxpPxcOJ3O-2iCdz4r0y7RS-ytc0nWS01duD5wHaVfbo0RyOJCZxroL8cgURSMch73HYIOJrjat3ec07X0qQaUZzRFFwfgT6FbpIrvzDw2vE215gm33KLJz_9r_uZUcBxWkmZCDYNf3ADISWSHoQ-80mVXQgEsMZHu0AtykV_8LgOIYH4dw.jpg"></i></a></div>
+  <div class="tgme_widget_message_bubble">
+    
+        <i class="tgme_widget_message_bubble_tail">
+      <svg class="bubble_icon" width="9px" height="20px" viewBox="0 0 9 20">
+        <g fill="none">
+          <path class="background" fill="#ffffff" d="M8,1 L9,1 L9,20 L8,20 L8,18 C7.807,15.161 7.124,12.233 5.950,9.218 C5.046,6.893 3.504,4.733 1.325,2.738 L1.325,2.738 C0.917,2.365 0.89,1.732 1.263,1.325 C1.452,1.118 1.72,1 2,1 L8,1 Z"></path>
+          <path class="border_1x" fill="#d7e3ec" d="M9,1 L2,1 C1.72,1 1.452,1.118 1.263,1.325 C0.89,1.732 0.917,2.365 1.325,2.738 C3.504,4.733 5.046,6.893 5.95,9.218 C7.124,12.233 7.807,15.161 8,18 L8,20 L9,20 L9,1 Z M2,0 L9,0 L9,20 L7,20 L7,20 L7.002,18.068 C6.816,15.333 6.156,12.504 5.018,9.58 C4.172,7.406 2.72,5.371 0.649,3.475 C-0.165,2.729 -0.221,1.464 0.525,0.649 C0.904,0.236 1.439,0 2,0 Z"></path>
+          <path class="border_2x" d="M9,1 L2,1 C1.72,1 1.452,1.118 1.263,1.325 C0.89,1.732 0.917,2.365 1.325,2.738 C3.504,4.733 5.046,6.893 5.95,9.218 C7.124,12.233 7.807,15.161 8,18 L8,20 L9,20 L9,1 Z M2,0.5 L9,0.5 L9,20 L7.5,20 L7.5,20 L7.501,18.034 C7.312,15.247 6.64,12.369 5.484,9.399 C4.609,7.15 3.112,5.052 0.987,3.106 C0.376,2.547 0.334,1.598 0.894,0.987 C1.178,0.677 1.579,0.5 2,0.5 Z"></path>
+          <path class="border_3x" d="M9,1 L2,1 C1.72,1 1.452,1.118 1.263,1.325 C0.89,1.732 0.917,2.365 1.325,2.738 C3.504,4.733 5.046,6.893 5.95,9.218 C7.124,12.233 7.807,15.161 8,18 L8,20 L9,20 L9,1 Z M2,0.667 L9,0.667 L9,20 L7.667,20 L7.667,20 L7.668,18.023 C7.477,15.218 6.802,12.324 5.64,9.338 C4.755,7.064 3.243,4.946 1.1,2.983 C0.557,2.486 0.52,1.643 1.017,1.1 C1.269,0.824 1.626,0.667 2,0.667 Z"></path>
+        </g>
+      </svg>
+    </i>
+    <div class="tgme_widget_message_author accent_color"><a class="tgme_widget_message_owner_name" href="https://t.me/TWAPx"><span dir="auto">TWAPs | Hyper | первый парсер в СНГ,остальные доходяги решили просто спиздить.</span></a></div>
+
+<a class="tgme_widget_message_reply user-color-default" href="https://t.me/TWAPx/44698" ">
+<div class="tgme_widget_message_author accent_color">
+  <span class="tgme_widget_message_author_name" dir="auto">TWAPs | Hyper | первый парсер в СНГ,остальные доходяги решили просто спиздить.</span>
+</div>
+<div class="tgme_widget_message_text js-message_reply_text" dir="auto"><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F9FA9.png')"><b>🟩</b></i> &#036;183.65K покупка ENA в течении 72 часов  Цена: &#036;0.161570 Объем: &#036;26.79M (0.69%) Субъект: 0xfc6a9deac9675b9fd1a961b43e5072f8eb3dcc22 #f8eb3dcc22  Создан в: 14:30:57 (UTC)</div>
+</a>
+<div class="tgme_widget_message_text js-message_text" dir="auto"><b><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/E29D8C.png')"><b>❌</b></i> TWAP отменён (частично)</b><br/>Статус: terminated<br/>Исполнено: 1.10%<br/>Размер: 12478.00 / 1136689.00 ENA<br/>TwapId: <code>2197342</code><br/>Субъект: <code>0xfc6a9deac9675b9fd1a961b43e5072f8eb3dcc22</code><br/><br/>Цена в начале:  &#036;0.161570<br/>Цена в конце: &#036;0.162465 <i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F9FA2.png')"><b>🟢</b></i> (+0.55%)</div>
+<div class="tgme_widget_message_footer compact js-message_footer">
+  
+  <div class="tgme_widget_message_info short js-message_info">
+    <span class="tgme_widget_message_views">6</span><span class="copyonly"> views</span><span class="tgme_widget_message_meta"><a class="tgme_widget_message_date" href="https://t.me/TWAPx/44731"><time datetime="2026-09-08T15:18:56+00:00" class="time">15:18</time></a></span>
+  </div>
+</div>
+  </div>
+  <div class="tgme_widget_message_inline_keyboard"><div class="tgme_widget_message_inline_row"><a class="tgme_widget_message_inline_button url_button" href="https://app.hyperliquid.xyz/explorer/tx/0x0efdca30b3ab096410770443f5d2dd02061100164eae2836b2c6758372aee34e" target="_blank" rel="noopener" onclick="return confirm('Open this link?\n\n'+this.href);"><span class="tgme_widget_message_inline_button_text" dir="auto"><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F9497.png')"><b>🔗</b></i> Explorer</span></a><a class="tgme_widget_message_inline_button url_button" href="https://hypurrscan.io/address/0xfc6a9deac9675b9fd1a961b43e5072f8eb3dcc22" target="_blank" rel="noopener" onclick="return confirm('Open this link?\n\n'+this.href);"><span class="tgme_widget_message_inline_button_text" dir="auto"><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F91A4.png')"><b>👤</b></i> Hypurrscan</span></a></div></div>
+</div></div><div class="tgme_widget_message_wrap js-widget_message_wrap"><div class="tgme_widget_message text_not_supported_wrap js-widget_message" data-post="TWAPx/44732" data-view="eyJjIjotMzY2MzE3MDc4NSwicCI6NDQ3MzIsInQiOjE3ODg4ODEyNjAsImgiOiIyN2U1YzFjOTc4OGY3NTY3NWMifQ">
+  <div class="tgme_widget_message_user"><a href="https://t.me/TWAPx"><i class="tgme_widget_message_user_photo bgcolor1" data-content="T"><img src="https://cdn4.telesco.pe/file/CbMqT_zwWzSJSQQl52b0WJD-TMuVoDSZJdSOZZVkjbcA8P0zwWXQY0GzeADVJaxZOEkvsJyXVr4dW5PhdBYTmCkU1FLtIt5tdrcQN9AVOK3VLPguVH-6O9I_P8EWQ7AOiRelKQENRKyE59ZVLocT_p3v-X7Lli_D_usBxpPxcOJ3O-2iCdz4r0y7RS-ytc0nWS01duD5wHaVfbo0RyOJCZxroL8cgURSMch73HYIOJrjat3ec07X0qQaUZzRFFwfgT6FbpIrvzDw2vE215gm33KLJz_9r_uZUcBxWkmZCDYNf3ADISWSHoQ-80mVXQgEsMZHu0AtykV_8LgOIYH4dw.jpg"></i></a></div>
+  <div class="tgme_widget_message_bubble">
+    
+        <i class="tgme_widget_message_bubble_tail">
+      <svg class="bubble_icon" width="9px" height="20px" viewBox="0 0 9 20">
+        <g fill="none">
+          <path class="background" fill="#ffffff" d="M8,1 L9,1 L9,20 L8,20 L8,18 C7.807,15.161 7.124,12.233 5.950,9.218 C5.046,6.893 3.504,4.733 1.325,2.738 L1.325,2.738 C0.917,2.365 0.89,1.732 1.263,1.325 C1.452,1.118 1.72,1 2,1 L8,1 Z"></path>
+          <path class="border_1x" fill="#d7e3ec" d="M9,1 L2,1 C1.72,1 1.452,1.118 1.263,1.325 C0.89,1.732 0.917,2.365 1.325,2.738 C3.504,4.733 5.046,6.893 5.95,9.218 C7.124,12.233 7.807,15.161 8,18 L8,20 L9,20 L9,1 Z M2,0 L9,0 L9,20 L7,20 L7,20 L7.002,18.068 C6.816,15.333 6.156,12.504 5.018,9.58 C4.172,7.406 2.72,5.371 0.649,3.475 C-0.165,2.729 -0.221,1.464 0.525,0.649 C0.904,0.236 1.439,0 2,0 Z"></path>
+          <path class="border_2x" d="M9,1 L2,1 C1.72,1 1.452,1.118 1.263,1.325 C0.89,1.732 0.917,2.365 1.325,2.738 C3.504,4.733 5.046,6.893 5.95,9.218 C7.124,12.233 7.807,15.161 8,18 L8,20 L9,20 L9,1 Z M2,0.5 L9,0.5 L9,20 L7.5,20 L7.5,20 L7.501,18.034 C7.312,15.247 6.64,12.369 5.484,9.399 C4.609,7.15 3.112,5.052 0.987,3.106 C0.376,2.547 0.334,1.598 0.894,0.987 C1.178,0.677 1.579,0.5 2,0.5 Z"></path>
+          <path class="border_3x" d="M9,1 L2,1 C1.72,1 1.452,1.118 1.263,1.325 C0.89,1.732 0.917,2.365 1.325,2.738 C3.504,4.733 5.046,6.893 5.95,9.218 C7.124,12.233 7.807,15.161 8,18 L8,20 L9,20 L9,1 Z M2,0.667 L9,0.667 L9,20 L7.667,20 L7.667,20 L7.668,18.023 C7.477,15.218 6.802,12.324 5.64,9.338 C4.755,7.064 3.243,4.946 1.1,2.983 C0.557,2.486 0.52,1.643 1.017,1.1 C1.269,0.824 1.626,0.667 2,0.667 Z"></path>
+        </g>
+      </svg>
+    </i>
+    <div class="tgme_widget_message_author accent_color"><a class="tgme_widget_message_owner_name" href="https://t.me/TWAPx"><span dir="auto">TWAPs | Hyper | первый парсер в СНГ,остальные доходяги решили просто спиздить.</span></a></div>
+
+
+<div class="tgme_widget_message_text js-message_text" dir="auto"><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F9FA9.png')"><b>🟩</b></i> <b>&#036;150.70K покупка </b><a href="https://www.mexc.com/ru-RU/futures/VVV_USDT" target="_blank" rel="noopener" onclick="return confirm('Open this link?\n\n'+this.href);"><b>VVV</b></a><b> в течении 30 минут</b><br/><br/>Цена: &#036;23.30<br/>Объем: &#036;43.13M (0.35%)<br/>Субъект: <code>0xb1e3bd05552290e8122b77ee73d244f4bfaeb750</code><br/><a href="?q=%23f4bfaeb750">#f4bfaeb750</a><br/><br/>Создан в: 15:20:22 (UTC)</div>
+<div class="tgme_widget_message_footer compact js-message_footer">
+  
+  <div class="tgme_widget_message_info short js-message_info">
+    <span class="tgme_widget_message_views">5</span><span class="copyonly"> views</span><span class="tgme_widget_message_meta"><a class="tgme_widget_message_date" href="https://t.me/TWAPx/44732"><time datetime="2026-09-08T15:20:52+00:00" class="time">15:20</time></a></span>
+  </div>
+</div>
+  </div>
+  <div class="tgme_widget_message_inline_keyboard"><div class="tgme_widget_message_inline_row"><a class="tgme_widget_message_inline_button url_button" href="https://app.hyperliquid.xyz/explorer/tx/0x751b018a57b9feb776940443f672eb020434006ff2bd1d8918e3acdd16bdd8a2" target="_blank" rel="noopener" onclick="return confirm('Open this link?\n\n'+this.href);"><span class="tgme_widget_message_inline_button_text" dir="auto"><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F9497.png')"><b>🔗</b></i> Explorer</span></a><a class="tgme_widget_message_inline_button url_button" href="https://hypurrscan.io/address/0xb1e3bd05552290e8122b77ee73d244f4bfaeb750" target="_blank" rel="noopener" onclick="return confirm('Open this link?\n\n'+this.href);"><span class="tgme_widget_message_inline_button_text" dir="auto"><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F91A4.png')"><b>👤</b></i> Hypurrscan</span></a></div></div>
+</div></div><div class="tgme_widget_message_wrap js-widget_message_wrap"><div class="tgme_widget_message text_not_supported_wrap js-widget_message" data-post="TWAPx/44733" data-view="eyJjIjotMzY2MzE3MDc4NSwicCI6NDQ3MzMsInQiOjE3ODg4ODEyNjAsImgiOiJlOGJkMzQwMDc0NzIzNmMzYTAifQ">
+  <div class="tgme_widget_message_user"><a href="https://t.me/TWAPx"><i class="tgme_widget_message_user_photo bgcolor1" data-content="T"><img src="https://cdn4.telesco.pe/file/CbMqT_zwWzSJSQQl52b0WJD-TMuVoDSZJdSOZZVkjbcA8P0zwWXQY0GzeADVJaxZOEkvsJyXVr4dW5PhdBYTmCkU1FLtIt5tdrcQN9AVOK3VLPguVH-6O9I_P8EWQ7AOiRelKQENRKyE59ZVLocT_p3v-X7Lli_D_usBxpPxcOJ3O-2iCdz4r0y7RS-ytc0nWS01duD5wHaVfbo0RyOJCZxroL8cgURSMch73HYIOJrjat3ec07X0qQaUZzRFFwfgT6FbpIrvzDw2vE215gm33KLJz_9r_uZUcBxWkmZCDYNf3ADISWSHoQ-80mVXQgEsMZHu0AtykV_8LgOIYH4dw.jpg"></i></a></div>
+  <div class="tgme_widget_message_bubble">
+    
+        <i class="tgme_widget_message_bubble_tail">
+      <svg class="bubble_icon" width="9px" height="20px" viewBox="0 0 9 20">
+        <g fill="none">
+          <path class="background" fill="#ffffff" d="M8,1 L9,1 L9,20 L8,20 L8,18 C7.807,15.161 7.124,12.233 5.950,9.218 C5.046,6.893 3.504,4.733 1.325,2.738 L1.325,2.738 C0.917,2.365 0.89,1.732 1.263,1.325 C1.452,1.118 1.72,1 2,1 L8,1 Z"></path>
+          <path class="border_1x" fill="#d7e3ec" d="M9,1 L2,1 C1.72,1 1.452,1.118 1.263,1.325 C0.89,1.732 0.917,2.365 1.325,2.738 C3.504,4.733 5.046,6.893 5.95,9.218 C7.124,12.233 7.807,15.161 8,18 L8,20 L9,20 L9,1 Z M2,0 L9,0 L9,20 L7,20 L7,20 L7.002,18.068 C6.816,15.333 6.156,12.504 5.018,9.58 C4.172,7.406 2.72,5.371 0.649,3.475 C-0.165,2.729 -0.221,1.464 0.525,0.649 C0.904,0.236 1.439,0 2,0 Z"></path>
+          <path class="border_2x" d="M9,1 L2,1 C1.72,1 1.452,1.118 1.263,1.325 C0.89,1.732 0.917,2.365 1.325,2.738 C3.504,4.733 5.046,6.893 5.95,9.218 C7.124,12.233 7.807,15.161 8,18 L8,20 L9,20 L9,1 Z M2,0.5 L9,0.5 L9,20 L7.5,20 L7.5,20 L7.501,18.034 C7.312,15.247 6.64,12.369 5.484,9.399 C4.609,7.15 3.112,5.052 0.987,3.106 C0.376,2.547 0.334,1.598 0.894,0.987 C1.178,0.677 1.579,0.5 2,0.5 Z"></path>
+          <path class="border_3x" d="M9,1 L2,1 C1.72,1 1.452,1.118 1.263,1.325 C0.89,1.732 0.917,2.365 1.325,2.738 C3.504,4.733 5.046,6.893 5.95,9.218 C7.124,12.233 7.807,15.161 8,18 L8,20 L9,20 L9,1 Z M2,0.667 L9,0.667 L9,20 L7.667,20 L7.667,20 L7.668,18.023 C7.477,15.218 6.802,12.324 5.64,9.338 C4.755,7.064 3.243,4.946 1.1,2.983 C0.557,2.486 0.52,1.643 1.017,1.1 C1.269,0.824 1.626,0.667 2,0.667 Z"></path>
+        </g>
+      </svg>
+    </i>
+    <div class="tgme_widget_message_author accent_color"><a class="tgme_widget_message_owner_name" href="https://t.me/TWAPx"><span dir="auto">TWAPs | Hyper | первый парсер в СНГ,остальные доходяги решили просто спиздить.</span></a></div>
+
+
+<div class="tgme_widget_message_text js-message_text" dir="auto"><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F9FA9.png')"><b>🟩</b></i> <b>&#036;149.99K покупка </b><a href="https://www.mexc.com/ru-RU/futures/ZEC_USDT" target="_blank" rel="noopener" onclick="return confirm('Open this link?\n\n'+this.href);"><b>ZEC</b></a><b> в течении 30 минут</b><br/><br/>Цена: &#036;1,179.05<br/>Объем: &#036;319.52M (0.05%)<br/>Субъект: <code>0xb1e3bd05552290e8122b77ee73d244f4bfaeb750</code><br/><a href="?q=%23f4bfaeb750">#f4bfaeb750</a><br/><br/>Создан в: 15:20:52 (UTC)</div>
+<div class="tgme_widget_message_footer compact js-message_footer">
+  
+  <div class="tgme_widget_message_info short js-message_info">
+    <span class="tgme_widget_message_views">6</span><span class="copyonly"> views</span><span class="tgme_widget_message_meta"><a class="tgme_widget_message_date" href="https://t.me/TWAPx/44733"><time datetime="2026-09-08T15:21:02+00:00" class="time">15:21</time></a></span>
+  </div>
+</div>
+  </div>
+  <div class="tgme_widget_message_inline_keyboard"><div class="tgme_widget_message_inline_row"><a class="tgme_widget_message_inline_button url_button" href="https://app.hyperliquid.xyz/explorer/tx/0xd159ba471213a152d2d30443f674a50202a8002cad16c02475226599d1177b3d" target="_blank" rel="noopener" onclick="return confirm('Open this link?\n\n'+this.href);"><span class="tgme_widget_message_inline_button_text" dir="auto"><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F9497.png')"><b>🔗</b></i> Explorer</span></a><a class="tgme_widget_message_inline_button url_button" href="https://hypurrscan.io/address/0xb1e3bd05552290e8122b77ee73d244f4bfaeb750" target="_blank" rel="noopener" onclick="return confirm('Open this link?\n\n'+this.href);"><span class="tgme_widget_message_inline_button_text" dir="auto"><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F91A4.png')"><b>👤</b></i> Hypurrscan</span></a></div></div>
+</div></div><div class="tgme_widget_message_wrap js-widget_message_wrap"><div class="tgme_widget_message text_not_supported_wrap js-widget_message" data-post="TWAPx/44734" data-view="eyJjIjotMzY2MzE3MDc4NSwicCI6NDQ3MzQsInQiOjE3ODg4ODEyNjAsImgiOiIwYjE1NDBmMTlkZTEyNDEyM2QifQ">
+  <div class="tgme_widget_message_user"><a href="https://t.me/TWAPx"><i class="tgme_widget_message_user_photo bgcolor1" data-content="T"><img src="https://cdn4.telesco.pe/file/CbMqT_zwWzSJSQQl52b0WJD-TMuVoDSZJdSOZZVkjbcA8P0zwWXQY0GzeADVJaxZOEkvsJyXVr4dW5PhdBYTmCkU1FLtIt5tdrcQN9AVOK3VLPguVH-6O9I_P8EWQ7AOiRelKQENRKyE59ZVLocT_p3v-X7Lli_D_usBxpPxcOJ3O-2iCdz4r0y7RS-ytc0nWS01duD5wHaVfbo0RyOJCZxroL8cgURSMch73HYIOJrjat3ec07X0qQaUZzRFFwfgT6FbpIrvzDw2vE215gm33KLJz_9r_uZUcBxWkmZCDYNf3ADISWSHoQ-80mVXQgEsMZHu0AtykV_8LgOIYH4dw.jpg"></i></a></div>
+  <div class="tgme_widget_message_bubble">
+    
+        <i class="tgme_widget_message_bubble_tail">
+      <svg class="bubble_icon" width="9px" height="20px" viewBox="0 0 9 20">
+        <g fill="none">
+          <path class="background" fill="#ffffff" d="M8,1 L9,1 L9,20 L8,20 L8,18 C7.807,15.161 7.124,12.233 5.950,9.218 C5.046,6.893 3.504,4.733 1.325,2.738 L1.325,2.738 C0.917,2.365 0.89,1.732 1.263,1.325 C1.452,1.118 1.72,1 2,1 L8,1 Z"></path>
+          <path class="border_1x" fill="#d7e3ec" d="M9,1 L2,1 C1.72,1 1.452,1.118 1.263,1.325 C0.89,1.732 0.917,2.365 1.325,2.738 C3.504,4.733 5.046,6.893 5.95,9.218 C7.124,12.233 7.807,15.161 8,18 L8,20 L9,20 L9,1 Z M2,0 L9,0 L9,20 L7,20 L7,20 L7.002,18.068 C6.816,15.333 6.156,12.504 5.018,9.58 C4.172,7.406 2.72,5.371 0.649,3.475 C-0.165,2.729 -0.221,1.464 0.525,0.649 C0.904,0.236 1.439,0 2,0 Z"></path>
+          <path class="border_2x" d="M9,1 L2,1 C1.72,1 1.452,1.118 1.263,1.325 C0.89,1.732 0.917,2.365 1.325,2.738 C3.504,4.733 5.046,6.893 5.95,9.218 C7.124,12.233 7.807,15.161 8,18 L8,20 L9,20 L9,1 Z M2,0.5 L9,0.5 L9,20 L7.5,20 L7.5,20 L7.501,18.034 C7.312,15.247 6.64,12.369 5.484,9.399 C4.609,7.15 3.112,5.052 0.987,3.106 C0.376,2.547 0.334,1.598 0.894,0.987 C1.178,0.677 1.579,0.5 2,0.5 Z"></path>
+          <path class="border_3x" d="M9,1 L2,1 C1.72,1 1.452,1.118 1.263,1.325 C0.89,1.732 0.917,2.365 1.325,2.738 C3.504,4.733 5.046,6.893 5.95,9.218 C7.124,12.233 7.807,15.161 8,18 L8,20 L9,20 L9,1 Z M2,0.667 L9,0.667 L9,20 L7.667,20 L7.667,20 L7.668,18.023 C7.477,15.218 6.802,12.324 5.64,9.338 C4.755,7.064 3.243,4.946 1.1,2.983 C0.557,2.486 0.52,1.643 1.017,1.1 C1.269,0.824 1.626,0.667 2,0.667 Z"></path>
+        </g>
+      </svg>
+    </i>
+    <div class="tgme_widget_message_author accent_color"><a class="tgme_widget_message_owner_name" href="https://t.me/TWAPx"><span dir="auto">TWAPs | Hyper | первый парсер в СНГ,остальные доходяги решили просто спиздить.</span></a></div>
+
+
+<div class="tgme_widget_message_text js-message_text" dir="auto"><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F9FA9.png')"><b>🟩</b></i> <b>&#036;138.27K покупка </b><a href="https://www.mexc.com/ru-RU/futures/LIT_USDT" target="_blank" rel="noopener" onclick="return confirm('Open this link?\n\n'+this.href);"><b>LIT</b></a><b> в течении 5.5 часа</b><br/><br/>Цена: &#036;4.73<br/>Объем: &#036;46.00M (0.30%)<br/>Субъект: <code>0x69443708e5135532d435b7d1a3b7e6bdc481a800</code><br/><a href="?q=%23bdc481a800">#bdc481a800</a><br/><br/>Создан в: 15:21:01 (UTC)</div>
+<div class="tgme_widget_message_footer compact js-message_footer">
+  
+  <div class="tgme_widget_message_info short js-message_info">
+    <span class="tgme_widget_message_views">6</span><span class="copyonly"> views</span><span class="tgme_widget_message_meta"><a class="tgme_widget_message_date" href="https://t.me/TWAPx/44734"><time datetime="2026-09-08T15:21:12+00:00" class="time">15:21</time></a></span>
+  </div>
+</div>
+  </div>
+  <div class="tgme_widget_message_inline_keyboard"><div class="tgme_widget_message_inline_row"><a class="tgme_widget_message_inline_button url_button" href="https://app.hyperliquid.xyz/explorer/tx/0xa7ed315f97574204a9660443f675220204eb0045325a60d64bb5dcb2565b1bef" target="_blank" rel="noopener" onclick="return confirm('Open this link?\n\n'+this.href);"><span class="tgme_widget_message_inline_button_text" dir="auto"><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F9497.png')"><b>🔗</b></i> Explorer</span></a><a class="tgme_widget_message_inline_button url_button" href="https://hypurrscan.io/address/0x69443708e5135532d435b7d1a3b7e6bdc481a800" target="_blank" rel="noopener" onclick="return confirm('Open this link?\n\n'+this.href);"><span class="tgme_widget_message_inline_button_text" dir="auto"><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F91A4.png')"><b>👤</b></i> Hypurrscan</span></a></div></div>
+</div></div><div class="tgme_widget_message_wrap js-widget_message_wrap"><div class="tgme_widget_message text_not_supported_wrap js-widget_message" data-post="TWAPx/44735" data-view="eyJjIjotMzY2MzE3MDc4NSwicCI6NDQ3MzUsInQiOjE3ODg4ODEyNjAsImgiOiIzYzIwMDdkYWFjMWE1MjVjODkifQ">
+  <div class="tgme_widget_message_user"><a href="https://t.me/TWAPx"><i class="tgme_widget_message_user_photo bgcolor1" data-content="T"><img src="https://cdn4.telesco.pe/file/CbMqT_zwWzSJSQQl52b0WJD-TMuVoDSZJdSOZZVkjbcA8P0zwWXQY0GzeADVJaxZOEkvsJyXVr4dW5PhdBYTmCkU1FLtIt5tdrcQN9AVOK3VLPguVH-6O9I_P8EWQ7AOiRelKQENRKyE59ZVLocT_p3v-X7Lli_D_usBxpPxcOJ3O-2iCdz4r0y7RS-ytc0nWS01duD5wHaVfbo0RyOJCZxroL8cgURSMch73HYIOJrjat3ec07X0qQaUZzRFFwfgT6FbpIrvzDw2vE215gm33KLJz_9r_uZUcBxWkmZCDYNf3ADISWSHoQ-80mVXQgEsMZHu0AtykV_8LgOIYH4dw.jpg"></i></a></div>
+  <div class="tgme_widget_message_bubble">
+    
+        <i class="tgme_widget_message_bubble_tail">
+      <svg class="bubble_icon" width="9px" height="20px" viewBox="0 0 9 20">
+        <g fill="none">
+          <path class="background" fill="#ffffff" d="M8,1 L9,1 L9,20 L8,20 L8,18 C7.807,15.161 7.124,12.233 5.950,9.218 C5.046,6.893 3.504,4.733 1.325,2.738 L1.325,2.738 C0.917,2.365 0.89,1.732 1.263,1.325 C1.452,1.118 1.72,1 2,1 L8,1 Z"></path>
+          <path class="border_1x" fill="#d7e3ec" d="M9,1 L2,1 C1.72,1 1.452,1.118 1.263,1.325 C0.89,1.732 0.917,2.365 1.325,2.738 C3.504,4.733 5.046,6.893 5.95,9.218 C7.124,12.233 7.807,15.161 8,18 L8,20 L9,20 L9,1 Z M2,0 L9,0 L9,20 L7,20 L7,20 L7.002,18.068 C6.816,15.333 6.156,12.504 5.018,9.58 C4.172,7.406 2.72,5.371 0.649,3.475 C-0.165,2.729 -0.221,1.464 0.525,0.649 C0.904,0.236 1.439,0 2,0 Z"></path>
+          <path class="border_2x" d="M9,1 L2,1 C1.72,1 1.452,1.118 1.263,1.325 C0.89,1.732 0.917,2.365 1.325,2.738 C3.504,4.733 5.046,6.893 5.95,9.218 C7.124,12.233 7.807,15.161 8,18 L8,20 L9,20 L9,1 Z M2,0.5 L9,0.5 L9,20 L7.5,20 L7.5,20 L7.501,18.034 C7.312,15.247 6.64,12.369 5.484,9.399 C4.609,7.15 3.112,5.052 0.987,3.106 C0.376,2.547 0.334,1.598 0.894,0.987 C1.178,0.677 1.579,0.5 2,0.5 Z"></path>
+          <path class="border_3x" d="M9,1 L2,1 C1.72,1 1.452,1.118 1.263,1.325 C0.89,1.732 0.917,2.365 1.325,2.738 C3.504,4.733 5.046,6.893 5.95,9.218 C7.124,12.233 7.807,15.161 8,18 L8,20 L9,20 L9,1 Z M2,0.667 L9,0.667 L9,20 L7.667,20 L7.667,20 L7.668,18.023 C7.477,15.218 6.802,12.324 5.64,9.338 C4.755,7.064 3.243,4.946 1.1,2.983 C0.557,2.486 0.52,1.643 1.017,1.1 C1.269,0.824 1.626,0.667 2,0.667 Z"></path>
+        </g>
+      </svg>
+    </i>
+    <div class="tgme_widget_message_author accent_color"><a class="tgme_widget_message_owner_name" href="https://t.me/TWAPx"><span dir="auto">TWAPs | Hyper | первый парсер в СНГ,остальные доходяги решили просто спиздить.</span></a></div>
+
+<a class="tgme_widget_message_reply user-color-default" href="https://t.me/TWAPx/44692" ">
+<div class="tgme_widget_message_author accent_color">
+  <span class="tgme_widget_message_author_name" dir="auto">TWAPs | Hyper | первый парсер в СНГ,остальные доходяги решили просто спиздить.</span>
+</div>
+<div class="tgme_widget_message_text js-message_reply_text" dir="auto"><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F9FA9.png')"><b>🟩</b></i> &#036;199.88K покупка PONS в течении 1 час  Цена: &#036;0.768570 Объем: &#036;114.89M (0.17%) Субъект: 0x72774e2fe1992d5da8c6e9cef73fd2ab980c0b98 #ab980c0b98  Создан в: 14:20:34 (UTC)</div>
+</a>
+<div class="tgme_widget_message_text js-message_text" dir="auto"><b><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/E29C85.png')"><b>✅</b></i> TWAP завершён</b><br/>Статус: finished<br/>Исполнено: 100.00%<br/>Размер: 260067.00 / 260067.00 PONS<br/>TwapId: <code>2197300</code><br/>Субъект: <code>0x72774e2fe1992d5da8c6e9cef73fd2ab980c0b98</code><br/><br/>Цена в начале:  &#036;0.768570<br/>Цена в конце: &#036;0.782870 <i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F9FA2.png')"><b>🟢</b></i> (+1.86%)</div>
+<div class="tgme_widget_message_footer compact js-message_footer">
+  
+  <div class="tgme_widget_message_info short js-message_info">
+    <span class="tgme_widget_message_views">6</span><span class="copyonly"> views</span><span class="tgme_widget_message_meta"><a class="tgme_widget_message_date" href="https://t.me/TWAPx/44735"><time datetime="2026-09-08T15:22:04+00:00" class="time">15:22</time></a></span>
+  </div>
+</div>
+  </div>
+  <div class="tgme_widget_message_inline_keyboard"><div class="tgme_widget_message_inline_row"><a class="tgme_widget_message_inline_button url_button" href="https://app.hyperliquid.xyz/explorer/tx/0x622b62d4532a8c8163a50443f5b0fe02026400b9ee2dab5305f40e27122e666c" target="_blank" rel="noopener" onclick="return confirm('Open this link?\n\n'+this.href);"><span class="tgme_widget_message_inline_button_text" dir="auto"><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F9497.png')"><b>🔗</b></i> Explorer</span></a><a class="tgme_widget_message_inline_button url_button" href="https://hypurrscan.io/address/0x72774e2fe1992d5da8c6e9cef73fd2ab980c0b98" target="_blank" rel="noopener" onclick="return confirm('Open this link?\n\n'+this.href);"><span class="tgme_widget_message_inline_button_text" dir="auto"><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F91A4.png')"><b>👤</b></i> Hypurrscan</span></a></div></div>
+</div></div><div class="tgme_widget_message_wrap js-widget_message_wrap"><div class="tgme_widget_message text_not_supported_wrap js-widget_message" data-post="TWAPx/44736" data-view="eyJjIjotMzY2MzE3MDc4NSwicCI6NDQ3MzYsInQiOjE3ODg4ODEyNjAsImgiOiI4N2VhNTkwMmUwYWM0YzhkZWQifQ">
+  <div class="tgme_widget_message_user"><a href="https://t.me/TWAPx"><i class="tgme_widget_message_user_photo bgcolor1" data-content="T"><img src="https://cdn4.telesco.pe/file/CbMqT_zwWzSJSQQl52b0WJD-TMuVoDSZJdSOZZVkjbcA8P0zwWXQY0GzeADVJaxZOEkvsJyXVr4dW5PhdBYTmCkU1FLtIt5tdrcQN9AVOK3VLPguVH-6O9I_P8EWQ7AOiRelKQENRKyE59ZVLocT_p3v-X7Lli_D_usBxpPxcOJ3O-2iCdz4r0y7RS-ytc0nWS01duD5wHaVfbo0RyOJCZxroL8cgURSMch73HYIOJrjat3ec07X0qQaUZzRFFwfgT6FbpIrvzDw2vE215gm33KLJz_9r_uZUcBxWkmZCDYNf3ADISWSHoQ-80mVXQgEsMZHu0AtykV_8LgOIYH4dw.jpg"></i></a></div>
+  <div class="tgme_widget_message_bubble">
+    
+        <i class="tgme_widget_message_bubble_tail">
+      <svg class="bubble_icon" width="9px" height="20px" viewBox="0 0 9 20">
+        <g fill="none">
+          <path class="background" fill="#ffffff" d="M8,1 L9,1 L9,20 L8,20 L8,18 C7.807,15.161 7.124,12.233 5.950,9.218 C5.046,6.893 3.504,4.733 1.325,2.738 L1.325,2.738 C0.917,2.365 0.89,1.732 1.263,1.325 C1.452,1.118 1.72,1 2,1 L8,1 Z"></path>
+          <path class="border_1x" fill="#d7e3ec" d="M9,1 L2,1 C1.72,1 1.452,1.118 1.263,1.325 C0.89,1.732 0.917,2.365 1.325,2.738 C3.504,4.733 5.046,6.893 5.95,9.218 C7.124,12.233 7.807,15.161 8,18 L8,20 L9,20 L9,1 Z M2,0 L9,0 L9,20 L7,20 L7,20 L7.002,18.068 C6.816,15.333 6.156,12.504 5.018,9.58 C4.172,7.406 2.72,5.371 0.649,3.475 C-0.165,2.729 -0.221,1.464 0.525,0.649 C0.904,0.236 1.439,0 2,0 Z"></path>
+          <path class="border_2x" d="M9,1 L2,1 C1.72,1 1.452,1.118 1.263,1.325 C0.89,1.732 0.917,2.365 1.325,2.738 C3.504,4.733 5.046,6.893 5.95,9.218 C7.124,12.233 7.807,15.161 8,18 L8,20 L9,20 L9,1 Z M2,0.5 L9,0.5 L9,20 L7.5,20 L7.5,20 L7.501,18.034 C7.312,15.247 6.64,12.369 5.484,9.399 C4.609,7.15 3.112,5.052 0.987,3.106 C0.376,2.547 0.334,1.598 0.894,0.987 C1.178,0.677 1.579,0.5 2,0.5 Z"></path>
+          <path class="border_3x" d="M9,1 L2,1 C1.72,1 1.452,1.118 1.263,1.325 C0.89,1.732 0.917,2.365 1.325,2.738 C3.504,4.733 5.046,6.893 5.95,9.218 C7.124,12.233 7.807,15.161 8,18 L8,20 L9,20 L9,1 Z M2,0.667 L9,0.667 L9,20 L7.667,20 L7.667,20 L7.668,18.023 C7.477,15.218 6.802,12.324 5.64,9.338 C4.755,7.064 3.243,4.946 1.1,2.983 C0.557,2.486 0.52,1.643 1.017,1.1 C1.269,0.824 1.626,0.667 2,0.667 Z"></path>
+        </g>
+      </svg>
+    </i>
+    <div class="tgme_widget_message_author accent_color"><a class="tgme_widget_message_owner_name" href="https://t.me/TWAPx"><span dir="auto">TWAPs | Hyper | первый парсер в СНГ,остальные доходяги решили просто спиздить.</span></a></div>
+
+
+<div class="tgme_widget_message_text js-message_text" dir="auto"><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F9FA9.png')"><b>🟩</b></i> <b>&#036;2.36M покупка </b><a href="https://www.mexc.com/ru-RU/futures/ZEC_USDT" target="_blank" rel="noopener" onclick="return confirm('Open this link?\n\n'+this.href);"><b>ZEC</b></a><b> в течении 12 часов</b><br/><br/>Цена: &#036;1,178.55<br/>Объем: &#036;320.39M (0.74%)<br/>Субъект: <code>0x9321d8117e73b0c79035f0e87debcfd8dbb1d75a</code><br/><a href="?q=%23d8dbb1d75a">#d8dbb1d75a</a><br/><br/>Создан в: 15:23:05 (UTC)</div>
+<div class="tgme_widget_message_footer compact js-message_footer">
+  
+  <div class="tgme_widget_message_info short js-message_info">
+    <span class="tgme_widget_message_views">4</span><span class="copyonly"> views</span><span class="tgme_widget_message_meta"><a class="tgme_widget_message_date" href="https://t.me/TWAPx/44736"><time datetime="2026-09-08T15:23:33+00:00" class="time">15:23</time></a></span>
+  </div>
+</div>
+  </div>
+  <div class="tgme_widget_message_inline_keyboard"><div class="tgme_widget_message_inline_row"><a class="tgme_widget_message_inline_button url_button" href="https://app.hyperliquid.xyz/explorer/tx/0xd35d8b843921decbd4d70443f67bdc0204ee0069d424fd9d772636d6f825b8b6" target="_blank" rel="noopener" onclick="return confirm('Open this link?\n\n'+this.href);"><span class="tgme_widget_message_inline_button_text" dir="auto"><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F9497.png')"><b>🔗</b></i> Explorer</span></a><a class="tgme_widget_message_inline_button url_button" href="https://hypurrscan.io/address/0x9321d8117e73b0c79035f0e87debcfd8dbb1d75a" target="_blank" rel="noopener" onclick="return confirm('Open this link?\n\n'+this.href);"><span class="tgme_widget_message_inline_button_text" dir="auto"><i class="emoji" style="background-image:url('//telegram.org/img/emoji/40/F09F91A4.png')"><b>👤</b></i> Hypurrscan</span></a></div></div>
+</div></div>
+    </section>
+  </div>
+</main>
+    <script src="//telegram.org/js/jquery.min.js"></script>
+    <script src="//telegram.org/js/jquery-ui.min.js"></script>
+    <script src="//telegram.org/js/tgwallpaper.min.js?3"></script>
+<script src="//telegram.org/js/tgsticker.js?32"></script>
+
+    <script src="//telegram.org/js/widget-frame.js?68"></script>
+    <script src="//telegram.org/js/telegram-web.js?14"></script>
+    <script>TWeb.init();
+</script>
+    
+  </body>
+</html>
+<!-- page generated in 69.39ms -->

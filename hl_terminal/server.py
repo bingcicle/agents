@@ -204,7 +204,11 @@ PRIO_K_DEPTH        = 0.10
 PRIO_FLOOR_USD      = 15_000.0
 PRIO_COOLDOWN_S     = 600   # одна адреса — не частіше разу на 10 хв
 PRIO_AGG_S          = 15.0  # v2.19: вікно агрегації WS-філів невідомої адреси по (адреса, монета, бік)
-PRIO_AGG_MIN_USD    = 500.0 # філ дрібніший — не накопичується (пил)
+PRIO_AGG_MIN_USD    = 0.0   # v2.20 (аудит v2.19, залишкове): пил ТЕЖ накопичується — 100×$200
+                            # у вікні 15 с = та сама подія, що $20k одним; вікно й чистка
+                            # акумуляторів тримають пам'ять обмеженою
+GONE_MAX_S          = 2 * 3600  # v2.20 (аудит №8): пара, яку скан бачить закритою, чекає
+                                # підтвердження sweep-ом (філи → подія) не довше за це
 _prio_acc           = {}    # (addr, coin, side) -> [сума $, ts початку вікна]
 PRIO_MAX_PER_MIN    = 10    # стеля тригерів; надлишок дропається з логом
 PRIO_DIRECT_PER_MIN = 4     # без проксі прямі запити ще скупіші
@@ -1737,6 +1741,50 @@ def update_watchlist(result, depth_snap, scan_start=0, failed_addrs=None,
                     new_wl.setdefault(_wa, {})[_wc] = dict(_wp)
                     carried_unscanned += 1
 
+        # v2.20 (аудит v2.19 №8): пара, яку СКАН бачить закритою (нема у знімку
+        # гаманця, який скан зчитав успішно), а realtime ще НЕ підтвердив
+        # (немає tombstone після старту скану) — НЕ зникає мовчки: лишається
+        # у watchlist з міткою _gone_ts, щоб sweep дістав філи й доставив
+        # повне закриття стратегіям/алертам (раніше: пара видалялась, sweep її
+        # не бачив, реверс-подія губилась). Обмеження — GONE_MAX_S, далі дроп
+        carried_gone = dropped_gone = 0
+        # пари, ПРИСУТНІ у знімку скану (позиція є, хай і без ratio/грейсу) — не «закриті»
+        _seen_pairs = {(p_["addr"].lower(), c_) for c_, ps_ in result.items() for p_ in ps_
+                       if p_.get("size") and p_.get("addr")}
+        for _wa, _wcoins in list(watchlist.items()):
+            if _wa not in (fetch_times or {}):
+                continue
+            _ft_a = (fetch_times or {}).get(_wa, scan_start)
+            for _wc, _wp in _wcoins.items():
+                _nw = new_wl.get(_wa, {}).get(_wc)
+                if _nw is None and (_wa, _wc) in _seen_pairs:
+                    continue   # позиція жива, просто не кваліфікується (ratio/грейс) — звичайний дроп
+                if _nw is not None:
+                    if (_nw.get("side") == _wp.get("side")
+                            or (_wp.get("upd", 0) >= _ft_a > 0)):
+                        _nw.pop("_gone_ts", None)   # пара жива у знімку — мітка знімається
+                        continue
+                    # ФЛІП у знімку (інший бік), а realtime старий бік ще не закрив:
+                    # старий запис лишається з міткою — sweep побачить розворот,
+                    # доставить повне закриття старого боку й вставить новий
+                    # (_insert_flipped); інакше реверс-подія старого боку губилась
+                _k = f"{_wa}:{_wc}"
+                if scan_tombstones.get(_k, 0) >= scan_start > 0:
+                    continue   # realtime уже закрив (і заалертив) цю пару
+                _g = float(_wp.get("_gone_ts") or 0)
+                if _g and _now_wl - _g > GONE_MAX_S:
+                    dropped_gone += 1
+                    stats["scan_gone_dropped"] = stats.get("scan_gone_dropped", 0) + 1
+                    print(f"  [WATCH] {_wc} {_wa[:10]}: закриття не підтверджене sweep-ом за "
+                          f"{GONE_MAX_S // 3600} год — пара знята (філів не отримано)")
+                    continue
+                _cp = dict(_wp)
+                if not _g:
+                    _cp["_gone_ts"] = _now_wl
+                    stats["scan_gone_carried"] = stats.get("scan_gone_carried", 0) + 1
+                new_wl.setdefault(_wa, {})[_wc] = _cp   # і при фліпі: старий бік замість нового
+                carried_gone += 1
+
         # Merge за ЧАСОМ, а не за розміром (last-write-wins): якщо
         # realtime торкався пари ПІСЛЯ того, як скан зчитав цей гаманець,
         # live-запис новіший і виграє повністю. Старий варіант брав live
@@ -1780,7 +1828,8 @@ def update_watchlist(result, depth_snap, scan_start=0, failed_addrs=None,
     print(f"  [WATCH] Watchlist updated: {len(new_wl)} wallets, "
           f"{sum(len(v) for v in new_wl.values())} positions with ratio>=2x"
           + (f" | {carried_unscanned} пар carried (не скановані/помилки)"
-             if carried_unscanned else ""))
+             if carried_unscanned else "")
+          + (f" | {carried_gone} закритих чекають підтвердження sweep" if carried_gone else ""))
 
 scan_metrics = {"next_scan_at": 0.0, "last_duration_s": 0.0, "new_pairs": 0}
 _scan_timer = None
@@ -2002,7 +2051,7 @@ def run_prio_fetcher():
             _prio_log(addr, coin0, pos_side, notional, depth0, thr,
                       result, best_ratio, "+".join(added), via_proxy)
 
-def get_recent_market_fills(addr, coin, since_ms, side=None):
+def get_recent_market_fills(addr, coin, since_ms, side=None, with_passive=False):
     """
     Повертає АГРЕСИВНІ закриття для addr/coin після since_ms,
     згруповані по ТРАНЗАКЦІЯХ (hash). side — бік позиції, яку
@@ -2022,6 +2071,9 @@ def get_recent_market_fills(addr, coin, since_ms, side=None):
       (реальні тейкер-закриття губились) і коштувала зайвого запиту.
 
     Кидає RateLimited / APIError при помилці — щоб не плутати з "немає fills".
+    v2.20 (аудит v2.19 №9): with_passive=True → (агресивні, ПАСИВНІ) — мейкерські
+    та TWAP-закриття тієї ж позиції (agg=0): вони НЕ тригер стратегій і не
+    алерт, але ВХОДЯТЬ в епізод закриття (тривалість/початок), як у settlement.
     """
     # Пагінація: одна відповідь — максимум 2000 філів. Без ММ-фільтра
     # у watchlist бувають гіперактивні гаманці, і потрібний філ міг
@@ -2080,7 +2132,7 @@ def get_recent_market_fills(addr, coin, since_ms, side=None):
         raise APIError(f"fills window incomplete for {addr[:10]}")
 
     # Групуємо по HASH (транзакція)
-    txs = {}  # hash -> {sz, cost, ts, oids, dir}
+    txs_by = {True: {}, False: {}}   # агресивність -> hash -> {sz, cost, ts, oids, dir}
     for f in (fills or []):
         # СТРОГА схема (аудит v2.6 №2): це головний детектор, битий
         # рядок тут = НЕ "пропустимо", а "результату довіряти не можна"
@@ -2120,8 +2172,12 @@ def get_recent_market_fills(addr, coin, since_ms, side=None):
         else:
             is_close = ("Close" in d) or (">" in d) or f_liq
         is_twap  = (f.get("twapId") is not None)
-        if not ((is_taker or f_liq) and is_close and not is_twap):
+        if not is_close:
             continue
+        agg = bool((is_taker or f_liq) and not is_twap)
+        if not agg and not with_passive:
+            continue
+        txs = txs_by[agg]
         oid = f.get("oid")
         h  = f.get("hash")
         # СИСТЕМНІ філи (ліквідації/ADL) несуть нульовий hash 0x000…0:
@@ -2178,11 +2234,12 @@ def get_recent_market_fills(addr, coin, since_ms, side=None):
             t["ts"] = f.get("time", 0)
 
     # Перетворюємо на список транзакцій
-    market_txs = []
-    for h, t in txs.items():
+    market_txs, passive_txs = [], []
+    for _agg, _txs in ((True, txs_by[True]), (False, txs_by[False])):
+      for h, t in _txs.items():
         if t["sz"] <= 0: continue
-        market_txs.append({
-            "hash":    h,
+        (market_txs if _agg else passive_txs).append({
+            "hash":    h, "agg": int(_agg),
             "px":      t["cost"] / t["sz"],   # середня ціна транзакції
             "sz":      t["sz"],               # сумарний розмір
             "sp":      t.get("sp", 0.0),      # позиція перед транзакцією
@@ -2195,6 +2252,9 @@ def get_recent_market_fills(addr, coin, since_ms, side=None):
             "px_last":  t["px_last"],         # сирий останній філ (кінець проходу)
         })
     market_txs.sort(key=lambda x: x["ts"], reverse=True)
+    if with_passive:
+        passive_txs.sort(key=lambda x: x["ts"], reverse=True)
+        return market_txs, passive_txs
     return market_txs
 
 def _depth_ok(d, count=True):
@@ -2317,7 +2377,7 @@ def _insert_flipped(addr, coin, pos, alert_key, snap_ms=None):
     print(f"  [WATCH] {coin} {addr[:10]} розворот: новий {pos['side']} "
           f"ratio {ratio:.1f}x одразу під наглядом")
 
-_ingested = OrderedDict()   # (addr, coin, tx-id) -> ts: доставлені транзакції (LRU)
+_ingested = OrderedDict()   # (addr, coin, tx-id) -> {"ts", "ok": {споживачі, що обробили}} (LRU)
 _ingested_lock = threading.Lock()
 INGEST_LRU = 20000
 
@@ -2329,60 +2389,127 @@ def _tx_key(f):
         return f"sys:{f.get('ts')}:{f.get('sz')}:{f.get('px')}"
     return h
 
-def _ingest_txs(addr, coin, old, mfills, new_size, full_close, det_src, snap_ms):
+INGEST_CONSUMERS = ("sim", "fc", "rev", "fol")
+INGEST_RETRY_MAX = 50
+_fc_done = {}       # (addr, coin) -> ключ останньої tx уже доставленого ПОВНОГО закриття
+_ingest_retry = {}  # (addr, coin) -> [tx, що якийсь споживач не підтвердив] (повтор при наступній доставці)
+
+def _ingest_txs(addr, coin, old, mfills, new_size, full_close, det_src, snap_ms, passive=None):
     """v2.19 (аудит v2.17 C): ЄДИНИЙ приймач підтверджених маркет-транзакцій
     для всіх шляхів детекції (WS fast-path / sweep / скан-діф) — дедуп за
     ідентичністю tx (_tx_key, LRU INGEST_LRU), журнал close_batch, SIM,
-    епізод (fc_on_txs), реверс, follow, повне закриття. Раніше скан-діф
-    підтверджував дельту філами, рухав спільний курсор і НЕ віддавав їх
-    стратегіям — філ «з'їдався»: пропущений вхід, передчасний вихід за
-    тишею, хибний початок наступного епізоду. Повне закриття, чиї tx уже
-    доставлені іншим шляхом (гонка WS↔sweep), усе одно доходить до
-    реверсу/follow/FC як подія (SIM їх не дублює).
+    епізод (fc_on_txs), реверс, follow, повне закриття.
+    v2.20 (аудит v2.19 №9): ІДЕМПОТЕНТНІСТЬ — кожна tx тримає ПІДТВЕРДЖЕННЯ
+    успішної обробки КОЖНИМ споживачем (sim/fc/rev/fol): збій одного споживача
+    не «з'їдає» tx для нього (наступна доставка повторює лише йому), а
+    успішні не дублюються; повне закриття має СТАБІЛЬНИЙ id (адреса, монета,
+    остання tx) — повторна доставка тієї самої події (WS↔sweep) не породжує
+    другого сигналу/_OUTCOME; passive — мейкерські/TWAP-закриття лише в
+    епізод (fc_on_txs), не тригер.
     → (нові tx після дедупу, ev_val, ep_ratio) для алерт-гейта."""
     now = time.time()
+    fc_key = (addr, coin)
     with _ingested_lock:
-        fresh = []
-        for f in mfills:
-            k = (addr, coin, _tx_key(f))
-            if k in _ingested:
-                continue
-            _ingested[k] = now
-            fresh.append(f)
+        # рев'ю v2.20: tx, яку якийсь споживач НЕ підтвердив (збій), лежить у
+        # retry-списку пари й повторно пред'являється при наступній доставці
+        # для цієї пари (курсор філів уже пішов далі — інакше джерела повтору
+        # немає); стеля INGEST_RETRY_MAX на пару, старші за годину — геть
+        _rt = [f for f in _ingest_retry.get(fc_key, ()) if now - float(f.get("_rt_ts") or now) < 3600.0]
+        _have = {_tx_key(f) for f in mfills}
+        mfills = list(mfills) + [f for f in _rt if _tx_key(f) not in _have]
+    keys = [(addr, coin, _tx_key(f)) for f in mfills]
+    with _ingested_lock:
+        fresh, todo = [], {c: [] for c in INGEST_CONSUMERS}
+        for f, k in zip(mfills, keys):
+            d = _ingested.get(k)
+            if d is None:
+                d = {"ts": now, "ok": set(), "busy": set()}
+                _ingested[k] = d
+                fresh.append(f)
+            d.setdefault("busy", set())
+            for c in INGEST_CONSUMERS:
+                if c not in d["ok"] and c not in d["busy"]:
+                    todo[c].append(f)
+                    d["busy"].add(c)   # in-flight: паралельна доставка (WS↔скан) не дублює виклик
         while len(_ingested) > INGEST_LRU:
             _ingested.popitem(last=False)
     dup = len(mfills) - len(fresh)
     if dup:
         stats["ingest_dup"] = stats.get("ingest_dup", 0) + dup
-    if not fresh and not full_close:
+    def _release(c, lst, ok):
+        """після виклику споживача: успіх — підтвердження; збій — tx у retry-список пари"""
+        with _ingested_lock:
+            for f in lst:
+                d = _ingested.get((addr, coin, _tx_key(f)))
+                if d is None:
+                    continue
+                d.get("busy", set()).discard(c)
+                if ok:
+                    d["ok"].add(c)
+                else:
+                    lst_r = _ingest_retry.setdefault(fc_key, [])
+                    if _tx_key(f) not in {_tx_key(x) for x in lst_r}:
+                        lst_r.append(dict(f, _rt_ts=now))
+                    if len(lst_r) > INGEST_RETRY_MAX:
+                        del lst_r[:len(lst_r) - INGEST_RETRY_MAX]
+            if fc_key in _ingest_retry:
+                _done = {_tx_key(f) for f in lst} if ok else set()
+                _ingest_retry[fc_key] = [f for f in _ingest_retry[fc_key]
+                                         if not (_tx_key(f) in _done
+                                                 and all(cc in (_ingested.get((addr, coin, _tx_key(f))) or {}).get("ok", ())
+                                                         for cc in INGEST_CONSUMERS))]
+                if not _ingest_retry[fc_key]:
+                    _ingest_retry.pop(fc_key, None)
+    last_key = (max(zip((f.get("ts") or 0 for f in mfills), (k[2] for k in keys)))[1]
+                if mfills else f"empty:{snap_ms}")
+    fc_event = bool(full_close) and _fc_done.get(fc_key) != last_key
+    if not any(todo.values()) and not fc_event:
+        if passive:
+            try:
+                fc_on_txs(addr, coin, old, [], passive=passive)   # пасивні — лише в епізод
+            except Exception as _fe:
+                print(f"  [FC] passive hook err: {_fe}")
         return [], _grace_val(old), 0
-    stats["ingest_txs"] = stats.get("ingest_txs", 0) + len(fresh)
-    stats[f"ingest_{det_src}"] = stats.get(f"ingest_{det_src}", 0) + 1
+    if fresh:
+        stats["ingest_txs"] = stats.get("ingest_txs", 0) + len(fresh)
+        stats[f"ingest_{det_src}"] = stats.get(f"ingest_{det_src}", 0) + 1
+    if not fresh and not fc_event:
+        stats["ingest_retry"] = stats.get("ingest_retry", 0) + 1
     txs = fresh if fresh else list(mfills)
     # аудит-2 №8: первинна подія у журнал — сирі ціни/розміри/час
     # кожної транзакції, знімок позиції, джерело детекції
-    _journal("close_batch", addr=addr, coin=coin, side=old.get("side"),
-             full_close=bool(full_close), detect_src=det_src, snap_ms=snap_ms,
-             old_size=old.get("size"), old_val=old.get("val"), ratio=old.get("ratio"),
-             new_size=new_size, n_txs=len(txs), n_dup=dup,
-             truncated=bool(len(txs) > 500),
-             txs=[{"h": str(f.get("hash"))[:18], "px": f["px"],
-                   "pf": f.get("px_first"), "pl": f.get("px_last"),
-                   "sz": f["sz"], "sp": f.get("sp"), "ts": f.get("ts"),
-                   "dir": f.get("dir"), "liq": int(bool(f.get("liq"))),
-                   "n": f.get("n_orders")}
-                  for f in txs[:500]])   # аудит-3: без обрізання на 40
-    # ── Симулятор: кожна підтверджена маркет-транзакція (лише нові) ──
-    if fresh:
+    if fresh or fc_event:
+      try:
+        _journal("close_batch", addr=addr, coin=coin, side=old.get("side"),
+                 full_close=bool(full_close), detect_src=det_src, snap_ms=snap_ms,
+                 old_size=old.get("size"), old_val=old.get("val"), ratio=old.get("ratio"),
+                 new_size=new_size, n_txs=len(txs), n_dup=dup, n_passive=len(passive or ()),
+                 truncated=bool(len(txs) > 500),
+                 txs=[{"h": str(f.get("hash"))[:18], "px": f["px"],
+                       "pf": f.get("px_first"), "pl": f.get("px_last"),
+                       "sz": f["sz"], "sp": f.get("sp"), "ts": f.get("ts"),
+                       "dir": f.get("dir"), "liq": int(bool(f.get("liq"))),
+                       "n": f.get("n_orders")}
+                      for f in txs[:500]])   # аудит-3: без обрізання на 40
+      except Exception as _je:
+        print(f"  [JOURNAL] close_batch err: {_je}")
+    # ── Симулятор: кожна підтверджена маркет-транзакція (лише ще не оброблені ним) ──
+    if todo["sim"]:
         try:
-            sim_on_market_txs(addr, coin, old, fresh, new_size, full_close)
+            sim_on_market_txs(addr, coin, old, todo["sim"], new_size, full_close)
+            _release("sim", todo["sim"], True)
         except Exception as _se:
+            _release("sim", todo["sim"], False)
             print(f"  [SIM] hook err: {_se}")
-    # ── Стратегія відкату (п.6): годуємо епізоди (дедуп по hash усередині) ──
-    try:
-        fc_on_txs(addr, coin, old, txs)
-    except Exception as _fe:
-        print(f"  [FC] txs hook err: {_fe}")
+    # ── Стратегія відкату (п.6): годуємо епізоди (дедуп по hash усередині;
+    #    пасивні філи — теж в епізод, аудит №9) ──
+    if todo["fc"] or passive:
+        try:
+            fc_on_txs(addr, coin, old, todo["fc"], passive=passive)
+            _release("fc", todo["fc"], True)
+        except Exception as _fe:
+            _release("fc", todo["fc"], False)
+            print(f"  [FC] txs hook err: {_fe}")
     # Розмір ПОДІЇ для алерт-гейта — ДО того, як fc_on_full_close
     # зніме епізод: при повному закритті це позиція на старті
     # серії, а не $5k-хвіст перед фінальним батчем (v2.11 п.1,
@@ -2399,20 +2526,34 @@ def _ingest_txs(addr, coin, old, mfills, new_size, full_close, det_src, snap_ms)
         # (рев'ю v2.12 №7a: 50%+50% показувало 1.25 замість 2.5)
         ep_ratio = (_ep_a or {}).get("ratio") or 0
     # ── ОБОЛОНКА СТРАТЕГІЙ: реверс + вхід у бік. rev читає
-    #    епізод ДО того, як fc_on_full_close його зніме
-    try:
-        rev_on_close(addr, coin, old, txs, full_close, detect_src=det_src)
-    except Exception as _re:
-        print(f"  [REV] hook err: {_re}")
-    try:
-        follow_on_txs(addr, coin, old, txs, full_close, detect_src=det_src)
-    except Exception as _fo:
-        print(f"  [FOLLOW] hook err: {_fo}")
+    #    епізод ДО того, як fc_on_full_close його зніме. Повне закриття без
+    #    нових tx (гонка WS↔sweep) — подія доставляється ОДИН раз (fc_event)
+    txs_rev = todo["rev"] if todo["rev"] else (list(mfills) if fc_event else [])
+    if txs_rev:
+        try:
+            rev_on_close(addr, coin, old, txs_rev, full_close, detect_src=det_src, detect_ms=snap_ms)
+            _release("rev", todo["rev"], True)
+        except Exception as _re:
+            _release("rev", todo["rev"], False)
+            print(f"  [REV] hook err: {_re}")
+    txs_fol = todo["fol"] if todo["fol"] else (list(mfills) if fc_event else [])
+    if txs_fol:
+        try:
+            follow_on_txs(addr, coin, old, txs_fol, full_close, detect_src=det_src, detect_ms=snap_ms)
+            _release("fol", todo["fol"], True)
+        except Exception as _fo:
+            _release("fol", todo["fol"], False)
+            print(f"  [FOLLOW] hook err: {_fo}")
     try:
         if full_close:
             fc_on_full_close(addr, coin, old)
     except Exception as _fe:
         print(f"  [FC] full hook err: {_fe}")
+    if full_close:
+        _fc_done[fc_key] = last_key
+        if len(_fc_done) > 5000:
+            for _k in list(_fc_done)[:1000]:
+                _fc_done.pop(_k, None)
     return fresh, ev_val, ep_ratio
 
 def run_realtime_monitor():
@@ -2487,6 +2628,7 @@ def run_realtime_monitor():
                         with watchlist_lock:
                             if addr in watchlist and coin in watchlist[addr]:
                                 _w = watchlist[addr][coin]
+                                _w.pop("_gone_ts", None)   # v2.20: позиція жива — мітка скану знімається
                                 _w["val"]   = new_pos["val"]
                                 _w["entry"] = new_pos.get("entry",
                                                           _w.get("entry", 0))
@@ -2560,8 +2702,8 @@ def run_realtime_monitor():
                 else:
                     since_ms = int((time.time() - 300) * 1000)
                 try:
-                    mfills = get_recent_market_fills(addr, coin, since_ms,
-                                                     old.get("side"))
+                    mfills, _passive = get_recent_market_fills(addr, coin, since_ms,
+                                                               old.get("side"), with_passive=True)
                 except RateLimited:
                     stats["rate_limited"] += 1
                     with cycle_rl_lock:
@@ -2573,6 +2715,13 @@ def run_realtime_monitor():
                     continue
 
                 if not mfills:
+                    if _passive:
+                        # v2.20 (аудит №9): пасивні закриття без агресивних — лише
+                        # в епізод (початок/тривалість), ДО зсуву курсора
+                        try:
+                            fc_on_txs(addr, coin, old, [], passive=_passive)
+                        except Exception as _pe:
+                            print(f"  [FC] passive hook err: {_pe}")
                     stats["fills_empty"] += 1
                     sent_alerts.discard(alert_key)
                     # АНТИ-РЕЙС: ми бачимо зміну позиції за пів секунди,
@@ -2662,7 +2811,7 @@ def run_realtime_monitor():
                 # дедупом за ідентичністю tx (той самий код у скан-діфі)
                 _fresh_txs, _ev_val, _ep_ratio = _ingest_txs(
                     addr, coin, old, mfills, (new_pos["size"] if new_pos else 0.0),
-                    full_close, det_src, snap_ms)
+                    full_close, det_src, snap_ms, passive=_passive)
 
                 # ПОРІГ (повернено на вимогу користувача): алерт лише
                 # коли ОДНА маркет-транзакція закрила >= MIN_CLOSE_PCT
@@ -3025,8 +3174,8 @@ def check_position_changes(new_result, depth_snap):
             else:
                 since_ms = int((time.time() - 300) * 1000)
             try:
-                mfills = get_recent_market_fills(addr, coin, since_ms,
-                                                 old.get("side"))
+                mfills, _passive = get_recent_market_fills(addr, coin, since_ms,
+                                                           old.get("side"), with_passive=True)
             except (RateLimited, APIError, Exception):
                 # Не можемо підтвердити — пропускаємо без алерту, а БАЗУ
                 # пари лишаємо СТАРОЮ (аудит v2.6 №1: інакше "наступний
@@ -3038,6 +3187,11 @@ def check_position_changes(new_result, depth_snap):
                 failed_keep.setdefault(addr, {})[coin] = _kept
                 continue
             if not mfills:
+                if _passive:
+                    try:
+                        fc_on_txs(addr, coin, old, [], passive=_passive)   # v2.20: лише в епізод
+                    except Exception as _pe:
+                        print(f"  [FC] passive hook err: {_pe}")
                 # Немає маркет fills — не шлемо алерт
                 continue
             # Курсор рухаємо ОДРАЗУ після підтвердження, ЯК У REALTIME
@@ -3055,7 +3209,7 @@ def check_position_changes(new_result, depth_snap):
             # епізоду). Той самий приймач, що й у realtime; дедуп за tx
             try:
                 _ingest_txs(addr, coin, old, mfills, new_pos["size"], False, "scan",
-                            int(_now * 1000))
+                            int(_now * 1000), passive=_passive)
             except Exception as _ie:
                 print(f"  [DIFF] ingest err: {_ie}")
 
@@ -3449,14 +3603,14 @@ def _book_quote(book_res, bids, asks, q_ms, t0, recv, coin, exch, what):
                 "exch": exch})
     return out
 
-def hl_book_exec(coin, side, usd=None, qty=None):
+def hl_book_exec(coin, side, usd=None, qty=None, min_recv_ms=None):
     """Свіжий стакан HL (l2Book, вага 2) через prio-канал → ВИКОНУВАНА
     ціна ринкового ордера з нашого боку: BUY іде по асках, SELL по бідах,
     VWAP по рівнях (v2.16). v2.19: лише для трекерів, відкритих до 2.19
     (біржа виконання нових — Binance, bn_book_exec); qty — вихід на
     кількість контрактів входу. Повертає dict(px, px_filled, qty, fill_frac,
     mid, bid, ask, ts_ms, recv_ms, req_ms, partial, exch="hl") або None."""
-    raw = _raw_book_get("hl", coin)
+    raw = _raw_book_get("hl", coin, min_recv_ms)
     if raw is None:
         t0 = time.time()
         try:
@@ -3481,12 +3635,16 @@ def hl_book_exec(coin, side, usd=None, qty=None):
         raw = _raw_book_put("hl", coin, t0, recv, bids, asks, q_ms)
     return _book_from_raw(raw, side, usd, qty, coin, "hl", "l2Book")
 
-def _raw_book_get(exch, coin):
+def _raw_book_get(exch, coin, min_recv_ms=None):
     """Сирий стакан не старший за BOOK_RAW_TTL_S (рев'ю v2.19): різні
     трекери одного тику виходять різними кількостями — один запит на
-    (біржа, монета), прохід по стакану — на кожну кількість."""
+    (біржа, монета), прохід по стакану — на кожну кількість.
+    v2.20 (аудит v2.19 №1, ПРИЧИННІСТЬ): стакан, ОТРИМАНИЙ до моменту
+    рішення (min_recv_ms — час події/рішення, що запитує ціну), не є ціною
+    «після сигналу» — кеш його не віддає, буде новий запит."""
     raw = _raw_book_cache.get((exch, coin))
-    if raw and time.time() - raw["recv"] <= BOOK_RAW_TTL_S:
+    if raw and time.time() - raw["recv"] <= BOOK_RAW_TTL_S \
+            and (not min_recv_ms or raw["recv"] * 1000.0 >= float(min_recv_ms)):
         return raw
     return None
 
@@ -3509,7 +3667,7 @@ def _book_from_raw(raw, side, usd, qty, coin, exch, what):
     return _book_quote(res, raw["bids"], raw["asks"], raw["q_ms"], raw["t0"], raw["recv"],
                        coin, exch, what)
 
-def bn_book_exec(coin, side, usd=None, qty=None):
+def bn_book_exec(coin, side, usd=None, qty=None, min_recv_ms=None):
     """v2.19: біржа ВИКОНАННЯ paper-угод — Binance USDⓈ-M (рішення
     користувача 12.09): свіжий стакан fapi/v1/depth (BN_EXEC_LEVELS рівнів,
     вага 5, напряму — той самий IP, що й цикл глибини) → ціна ринкового
@@ -3527,7 +3685,7 @@ def bn_book_exec(coin, side, usd=None, qty=None):
     if _depth_universe[0] and coin not in _depth_universe[0]:
         stats["book_no_symbol"] = stats.get("book_no_symbol", 0) + 1
         return None
-    raw = _raw_book_get("bn", coin)
+    raw = _raw_book_get("bn", coin, min_recv_ms)
     if raw is None:
         if time.time() < _bn_backoff[0]:
             stats["book_fail"] = stats.get("book_fail", 0) + 1
@@ -3645,8 +3803,97 @@ def _px_mid_age(coin):
         ts, px = h[-1]
     return px, int((time.time() - ts) * 1000)
 
+# ── v2.20 (аудит v2.19 №2): ПОТІК ЦІН BINANCE для Binance-трекерів ──────
+# Сигнал (філи кита, BTC-вето, референс епізоду, P0/P1 твапу) — з HL; але
+# ПОРОГИ і ВИКОНАННЯ Binance-позиції (тригер R2, TP R8, хвилинні семпли
+# кривої, фолбек міда, кап тику) — лише з узгодженого Binance-потоку:
+# fapi/v1/ticker/bookTicker на всі символи кожні BN_PX_POLL_S (вага 5).
+BN_PX_POLL_S = 3.0
+BN_PX_URL    = "https://fapi.binance.com/fapi/v1/ticker/bookTicker"
+bn_px_lock   = threading.Lock()
+bn_px_hist   = {}   # symbol -> [(ts_send, mid, bid, ask), ...] (останні 50)
+
+def run_bn_px_poller():
+    while True:
+        t0 = time.time()
+        if t0 < _bn_backoff[0]:
+            time.sleep(1.0); continue
+        try:
+            req = urllib.request.Request(BN_PX_URL, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=5) as r:
+                data = json.loads(r.read())
+            n = 0
+            with bn_px_lock:
+                for it in data or ():
+                    try:
+                        sym = it.get("symbol"); bid = float(it.get("bidPrice")); ask = float(it.get("askPrice"))
+                    except (TypeError, ValueError, AttributeError):
+                        continue
+                    if not sym or not (math.isfinite(bid) and math.isfinite(ask)) or bid <= 0 or ask <= 0:
+                        continue
+                    h = bn_px_hist.setdefault(sym, [])
+                    h.append((t0, (bid + ask) / 2.0, bid, ask))
+                    if len(h) > 50: del h[:len(h) - 50]
+                    n += 1
+            stats["bn_px_last_ok"] = time.time(); stats["bn_px_n"] = n
+        except Exception as e:
+            code = getattr(e, "code", None)
+            if code in (418, 429):
+                try:
+                    ra = float((getattr(e, "headers", None) or {}).get("Retry-After") or 0)
+                except (TypeError, ValueError, AttributeError):
+                    ra = 0.0
+                _bn_backoff[0] = time.time() + max(30.0, ra)
+            stats["bn_px_fail"] = stats.get("bn_px_fail", 0) + 1
+            if stats["bn_px_fail"] in (1, 10, 100) or stats["bn_px_fail"] % 1000 == 0:
+                print(f"  [BNPX] bookTicker недоступний ({stats['bn_px_fail']}): {e}")
+        time.sleep(max(0.5, BN_PX_POLL_S - (time.time() - t0)))
+
+def _bn_px_mid_age(coin):
+    """Мід Binance (bookTicker) монети, його вік у мс і момент семпла (с);
+    (None, None, None) — потоку/символу нема."""
+    sym = get_bn_symbol(coin)
+    with bn_px_lock:
+        h = bn_px_hist.get(sym)
+        if not h:
+            return None, None, None
+        ts, mid = h[-1][0], h[-1][1]
+    return mid, int((time.time() - ts) * 1000), ts
+
+def _bn_px_now(coin, max_age=20.0):
+    mid, age_ms, _ = _bn_px_mid_age(coin)
+    return mid if (mid is not None and (age_ms or 0) <= max_age * 1000) else None
+
+def _mid_age_exch(exch, coin):
+    """(mid, age_ms, ts_s) з потоку біржі виконання: "bn" → bookTicker,
+    інакше HL allMids (старі трекери до 2.19)."""
+    if (exch or EXEC_EXCH) == "bn":
+        return _bn_px_mid_age(coin)
+    mid, age = _px_mid_age(coin)
+    ts = (time.time() - age / 1000.0) if age is not None else None
+    return mid, age, ts
+
+def _bn_px_age_s():
+    with bn_px_lock:
+        if not bn_px_hist:
+            return None
+        ts = max(h[-1][0] for h in bn_px_hist.values() if h)
+    return round(time.time() - ts, 1)
+
+def _tr_exch(p):
+    """Біржа виконання трекера — записана при вході (v2.19); трекер без
+    поля (до 2.19) виконувався на HL — і виходить/семплюється там само."""
+    return p.get("exch") or ("hl" if _vt(p.get("algo_v")) < (2, 19) else EXEC_EXCH)
+
+def _tr_px_now(p, max_age=30.0):
+    """v2.20 (аудит v2.19 №2): поточна ціна ДЛЯ ТРЕКЕРА — з потоку його
+    біржі виконання: тригер R2, TP R8, хвилинні семпли Binance-позиції
+    рахуються по Binance, не по HL-міду з Binance-входом."""
+    return (_bn_px_now(p["coin"], max_age) if _tr_exch(p) == "bn"
+            else _px_now(p["coin"], max_age=max_age))
+
 def _paper_px(coin, side, whale_px=None, max_mid_age_ms=20_000, strict=False,
-              qty=None, exch=None):
+              qty=None, exch=None, min_recv_ms=None):
     """Ціна paper-угоди У МОМЕНТ рішення (v2.16): свіжий стакан → src
     'book'. strict=True (ВХОДИ, аудит v2.16 №1): без повного стакану
     угоди немає — (None, 'no_book'); мід/ціна філа кита не є доказом
@@ -3660,14 +3907,20 @@ def _paper_px(coin, side, whale_px=None, max_mid_age_ms=20_000, strict=False,
     v2.19: exch — біржа виконання ("bn" Binance для нових трекерів, "hl" —
     старі), qty — вихід на кількість контрактів входу; meta.recv_ms —
     момент отримання ціни (= час виконання, аудит I). Вік міда міряється
-    ПІСЛЯ запиту стакану."""
+    ПІСЛЯ запиту стакану.
+    v2.20 (аудит v2.19 №1/№2): min_recv_ms — мінімальний момент ОТРИМАННЯ
+    котирування (час рішення): стакан чи мід, отримані раніше, не є ціною
+    після сигналу (кеш їх не віддає; мід старіший за рішення → 'none');
+    мід-фолбек — з потоку ТІЄЇ Ж біржі (Binance bookTicker для "bn"), а
+    не HL allMids з позначкою exch="bn"."""
     exch = exch or EXEC_EXCH
     meta = {"mid": None, "px_age_ms": None, "whale_px": whale_px,
             "book_ms": None, "partial": 0, "quote_ts_ms": None, "exch": exch,
-            "recv_ms": None, "fill_frac": None, "px_filled": None, "qty": None}
-    bx = (bn_book_exec(coin, side, qty=qty) if exch == "bn"
-          else hl_book_exec(coin, side, qty=qty))
-    mid, age_ms = _px_mid_age(coin)   # ПІСЛЯ запиту: вік на момент входу
+            "recv_ms": None, "fill_frac": None, "px_filled": None, "qty": None,
+            "min_recv_ms": min_recv_ms}
+    bx = (bn_book_exec(coin, side, qty=qty, min_recv_ms=min_recv_ms) if exch == "bn"
+          else hl_book_exec(coin, side, qty=qty, min_recv_ms=min_recv_ms))
+    mid, age_ms, mid_ts = _mid_age_exch(exch, coin)   # ПІСЛЯ запиту: вік на момент входу
     meta["mid"], meta["px_age_ms"] = mid, age_ms
     if bx:
         meta["book_ms"] = bx["req_ms"]; meta["partial"] = bx["partial"]
@@ -3683,6 +3936,11 @@ def _paper_px(coin, side, whale_px=None, max_mid_age_ms=20_000, strict=False,
         return None, "no_book", meta
     if mid is None or (age_ms or 0) > max_mid_age_ms:
         return None, "none", meta
+    if min_recv_ms and mid_ts and mid_ts * 1000.0 < float(min_recv_ms):
+        # семпл міда знято ДО рішення — не «ціна після сигналу» (аудит №1)
+        stats["px_pre_decision"] = stats.get("px_pre_decision", 0) + 1
+        return None, "none", meta
+    meta["recv_ms"] = int(mid_ts * 1000) if mid_ts else meta["recv_ms"]   # момент семпла — час ціни
     px, src = mid, "mid"
     if whale_px:
         worse = max(mid, whale_px) if side == "BUY" else min(mid, whale_px)
@@ -4152,7 +4410,8 @@ def _pending_rev_rows(st, csv_keys):
                     "exit_src": p.get("exit_src") or "", "detect_src": p.get("detect_src") or "",
                     "adm": 0, "sig_ok": None, "sig_why": "pending", "px_ok": None,
                     "exit_ok": (0 if reason == "timer_late" else 1), "exit_why": "",
-                    "exit_partial": int(_ff is not None and _ff < 1.0 - 1e-9), "fill_frac": _ff,
+                    "exit_partial": int((_ff is not None and _ff < 1.0 - 1e-9)
+                                        or str(p.get("exit_src") or "").startswith("book_partial")), "fill_frac": _ff,
                     "funding": p.get("funding_pct"), "exch": p.get("exch") or "",
                     "exec_delay": p.get("exec_delay_s"), "net_tp_mkt": None, "net_tp_lim": None,
                     "entered": 1, "ts": p.get("detect_ts"), "pending_row": 1,
@@ -4467,8 +4726,10 @@ def _fc_rebuild(ep_txs, old, seen, prev=None):
           "start_size": (t0.get("sp") or old.get("size", 0)),
           "max_sz": 0.0, "max_usd": 0.0, "max_liq": 0, "pos_after": None,
           "txs": [{k: t.get(k) for k in ("hash", "ts", "px", "px_first", "px_last",
-                                          "sz", "sp", "dir", "liq")} for t in ep_txs]}
+                                          "sz", "sp", "dir", "liq", "agg")} for t in ep_txs]}
     for t in ep_txs:
+        if int(t.get("agg", 1)) == 0:
+            continue   # v2.20: база R7 «одним пострілом» — лише агресивна tx
         if t["sz"] > ep["max_sz"]:
             ep["max_sz"], ep["max_usd"] = t["sz"], t["px"] * t["sz"]
             ep["max_liq"] = int(bool(t.get("liq")))
@@ -4477,7 +4738,7 @@ def _fc_rebuild(ep_txs, old, seen, prev=None):
     return ep
 fc_positions = {}   # (addr, coin) -> наша відкрита позиція відкату
 
-def fc_on_txs(addr, coin, old, mfills):
+def fc_on_txs(addr, coin, old, mfills, passive=None):
     """Будує епізод закриття з підтверджених маркет-транзакцій.
     аудит-3 №2: епізод = settle.close_episode над УСІМА транзакціями
     поточного епізоду + новими, у хронології: розрив ≤300 с між сусідніми
@@ -4485,12 +4746,18 @@ def fc_on_txs(addr, coin, old, mfills):
     попередньої); долив/перевідкриття ВСЕРЕДИНІ батча теж починає новий
     епізод (раніше перевірялась лише межа між батчами — той самий потік,
     порізаний інакше, давав іншу базу R7 і тривалість)."""
-    if not FC_ENABLED or not mfills: return
+    if not FC_ENABLED or not (mfills or passive): return
     key = (addr, coin)
+    # v2.20 (аудит v2.19 №9): епізод будується на ВСІХ закриттях позиції —
+    # агресивних (agg=1: тригер стратегій) і пасивних (мейкер/TWAP, agg=0:
+    # лише тривалість/початок), як у settlement (close_episode над усіма
+    # філами) — інакше live бачив 60 с там, де settlement бачить 360
+    _all = [dict(t, agg=(1 if t.get("agg") is None else int(t.get("agg")))) for t in (mfills or ())]
+    _all += [dict(t, agg=0) for t in (passive or ())]
     with fc_lock:
         ep = fc_episodes.get(key)
         seen = ep["seen"] if ep else set()
-        new = sorted([t for t in mfills if t.get("hash") not in seen],
+        new = sorted([t for t in _all if t.get("hash") not in seen],
                      key=lambda t: t.get("ts", 0))
         if not new: return
         # аудит v2.17 D: активний FC-трек (fc_positions — стара стрічка
@@ -4517,9 +4784,11 @@ def fc_on_txs(addr, coin, old, mfills):
                           "sz": t["sz"], "px": (t.get("px_first") or t["px"]), "_i": i})
         t_last = max(t.get("ts", 0) for t in txs_all)
         if _close_episode is not None:
-            # grow_only: у live лише тейкерські філи — мейкерське закриття
-            # між ними не є новим епізодом (рев'ю), розрив лише на зростанні
-            _first, _last, ep_f = _close_episode(fills, coin, t_last, True, grow_only=True)
+            # v2.20: у потоці ВСІ закриття (і мейкерські) — абсолютний допуск
+            # «позиція не виросла», як у settlement (grow_only лише для
+            # епізодів зі старого state без пасивних філів)
+            _grow_only = not any(int(t.get("agg", 1)) == 0 for t in txs_all)
+            _first, _last, ep_f = _close_episode(fills, coin, t_last, True, grow_only=_grow_only)
             ep_txs = [txs_all[f["_i"]] for f in ep_f] if ep_f else [txs_all[-1]]
         else:
             # фолбек без settle.py: те саме правило inline (розрив ≤300 с і
@@ -4771,9 +5040,11 @@ STRAT_SINCE = {
     # 2.17 — строгий стакан, єдиний епізод на кожній tx, повне закриття
     # для всіх R. Рядки 2.16 — лише через legacy-допуск за settlement
     # (_rev_adm_legacy: епізод, повне закриття, лаг, ціна зі стрічки)
-    "R1_загальний": "2.17", "R2_breakout": "2.17", "R3_великі": "2.17",
+    # v2.20: R2/R8 — тригер/TP тепер по Binance-потоку (до 2.20 — HL-мід проти
+    # Binance-входу: інша семантика перетину), рядки 2.17–2.19 не порівнянні
+    "R1_загальний": "2.17", "R2_breakout": "2.20", "R3_великі": "2.17",
     "R4_великий": "2.17", "R5_дуже": "2.17", "R6_волт": "2.17",
-    "R7_одним": "2.17", R8_NAME: "2.17",
+    "R7_одним": "2.17", R8_NAME: "2.20",
     "F1_1хв": "2.10", "F2_2хв": "2.10", "F3_3хв": "2.10",
     "F6_1хв_перший": "2.10",
     # v2.18: профіль v10 (життєві цикли, без ratio-гейта, uncertain), F5 —
@@ -4815,7 +5086,7 @@ F4_CLAMP         = (60.0, 300.0)
 F5_FIRST_SHOT_S  = 3600.0   # пауза пари, після якої tx знову «перша»
 PROFILE_WINDOW_D = 90       # глибина історії, днів
 PROFILE_PAGES    = 6        # 5 × 2000 = кап API 10k; 6-та — детект «є ще»
-PROFILE_ALGO_V   = 10     # версія алгоритму профілів: старі записи без
+PROFILE_ALGO_V   = 11     # версія алгоритму профілів: старі записи без
                           # цієї позначки перераховуються (аудит v2.1 п.3;
                           # v3: boundary-safe пагінація; v4: епізод =
                           # позиція, malformed fail-closed, композитний
@@ -4831,10 +5102,14 @@ PROFILE_ALGO_V   = 10     # версія алгоритму профілів: с
                           # (лише ≥$100k) — кваліфікація F7, ТЗ 04.09;
                           # v9: бік "Short > Long" — SHORT, глибина з
                           # правильної сторони (аудит v2.10 №8))
+EVAL_SINCE       = "2026-09-13"   # v2.20 (аудит v2.19, рекомендація 6): правила кандидатних
+                                  # стратегій ЗАФІКСОВАНО; результат нового періоду (з цієї
+                                  # дати, локальний час) показується ОКРЕМО від того, на якому
+                                  # обирались пороги (блок eval у картці/зрізі)
 RESEARCH_SINCE   = "2.17" # аудит-3 №4: спостереження на тіньовій outcome-стрічці —
                           # лише рядки з поточною семантикою (рух епізоду, ціна
                           # детекту після строгого правила); старіші — поза
-DATA_ALGO_V      = "2.19" # версія логіки збору: трекер отримує її при
+DATA_ALGO_V      = "2.20" # версія логіки збору: трекер отримує її при
                           # СТВОРЕННІ і несе у рядок; API рахує лише
                           # поточну версію (аудит v2.2: рестарт підписував
                           # старі трекери новою версією). При зміні
@@ -4965,7 +5240,8 @@ REV_HEADERS = (["sig_id", "strategy", "date", "coin", "our_side", "whale_addr",
                 "exit_ts_ms", "exit_px", "exit_src", "tp_px",
                 # v2.19: виконання на Binance (біржа, кількість, частковий
                 # вихід, фандинг, затримка застосування ціни)
-                "exch", "entry_qty", "exit_fill_frac", "funding_pct", "exec_delay_s"]
+                "exch", "entry_qty", "exit_fill_frac", "funding_pct", "exec_delay_s",
+                "decision_ms", "detect_ms", "exit_decision_ms", "exit_px_filled", "trig_hash"]
                + [f"m{i}" for i in range(1, REV_TRACK_MIN + 1)] + ["eol"])
 FOLLOW_HEADERS = ["date_open", "date_close", "strategy", "coin", "our_side",
                   "whale_addr", "entry_px", "exit_px", "exit_reason", "hold_s",
@@ -4993,7 +5269,8 @@ FOLLOW_HEADERS = ["date_open", "date_close", "strategy", "coin", "our_side",
                   "prof_status", "prof_n_uncertain", "prof_fast_lb95", "prof_cont_pct",
                   "prof_one_shot_pct", "prof_after_pct_med",
                   # v2.19: виконання на Binance
-                  "exch", "entry_qty", "exit_fill_frac", "funding_pct", "exec_delay_s", "eol"]
+                  "exch", "entry_qty", "exit_fill_frac", "funding_pct", "exec_delay_s",
+                "decision_ms", "detect_ms", "exit_decision_ms", "exit_px_filled", "trig_hash", "eol"]
 # Тіньова хвилинна стрічка FOLLOW-входів: m1..m60 у НАШОМУ напрямку від
 # ціни входу, незалежно від правил виходу F1-F4 — щоб крива "яка хвилина
 # виходу найкраща" існувала й для follow (запит користувача 30.08)
@@ -5272,7 +5549,7 @@ def _rev_ref_px(coin, first_ts_ms, first_px):
             return p
     return first_px
 
-def rev_on_close(addr, coin, old, mfills, full_close, detect_src="sweep"):
+def rev_on_close(addr, coin, old, mfills, full_close, detect_src="sweep", detect_ms=None):
     """Викликається на кожен підтверджений батч закриттів, ДО того як
     fc_on_full_close зніме епізод (фічі dur/sum ще доступні)."""
     if not STRAT2_ENABLED or not mfills: return
@@ -5379,16 +5656,24 @@ def rev_on_close(addr, coin, old, mfills, full_close, detect_src="sweep"):
     # останнього філа кита (v2.16 п.1)
     # аудит v2.16 №1: стратегії відкриваються ЛИШЕ за повним свіжим
     # стаканом; без нього — тільки тіньова outcome-стрічка від міда
+    # v2.20 (аудит v2.19 №1): рішення = старт обробника; котирування, отримане
+    # раніше (кеш стакану, семпл міда), не є ціною ПІСЛЯ сигналу
+    decision_ms = int(now * 1000)
     px_entry, entry_src, pmeta = _paper_px(coin, "BUY" if side == "LONG" else "SELL",
-                                           whale_px=last_px, strict=True)
+                                           whale_px=last_px, strict=True, min_recv_ms=decision_ms)
     no_book = not px_entry
     if no_book:
         stats["rev_no_book"] = stats.get("rev_no_book", 0) + 1
-        _mid0, _age0 = _px_mid_age(coin)
-        if _mid0 is None or (_age0 or 0) > 20_000:
+        # тіньова outcome-стрічка від міда ТІЄЇ Ж біржі (аудит №2), знятого не
+        # раніше за ПОДІЮ (останній філ кита): семпл поллера завжди старший за
+        # рішення, але не має бути старшим за сигнал (причинність, аудит №1)
+        _mid0, _age0, _mts0 = _mid_age_exch(pmeta.get("exch") or EXEC_EXCH, coin)
+        _ev_ms = int(_txs[-1].get("ts") or 0)
+        if _mid0 is None or (_age0 or 0) > 20_000 or (_mts0 and _ev_ms and _mts0 * 1000.0 < _ev_ms):
             stats["rev_no_px"] = stats.get("rev_no_px", 0) + 1
             return
         px_entry, entry_src = _mid0, "mid"
+        pmeta = dict(pmeta); pmeta["recv_ms"] = int(_mts0 * 1000) if _mts0 else decision_ms
     # аудит v2.17 I: час виконання = момент ОТРИМАННЯ ціни (запит стакану
     # міг тривати секунди), не «зараз» після нього
     t_entry = (pmeta.get("recv_ms") / 1000.0) if pmeta.get("recv_ms") else time.time()
@@ -5401,6 +5686,13 @@ def rev_on_close(addr, coin, old, mfills, full_close, detect_src="sweep"):
     stale = lag_s is not None and lag_s > REV_MAX_FILL_AGE_S
     if stale:
         stats["rev_stale_skips"] = stats.get("rev_stale_skips", 0) + 1
+    if lag_s is not None and lag_s < 0:
+        # аудит v2.19 №1: НИЖНЯ межа лага — ціна, отримана до філа кита,
+        # порушує причинність (зсув годинника / стара котировка): входу немає
+        stats["rev_neg_lag"] = stats.get("rev_neg_lag", 0) + 1
+        _journal("rev_skip", addr=addr, coin=coin, why="neg_lag", fill_ts_ms=fill_ts_ms,
+                 lag_s=round(lag_s, 3), recv_ms=pmeta.get("recv_ms"), decision_ms=decision_ms)
+        return
     b_now = _px_now("BTC"); b_ago = _px_ago("BTC", REV_WINDOW_S)
     if b_now and b_ago:
         btc_move = (b_now / b_ago - 1.0) * 100.0
@@ -5423,9 +5715,12 @@ def rev_on_close(addr, coin, old, mfills, full_close, detect_src="sweep"):
              if full_close else (old.get("ratio", 0) or 0))
     grace = int((old.get("ratio") or 0) < 2.0)   # v2.16 п.4
     # унікальність: мс + монета + гаманець + hash транзакції-тригера
-    _txh = str(mfills[-1].get("hash", ""))[2:10]
-    _sig_seq[0] += 1
-    sig_id = f"{int(now * 1000)}-{coin}-{addr[2:8]}-{_txh}-{_sig_seq[0]}"
+    # v2.20 (аудит v2.19 №9): СТАБІЛЬНИЙ id сигналу — (монета, адреса, час і
+    # hash останньої tx батчу): повторна доставка тієї самої події дає той
+    # самий ключ (_OUTCOME перезаписується, не дублюється); різні батчі
+    # одного епізоду — різні ключі, як і раніше
+    _txh = str(_txs[-1].get("hash", ""))[2:10]
+    sig_id = f"{int(fill_ts_ms or now * 1000)}-{coin}-{addr[2:8]}-{_txh}"
     # «одним пострілом» (ТЗ 04.09 п.2): повне закриття, у якому ОДНА
     # маркет-транзакція закрила ≥95% позиції і коштувала ≥$100k.
     # Аудит v2.10 №2: звіряємось із ЕПІЗОДОМ, а не з поточним батчем —
@@ -5494,6 +5789,10 @@ def rev_on_close(addr, coin, old, mfills, full_close, detect_src="sweep"):
                 "grace": grace, "entry_src": entry_src,
                 "entry_px_mid": pmeta.get("mid"), "px_age_ms": pmeta.get("px_age_ms"),
                 "whale_px": last_px,
+                # v2.20: окремі мітки часу — подія (fill_ts_ms), виявлення,
+                # рішення; hash останньої транзакції батча (тригер сигналу)
+                "detect_ms": detect_ms, "decision_ms": decision_ms,
+                "trig_hash": str(_txs[-1].get("hash") or ""),
                 "samples": [], "peak": -999.0, "trough": 999.0}
     base_pos.update(_xf)   # v2.19: біржа, кількість контрактів, фандинг
     opened = []
@@ -5636,14 +5935,22 @@ def _rev_extra(p):
             p.get("exit_src", ""), _rnd(p.get("tp_px"), 8)] + _exec_extra(p)
 
 def _exec_extra(p):
-    """v2.19: 5 колонок виконання у рядках R/F/TWAP — біржа, кількість
+    """v2.19: колонки виконання у рядках R/F/TWAP — біржа, кількість
     контрактів входу, заповнена частка виходу, фандинг (%), затримка між
-    отриманням ціни і застосуванням (с)."""
+    отриманням ціни і застосуванням (с). v2.20 (аудит v2.19 №1/№5): окремі
+    мітки часу — виявлення (detect_ms: знімок/WS-подія), рішення входу
+    (decision_ms: старт обробника), рішення виходу (exit_decision_ms: фаза 1
+    тику); VWAP заповненої частини виходу (exit_px_filled) і hash тригерної
+    транзакції (trig_hash — settlement звіряє САМЕ її, аудит №3)."""
+    _ms_ = lambda v: (int(v) if isinstance(v, (int, float)) and v else "")
     return [p.get("exch", ""), _rnd(p.get("entry_qty"), 8),
             _rnd(p.get("exit_fill_frac"), 4), _rnd(p.get("funding_pct"), 5),
-            _rnd(p.get("exec_delay_s"), 3)]
+            _rnd(p.get("exec_delay_s"), 3),
+            _ms_(p.get("decision_ms")), _ms_(p.get("detect_ms")), _ms_(p.get("exit_decision_ms")),
+            _rnd(p.get("exit_px_filled"), 8), (p.get("trig_hash") or "")]
 
-EXEC_COLS = ["exch", "entry_qty", "exit_fill_frac", "funding_pct", "exec_delay_s"]
+EXEC_COLS = ["exch", "entry_qty", "exit_fill_frac", "funding_pct", "exec_delay_s",
+             "decision_ms", "detect_ms", "exit_decision_ms", "exit_px_filled", "trig_hash"]
 
 def _rev_row(p, entered):
     costs = _p_costs(p)
@@ -5751,7 +6058,7 @@ def _fol_row(p, fid, close_ts, exit_px, reason, g):
            + _exec_extra(p)
 
 # ── ВХІД У БІК ТИСКУ ────────────────────────────────────
-def follow_on_txs(addr, coin, old, mfills, full_close, detect_src="sweep"):
+def follow_on_txs(addr, coin, old, mfills, full_close, detect_src="sweep", detect_ms=None):
     if not STRAT2_ENABLED or not mfills: return
     key = f"{addr}:{coin}"
     now = time.time()
@@ -5832,8 +6139,10 @@ def follow_on_txs(addr, coin, old, mfills, full_close, detect_src="sweep"):
     # СВІЖОГО повного стакану з нашого боку (виконувана на $1000); без
     # нього paper-угоди немає (аудит №1: мід і ціна філа кита не є доказом
     # ціни після зливу) — пропуск рахується
+    # v2.20 (аудит v2.19 №1): котирування — не раніше за рішення (старт обробника)
+    decision_ms = int(now * 1000)
     px, entry_src, pmeta = _paper_px(coin, "SELL" if our == "SHORT" else "BUY",
-                                     whale_px=tx["px"], strict=True)
+                                     whale_px=tx["px"], strict=True, min_recv_ms=decision_ms)
     if not px:
         stats["follow_no_book"] = stats.get("follow_no_book", 0) + 1
         _journal("follow_skip", addr=addr, coin=coin, why="no_book",
@@ -5848,6 +6157,14 @@ def follow_on_txs(addr, coin, old, mfills, full_close, detect_src="sweep"):
         stats["follow_stale_skips"] = stats.get("follow_stale_skips", 0) + 1
         _journal("follow_skip", addr=addr, coin=coin, why="stale_exec",
                  fill_ts_ms=fill_ts_ms, lag_s=round(lag_s, 2), lag_decision_s=round(lag_dec, 2),
+                 detect_src=detect_src)
+        return
+    if lag_s is not None and lag_s < 0:
+        # аудит v2.19 №1: нижня межа лага — ціна ДО тригерного філа = порушення
+        # причинності (кеш/зсув годинника); входу немає, подія у журналі
+        stats["follow_neg_lag"] = stats.get("follow_neg_lag", 0) + 1
+        _journal("follow_skip", addr=addr, coin=coin, why="neg_lag", fill_ts_ms=fill_ts_ms,
+                 lag_s=round(lag_s, 3), recv_ms=pmeta.get("recv_ms"), decision_ms=decision_ms,
                  detect_src=detect_src)
         return
     vault = is_vault(addr)
@@ -5875,6 +6192,10 @@ def follow_on_txs(addr, coin, old, mfills, full_close, detect_src="sweep"):
             "force_exit": None, "profile_gap": 0.0,
             "first_shot": first_shot,
             "pair_gap": (round(pair_gap, 1) if pair_gap is not None else ""),
+            # v2.20: мітки часу й ідентичність тригерної транзакції (аудит №1/№3)
+            "detect_ms": detect_ms, "decision_ms": decision_ms,
+            "trig_hash": str(tx.get("hash") or ""), "trig_dir": tx.get("dir") or "",
+            "trig_sz": tx.get("sz"), "trig_sp": tx.get("sp"),
             # профіль швидкості гаманця НА МОМЕНТ входу (v2.8): у рядок
             # кожної F-угоди, якщо профіль уже є — порівнювати когорти
             "prof": {},
@@ -6121,6 +6442,18 @@ def _profile_refresh_pick(now=None):
             r = _need(a)
             if r is not None:
                 cands.append((6, r[1], a))
+        elif p.get("err"):
+            # v2.20 (аудит v2.19, залишкове): профіль зі збоєм (err) поза
+            # watchlist — повторити після PROFILE_ERR_TTL_S, а не назавжди
+            r = _need(a)
+            if r is not None:
+                cands.append((7, r[1], a))
+    # v2.20: адреси, чий запит відклали (429/бюджет) і профілю ще НЕМА, а з
+    # watchlist вони вже випали — раніше не потрапляли до жодного списку
+    for a, t_ in retry.items():
+        if a in wl_set or a in profs or a in fetching or now < t_:
+            continue
+        cands.append((8, 0.0, a))
     cands.sort()
     return [a for _, _, a in cands[:PROFILE_REFRESH_BATCH]]
 
@@ -6305,8 +6638,17 @@ def _profile_lifecycles(txs):
     for tx in txs:
         if tx["kind"] == "open":
             if cur is None or cur["zero"]:
-                cur = {"start_known": True, "start_t": tx["t"], "opens": [tx], "closes": [],
-                       "pos": tx["sp"] + tx["sz"], "zero": False, "n_add_in": 0, "from_dust": 0}
+                # v2.20 (аудит v2.19 №7): відкриття доводить ПОЧАТОК позиції лише
+                # при нульовій попередній позиції (startPosition ≈ 0); перше
+                # видиме відкриття з ненульовим startPosition — ДОЛИВ до
+                # позиції, старшої за історію: початок невідомий (uncertain),
+                # не «швидкий» — обрізана історія не робить повільний гаманець
+                # підтверджено швидким
+                _prev = float(tx.get("sp") or 0.0)
+                _known = _prev <= max(1e-9, PROFILE_ZERO_TOL * (_prev + float(tx["sz"])))
+                cur = {"start_known": bool(_known), "start_t": (tx["t"] if _known else None),
+                       "opens": [tx], "closes": [], "pos": tx["sp"] + tx["sz"], "zero": False,
+                       "n_add_in": (0 if _known else 1), "from_dust": 0}
                 lifes.append(cur)
             elif cur.get("ep_end_t") is not None and tx["sp"] <= cur.get("dust_thr", 0.0):
                 cur = {"start_known": True, "start_t": tx["t"], "opens": [tx], "closes": [],
@@ -6731,7 +7073,15 @@ def _fetch_profile_locked(addr):
                 json.dump({"addr": addr, "fetched": prof["fetched"], "v": PROFILE_ALGO_V,
                            "window_start_ms": int(now_ms - PROFILE_WINDOW_D * 86400 * 1000),
                            "end_ms": int(now_ms), "n": len(fills), "fills": fills}, _gf)
-            os.replace(_tmp, os.path.join(_rd, f"{addr}.json.gz"))
+            # v2.20 (аудит v2.19, залишкове): сирі філи НЕ перезаписуються
+            # безслідно — ротація трьох поколінь (.json.gz → .1 → .2): кожен
+            # із останніх профілів відтворюваний зі своїх точних вихідних даних
+            _cur = os.path.join(_rd, f"{addr}.json.gz")
+            for _g in (2, 1):
+                _src = _cur if _g == 1 else os.path.join(_rd, f"{addr}.{_g - 1}.json.gz")
+                if os.path.exists(_src):
+                    os.replace(_src, os.path.join(_rd, f"{addr}.{_g}.json.gz"))
+            os.replace(_tmp, _cur)
     except Exception as _re:
         stats["profile_raw_err"] = stats.get("profile_raw_err", 0) + 1
         if stats["profile_raw_err"] in (1, 10):
@@ -6869,7 +7219,7 @@ def _strat2_tick():
                             p, 1 if p.get("entry_px") else 0)
                     rev_rows.append((pid, p["row_kind"], p["final_row"]))
                 continue
-            px = _px_now(p["coin"], max_age=30.0)
+            px = _tr_px_now(p, 30.0)   # v2.20: ціна з біржі виконання трекера
             if p["state"] == "armed":
                 # СПОЧАТКУ дедлайн (аудит п.3: пізній тик після
                 # закінчення вікна відкривав позицію заднім числом)
@@ -7042,7 +7392,7 @@ def _strat2_tick():
                     print(f"  [STRAT] DROP {fid}: done без final_row "
                           f"(старий state)")
                 continue
-            px = _px_now(p["coin"], max_age=30.0)
+            px = _tr_px_now(p, 30.0)   # v2.20: ціна з біржі виконання трекера
             if px:
                 g = (px / p["entry_px"] - 1.0) * 100.0
                 if p["our_side"] == "SHORT": g = -g
@@ -7076,11 +7426,7 @@ def _strat2_tick():
                     # виходять на m30 одним тиком — один запит, не шість (рев'ю)
         _pass_t0 = time.time()
         _fetched = set()   # (coin, бік, біржа) — реальні запити стакану за прохід
-        def _tr_exch(p):
-            # v2.19: біржа виконання трекера — записана при вході; трекер
-            # без поля (до 2.19) виконувався на HL — і виходить там само
-            return p.get("exch") or ("hl" if _vt(p.get("algo_v")) < (2, 19) else EXEC_EXCH)
-        def _ppx(coin, bside, strict=False, qty=None, exch=None):
+        def _ppx(coin, bside, strict=False, qty=None, exch=None, min_recv_ms=None):
             # strict (вхід R2 на пробої): ЛИШЕ повний свіжий стакан —
             # без міда/partial (рев'ю аудит-2: armed→open обходив
             # строге правило входу через фолбек міда)
@@ -7089,22 +7435,30 @@ def _strat2_tick():
             # стакану проходяться без нового запиту (_raw_book_cache)
             k = (coin, bside, strict, exch or EXEC_EXCH, round(qty, 8) if qty else None)
             fk = (coin, bside, exch or EXEC_EXCH)
+            # v2.20 (аудит №1): кешована відповідь придатна лише якщо ціну
+            # ОТРИМАНО не раніше за рішення цього запитувача (min_recv_ms)
+            if k in _pxc and min_recv_ms:
+                _rm = ((_pxc[k][2] or {}).get("recv_ms") or 0)
+                if _rm and _rm < min_recv_ms:
+                    _pxc.pop(k, None)
             if k not in _pxc:
                 if (fk not in _fetched and len(_fetched) >= 6) or time.time() - _pass_t0 > 12.0:
-                    # кап на прохід: решта — з кеш-міда (тик не має
+                    # кап на прохід: решта — з кеш-міда ТІЄЇ Ж біржі (тик не має
                     # тривати хвилину, інші трекери втрачають семпли);
-                    # для входу мід не годиться → no_book
-                    _mid, _age = _px_mid_age(coin)
-                    _m = {"mid": _mid, "px_age_ms": _age, "recv_ms": int(time.time() * 1000),
+                    # для входу мід не годиться → no_book; семпл до рішення — ні
+                    _mid, _age, _mts = _mid_age_exch(exch or EXEC_EXCH, coin)
+                    _m = {"mid": _mid, "px_age_ms": _age,
+                          "recv_ms": (int(_mts * 1000) if _mts else int(time.time() * 1000)),
                           "exch": exch or EXEC_EXCH}
+                    _pre = bool(min_recv_ms and _mts and _mts * 1000.0 < float(min_recv_ms))
                     if strict:
                         _pxc[k] = (None, "no_book", _m)
                     else:
-                        _pxc[k] = ((_mid if (_mid and (_age or 0) <= 35_000) else None), "mid", _m)
+                        _pxc[k] = ((_mid if (_mid and (_age or 0) <= 35_000 and not _pre) else None), "mid", _m)
                 else:
                     _fetched.add(fk)
                     _pxc[k] = _paper_px(coin, bside, max_mid_age_ms=35_000, strict=strict,
-                                        qty=qty, exch=exch)
+                                        qty=qty, exch=exch, min_recv_ms=min_recv_ms)
             return _pxc[k]
         for pid, what in rev_price:
             with strat2_lock:
@@ -7117,8 +7471,9 @@ def _strat2_tick():
             # відкриття LONG = BUY (аски), закриття LONG = SELL (біди)
             bside = (("BUY" if side == "LONG" else "SELL") if what == "arm"
                      else ("SELL" if side == "LONG" else "BUY"))
+            _mr = int(round(float(req.get("ts") or 0) * 1000)) or None   # рішення фази 1
             xpx, xsrc, xmeta = _ppx(coin, bside, strict=(what == "arm"),
-                                    qty=(None if what == "arm" else _q), exch=_ex)
+                                    qty=(None if what == "arm" else _q), exch=_ex, min_recv_ms=_mr)
             if what == "arm" and xpx and xsrc == "book":
                 # v2.19: поля виконання входу (фандинг — мережа) ПОЗА локом
                 xmeta = dict(xmeta); xmeta["_xf"] = _entry_exec_fields(xpx, xmeta, coin)
@@ -7130,18 +7485,26 @@ def _strat2_tick():
                     continue
                 coin, side = p["coin"], p["our_side"]
                 _q, _ex = p.get("entry_qty"), _tr_exch(p)
-            xpx, xsrc, xmeta = _ppx(coin, "BUY" if side == "SHORT" else "SELL", qty=_q, exch=_ex)
+                _mr = int(round(float((p.get("exit_pending") or {}).get("ts") or 0) * 1000)) or None
+            xpx, xsrc, xmeta = _ppx(coin, "BUY" if side == "SHORT" else "SELL", qty=_q, exch=_ex,
+                                    min_recv_ms=_mr)
             fpriced.append((fid, xpx, xsrc, xmeta))
-        def _apply_delay(xmeta, now2):
+        def _apply_delay(xmeta, now2, req=None):
             """аудит v2.17 I: ціна застосовується з моментом ОТРИМАННЯ; якщо
             від отримання до застосування минуло > BOOK_APPLY_MAX_S — це вже
-            не «зараз», повторний запит наступним тиком. → (recv_s, delay_s)
-            або (None, None) якщо застаріла."""
+            не «зараз», повторний запит наступним тиком. v2.20 (аудит v2.19 №1):
+            ціна, ОТРИМАНА до моменту рішення (req.ts фази 1), — не «після
+            сигналу» (захист у глибину до min_recv_ms). → (recv_s, delay_s)
+            або (None, None) якщо застаріла / до рішення."""
             recv = (xmeta or {}).get("recv_ms")
             recv_s = (recv / 1000.0) if recv else now2
             delay = max(0.0, now2 - recv_s)
             if delay > BOOK_APPLY_MAX_S:
                 stats["book_apply_stale"] = stats.get("book_apply_stale", 0) + 1
+                return None, None
+            _rt = float((req or {}).get("ts") or 0)
+            if recv and _rt and recv_s < _rt - 1e-6:
+                stats["book_pre_decision"] = stats.get("book_pre_decision", 0) + 1
                 return None, None
             return recv_s, delay
         _jrn = []   # події журналу — пишуться ПІСЛЯ лока (диск не тримає strat2_lock)
@@ -7171,7 +7534,7 @@ def _strat2_tick():
                         p["arm_hit"] = req
                         continue
                     trig, mid = req["trig"], req["mid"]
-                    recv_s, _dl = _apply_delay(xmeta, now2)
+                    recv_s, _dl = _apply_delay(xmeta, now2, req)
                     if recv_s is None:
                         # ціна застаріла до застосування — запит НЕ відновлюємо
                         # (рев'ю v2.19 №2: відновлений arm_hit зі старим ts блокував
@@ -7182,6 +7545,7 @@ def _strat2_tick():
                     p["entry_px"] = (max(base_px, trig) if p["side"] == "LONG"
                                      else min(base_px, trig))
                     p["entry_ts"] = recv_s   # аудит I: момент отримання ціни
+                    p["decision_ms"] = int(round(float(req.get("ts") or 0) * 1000))   # v2.20: рішення фази 1
                     p["entry_src"] = xsrc
                     p["entry_px_mid"] = xmeta.get("mid") or mid
                     p["px_age_ms"] = xmeta.get("px_age_ms")
@@ -7211,7 +7575,7 @@ def _strat2_tick():
                             continue
                         if not base_px:
                             continue   # повтор через exit_retry_at; після капу — no_price
-                        recv_s, _dl = _apply_delay(xmeta, now2)
+                        recv_s, _dl = _apply_delay(xmeta, now2, req)
                         if recv_s is None:
                             continue   # застаріла — запит не відновлюємо, фаза 1 створить новий (рев'ю №2)
                         tw = p.get("twap")
@@ -7220,6 +7584,8 @@ def _strat2_tick():
                             tw["exit_src"] = xsrc
                             tw["exit_ts_ms"] = int(round(recv_s * 1000))   # аудит I
                             p["exec_delay_s"] = round(_dl, 3)
+                            p["exit_decision_ms"] = int(round(float(req.get("ts") or 0) * 1000))   # v2.20
+                            p["exit_px_filled"] = xmeta.get("px_filled")
                             p["exit_fill_frac"] = (xmeta.get("fill_frac") if xmeta.get("fill_frac") is not None
                                                    else (1.0 if str(xsrc).startswith("book") else None))
                             p["exit_partial"] = int((p["exit_fill_frac"] or 1.0) < 1.0 - 1e-9)
@@ -7233,7 +7599,7 @@ def _strat2_tick():
                         continue
                     if p.get("exit_reason"): continue
                     if not base_px: continue   # ні стакану, ні свіжого міда — наступний тик
-                    recv_s, _dl = _apply_delay(xmeta, now2)
+                    recv_s, _dl = _apply_delay(xmeta, now2, req)
                     if recv_s is None:
                         continue   # застаріла — запит не відновлюємо, фаза 1 створить новий (рев'ю №2)
                     if req["kind"] == "tp" and p.get("tp_px"):
@@ -7245,6 +7611,8 @@ def _strat2_tick():
                     p["exit_src"] = xsrc
                     p["exit_ts_ms"] = int(round(recv_s * 1000))   # аудит I: момент отримання ціни
                     p["exec_delay_s"] = round(_dl, 3)
+                    p["exit_decision_ms"] = int(round(float(req.get("ts") or 0) * 1000))   # v2.20
+                    p["exit_px_filled"] = xmeta.get("px_filled")
                     p["exit_fill_frac"] = (xmeta.get("fill_frac") if xmeta.get("fill_frac") is not None
                                            else (1.0 if str(xsrc).startswith("book") else None))
                     p["exit_partial"] = int((p["exit_fill_frac"] or 1.0) < 1.0 - 1e-9)
@@ -7273,11 +7641,13 @@ def _strat2_tick():
                 if not epx:
                     p["exit_retry_at"] = now2 + 15.0   # ні стакану, ні свіжого міда
                     continue
-                recv_s, _dl = _apply_delay(xmeta, now2)
+                recv_s, _dl = _apply_delay(xmeta, now2, req)
                 if recv_s is None:
                     p["exit_pending"] = req; continue   # застаріла до застосування — повтор
                 now2 = recv_s   # аудит I: час виходу = момент отримання ціни
                 p["exec_delay_s"] = round(_dl, 3)
+                p["exit_decision_ms"] = int(round(float(req.get("ts") or 0) * 1000))   # v2.20
+                p["exit_px_filled"] = xmeta.get("px_filled")
                 p["exit_fill_frac"] = (xmeta.get("fill_frac") if xmeta.get("fill_frac") is not None
                                        else (1.0 if str(xsrc).startswith("book") else None))
                 p["exit_partial"] = int((p["exit_fill_frac"] or 1.0) < 1.0 - 1e-9)
@@ -7434,19 +7804,21 @@ def _load_settlements():
         # нерозрахована, а не з хибним офіційним net
         cur = getattr(_settle, "SETTLE_V", None)
         if cur is not None:
-            # v2.19: придатні рядки v3+ (ціни ті самі; v4 додає реплей TP R8,
-            # фандинг, повноту стрічки — до перерахунку R8 показує exit «pending»,
-            # net без фандингу); v1/v2 (stale-ціни) — pending
+            # v2.20 (аудит v2.19 №4): придатний ЛИШЕ рядок ПОТОЧНОЇ версії
+            # розрахунку — старіші рахувались на кешах без доказу повноти
+            # (обрізані сторінки v2.17) / без прив'язки до тригера / без
+            # фандингу у кривій; до перерахунку угода показується як
+            # нерозрахована (pending), не з хибним «verified»
             def _sv(r):
                 try:
                     return int(str(r.get("settle_v") or "0").strip())
                 except ValueError:
                     return 0
-            old = [k for k, r in data.items() if _sv(r) < 3]
+            old = [k for k, r in data.items() if (r.get("settle_v") or "").strip() != str(cur)]
+            stats["settle_old_v"] = sum(1 for k in old if _sv(data[k]) < 3)
             for k in old:
                 data.pop(k, None)
-            stats["settle_old_v"] = len(old)
-            stats["settle_prev_v"] = sum(1 for r in data.values() if (r.get("settle_v") or "").strip() != str(cur))
+            stats["settle_prev_v"] = len(old)
     except Exception as e:
         print(f"  [SETTLE] читання settlements.csv: {e}")
         data = {}
@@ -7562,6 +7934,8 @@ def _sig_check_rev(st, srow, fnum):
     lag = fnum(srow.get("lag_s"))
     if lag is None or lag > REV_MAX_FILL_AGE_S:
         return 0, "stale_fill"
+    if lag < 0:
+        return 0, "neg_lag"        # v2.20 (аудит №1): ціна до філа кита — не сигнал
     if st == R7_NAME:
         mp, mu = fnum(srow.get("whale_max_fill_pct")), fnum(srow.get("whale_max_fill_usd"))
         if mp is None or mp < F4_FULL_PCT or (mu or 0) < R7_MIN_TX_USD:
@@ -7581,10 +7955,32 @@ def _sig_check_fol(srow, fnum):
         return None, "no_fills"
     if "no_whale_fill" in fl:
         return 0, "no_whale_fill"
+    if "trigger_unmatched" in fl:
+        # v2.20 (аудит №3): settlement НЕ знайшов записану тригерну транзакцію
+        # серед філів кита — підставляти «останній підхожий філ» не можна:
+        # перевірка неповна (None), не дозвіл
+        return None, "trig_unmatched"
     lag = fnum(srow.get("lag_s"))
     if lag is None or lag > FOLLOW_MAX_FILL_AGE_S:
         return 0, "stale_fill"
+    if lag < 0:
+        return 0, "neg_lag"        # v2.20 (аудит №1): нижня межа лага
     return 1, ""
+
+def _exit_partial_of(r, fnum):
+    """v2.20 (аудит v2.19 №5): частковість виходу — і за новою колонкою
+    exit_fill_frac (<1), і за СТАРИМ явним джерелом exit_src="book_partial"
+    (рядки до 2.19 колонки не мають — «видимі $100 на $1000» не стають
+    повним виходом від оновлення). Частковий вхід (entry_src book_partial у
+    старих рядках) — теж не повне виконання."""
+    ff = fnum(r.get("exit_fill_frac"))
+    if ff is not None and ff < 1.0 - 1e-9:
+        return 1
+    if str(r.get("exit_src") or "").startswith("book_partial"):
+        return 1
+    if str(r.get("entry_src") or "").startswith("book_partial"):
+        return 1
+    return 0
 
 def _px_check(vstat, exit_partial):
     """Якість перевірки ціни: 1 — verified (обидві оцінки, вихід повний),
@@ -7608,7 +8004,9 @@ def _head_ok(t):
     if t.get("late") or t.get("stale") or t.get("unc"):
         return False
     if not HEAD_STRICT:
-        return t.get("exit_ok", 1) != 0
+        # нестрогий режим (лише тестові сюїти до 2.19): старий допущений рядок —
+        # лише з підтвердженим сигналом, як у v2.19 (_rev_adm_legacy)
+        return t.get("exit_ok", 1) != 0 and (not t.get("adm") or t.get("sig_ok") == 1)
     if t.get("sig_ok", 1) != 1:
         return False
     px_ok = t.get("px_ok")
@@ -7618,6 +8016,31 @@ def _head_ok(t):
         return False
     # правило виходу не перевірене (R8 без реплею — exit_ok None) — теж поза заголовком
     return t.get("exit_ok", 1) == 1
+
+def _group_stats(trs_, keyf):
+    """v2.18 (аудит №9): результат по ГРУПАХ (гаманці / дні / монети) —
+    медіана групових медіан і частка найбільшої групи в n, щоб один кит,
+    один день чи одна монета не домінували у заголовку. v2.20 (аудит v2.19
+    №10): ТОЙ САМИЙ допуск, що й заголовок (_head_ok) — раніше групи брали
+    рядки з непідтвердженим сигналом/ціною."""
+    g = {}
+    for t in trs_:
+        if not _head_ok(t):
+            continue
+        g.setdefault(keyf(t), []).append(t["net30"])
+    if not g:
+        return {"n_groups": 0, "median_of_medians": None, "top_share": None, "top_key": None}
+    meds = [_median(v) for v in g.values()]
+    total = sum(len(v) for v in g.values())
+    top = max(g.items(), key=lambda kv: len(kv[1]))
+    return {"n_groups": len(g), "median_of_medians": _median(meds),
+            "top_share": round(100.0 * len(top[1]) / total, 1), "top_key": str(top[0] or "")}
+
+def _eval_ts():
+    try:
+        return time.mktime(time.strptime(EVAL_SINCE, "%Y-%m-%d"))
+    except (ValueError, TypeError):
+        return None
 
 def _agg_block(trs, now, H, buckets=False):
     """ЄДИНИЙ агрегатор статистики стратегії/зрізу (аудит-2 №4): ті самі
@@ -7636,6 +8059,7 @@ def _agg_block(trs, now, H, buckets=False):
     for v in nets:
         acc += v; cum.append(round(acc, 3))
     ver = [t["net30"] for t in head if t.get("status") == "verified"]
+    _ev_ts = _eval_ts()
     out = {"n": len(nets), "median": _median(nets),
            "mean": (sum(nets) / len(nets)) if nets else None,
            "win": (100.0 * sum(1 for v in nets if v > 0) / len(nets)) if nets else None,
@@ -7679,7 +8103,20 @@ def _agg_block(trs, now, H, buckets=False):
            "n_partial_close": sum(1 for t in trs if t.get("full_close") == 0),
            "n_grace": sum(1 for t in trs if t.get("grace") == 1),
            "n_grace_unknown": sum(1 for t in trs if t.get("grace") is None),
-           "n_trades_total": len(trs)}
+           "n_trades_total": len(trs),
+           # v2.20 (аудит v2.19, рекомендація 7): частка перевірених серед усіх
+           # paper-угод — картка показує поряд «уся поведінка» і «доведена гіпотеза»
+           "pct_verified": (round(100.0 * len(nets) / len(paper_all), 1) if paper_all else None),
+           # рекомендація 6: оцінювальний період після фіксації правил — окремо
+           "eval_since": EVAL_SINCE,
+           "eval": _stat_small([v for ts, v in items if ts is not None and _ev_ts is not None and ts >= _ev_ts]),
+           "eval_paper": _stat_small([t["net30"] for t in trs if t.get("entered", 1) != 0
+                                      and t.get("net30") is not None and t.get("ts") is not None
+                                      and _ev_ts is not None and t["ts"] >= _ev_ts]),
+           # концентрація заголовка (той самий допуск): гаманець / день / монета
+           "by_wallet": _group_stats(trs, lambda t: t.get("wallet")),
+           "by_day": _group_stats(trs, lambda t: (t.get("date") or "")[:10]),
+           "by_coin": _group_stats(trs, lambda t: t.get("coin"))}
     out.update(_curves_of(head, H))
     if buckets:
         out["buckets"] = {str(b): _stat_small([t["net30"] for t in head if t.get("bucket") == b])
@@ -7938,18 +8375,21 @@ def strat2_api():
         # ОДНАКОВО для всіх; кандидат — лише рядок, що має settlement і
         # підтверджений сигнал; у заголовок він потрапить лише з перевіреною
         # ціною (_head_ok) — «старий live-only PnL» більше не допускається
-        adm = []
+        # v2.20 (аудит v2.19 №10): у ЖУРНАЛ paper ідуть УСІ старі рядки (≥2.10) —
+        # і зі спростованим/відсутнім settlement (їхні втрати не зникають);
+        # у заголовок — лише через _head_ok (сигнал + ціна). Кандидати
+        # (settlement є, сигнал підтверджено) рахуються окремо
+        adm, cand = [], 0
         for r in rev_all:
             if r.get("strategy") != st or _v_ok(r.get("algo_v"), STRAT_SINCE.get(st, DATA_ALGO_V)):
                 continue
             if _vt(r.get("algo_v")) < (2, 10):
                 continue
+            adm.append(r)
             s_ = settl.get(f"{r.get('sig_id')}|{st}")
-            if not s_:
-                continue
-            if _sig_check_rev(st, s_, fnum)[0] == 1:
-                adm.append(r)
-        return adm
+            if s_ and _sig_check_rev(st, s_, fnum)[0] == 1:
+                cand += 1
+        return adm, cand
     # v2.15: рядки угод пишуться у момент виходу (pending-синтез не
     # потрібен); криві 120 хв — окремий файл, по ключу угоди
     twc_all = dedup(read(TWAP_CURVE_CSV),
@@ -8008,7 +8448,7 @@ def strat2_api():
     for st in ("R1_загальний", "R2_breakout", "R3_великі", "R4_великий",
                "R5_дуже", "R6_волт", R7_NAME, R8_NAME):
         rows = [r for r in rev if r.get("strategy") == st]
-        adm_rows = _rev_adm_legacy(st)
+        adm_rows, n_adm_cand = _rev_adm_legacy(st)
         _adm_ids = {id(r) for r in adm_rows}
         rows += adm_rows
         legacy_rows -= len(adm_rows)
@@ -8057,7 +8497,7 @@ def strat2_api():
             # v2.19 (аудит A/E/F/J): три факти окремо
             sig_ok, sig_why = (_sig_check_rev(st, srow, fnum) if entered else (None, ""))
             _ff = fnum(r.get("exit_fill_frac"))
-            exit_partial = int(_ff is not None and _ff < 1.0 - 1e-9)
+            exit_partial = _exit_partial_of(r, fnum)   # v2.20: і старий book_partial
             # px_ok: без settlement — pending (None); є settlement — verified І повний вихід
             px_ok = ((_px_check(vstat, exit_partial) if srow else None) if entered else None)
             exit_ok, exit_why = (1, "")
@@ -8136,6 +8576,7 @@ def strat2_api():
                 "lag": fnum(r.get("lag_s")),
                 "entry_src": r.get("entry_src") or "", "exit_src": r.get("exit_src") or "",
                 "detect_src": r.get("detect_src") or "",
+                "wallet": (r.get("whale_addr") or "")[:10],
                 "adm": 1 if id(r) in _adm_ids else 0,
                 # v2.19: сигнал / ціна / вихід — окремі факти; виконання
                 "sig_ok": sig_ok, "sig_why": sig_why, "px_ok": px_ok,
@@ -8161,27 +8602,13 @@ def strat2_api():
             "since": STRAT_SINCE.get(st, DATA_ALGO_V),
             # допущені старі рядки — лише ті, що у заголовку (сигнал + ціна)
             "n_adm_legacy": sum(1 for t in trades if t.get("adm") and _head_ok(t)),
-            "n_adm_cand": len(adm_rows),
+            "n_adm_cand": n_adm_cand,
         })
-        legacy_rows += len(adm_rows) - blk["n_adm_legacy"]
+        # v2.20: усі старі R-рядки (≥2.10) показані у журналі paper — вони вже
+        # не «приховані» (legacy_rows зменшено на len(adm_rows) вище)
         out["strategies"][st] = blk
-    out["legacy_rows"] = legacy_rows   # v2.16: мінус допущені за settlement старі R-рядки
+    out["legacy_rows"] = legacy_rows   # v2.16/v2.20: мінус старі R-рядки, показані у журналі
 
-    def _group_stats(trs_, keyf):
-        """v2.18 (аудит №9): результат по ГРУПАХ (гаманці / дні) — медіана
-        групових медіан і частка найбільшої групи в n, щоб один кит або один
-        день не домінував у заголовку."""
-        g = {}
-        for t in trs_:
-            if t.get("net30") is None or t.get("late") or t.get("stale") or t.get("unc"):
-                continue
-            g.setdefault(keyf(t), []).append(t["net30"])
-        if not g:
-            return {"n_groups": 0, "median_of_medians": None, "top_share": None}
-        meds = [_median(v) for v in g.values()]
-        total = sum(len(v) for v in g.values())
-        return {"n_groups": len(g), "median_of_medians": _median(meds),
-                "top_share": round(100.0 * max(len(v) for v in g.values()) / total, 1)}
     for st in list(FOLLOW_TIMERS) + [F6_NAME, F4_NAME, F5_NAME, F8_NAME,
                                      F7_NAME, F9_NAME, F10_NAME]:
         rows = [r for r in fol if r.get("strategy") == st]
@@ -8218,7 +8645,7 @@ def strat2_api():
                 if _lg is None or _lg > FOLLOW_MAX_FILL_AGE_S:
                     stale = 1
             _ff = fnum(r.get("exit_fill_frac"))
-            exit_partial = int(_ff is not None and _ff < 1.0 - 1e-9)
+            exit_partial = _exit_partial_of(r, fnum)   # v2.20: і старий book_partial
             px_ok = _px_check(vstat, exit_partial) if srow else None   # без settlement — pending
             ts = _ts_local(r.get("date_open"))
             fs = fnum(r.get("first_shot"))
@@ -8274,9 +8701,7 @@ def strat2_api():
                 "pf_oneshot": fnum(r.get("prof_one_shot_pct")),
                 "_ct": (_parse_curve(srow.get("curve_tape"), REV_TRACK_MIN) if srow else None),
                 "_cl": None})
-        blk = _agg_block(trades, now, REV_TRACK_MIN)
-        blk["by_wallet"] = _group_stats(trades, lambda t: t.get("wallet"))
-        blk["by_day"] = _group_stats(trades, lambda t: (t.get("date") or "")[:10])
+        blk = _agg_block(trades, now, REV_TRACK_MIN)   # v2.20: групи всередині (_head_ok)
         _strat2_full[st] = {"kind": "follow", "H": REV_TRACK_MIN, "trades": trades}
         if blk["curve_src"] != "official" or (blk.get("curve_tape_n") or 0) < 3:
             # власних live-траєкторій у F немає; <3 траєкторій зі стрічки —
@@ -8339,7 +8764,7 @@ def strat2_api():
             # заявка, звірена з біржею при вході (verify_ok) — підтверджений
             # за побудовою; ціна — settlement; правило виходу — не пізній
             _ff = fnum(r.get("exit_fill_frac"))
-            _xpart = int(_ff is not None and _ff < 1.0 - 1e-9)
+            _xpart = _exit_partial_of(r, fnum)   # v2.20: і старий book_partial
             _late = int(reason.endswith("_late"))
             out_.append({"date": r.get("date_entry"), "coin": r.get("coin"),
                 "side": r.get("our_side"), "net30": official,
@@ -8384,10 +8809,12 @@ def strat2_api():
         # частково виконаних (finished, але < sz) і непідтверджених;
         # скільки входів мають обидві ціни зі свічок біржі
         _f = lambda r, k: fnum(r.get(k), 0)
-        conf_rows = [r for r in rs
-                     if _f(r, "completed") == 1 and _f(r, "cancel_after_entry") == 0
-                     and not (r.get("exit_reason") or "").endswith("_late")]
-        conf = [x for x in (_tw_net(r)[0] for r in conf_rows) if x is not None]
+        # v2.20 (аудит v2.19 №10): «підтверджено завершені» — підмножина
+        # ЗАГОЛОВКА (той самий допуск _head_ok: перевірена ціна), а не будь-який
+        # рядок із completed=1 без settlement
+        conf = [t["net30"] for t in trs
+                if fnum(t.get("completed"), 0) == 1 and fnum(t.get("cancel_after"), 0) == 0
+                and _head_ok(t)]
         n_cancel = sum(1 for r in rs if _f(r, "cancel_after_entry") == 1)
         n_partial = sum(1 for r in rs
                         if _f(r, "completed") == 0 and _f(r, "cancel_after_entry") == 0
@@ -8740,7 +9167,8 @@ TWAP_HEADERS     = (["twap_id", "strategy", "date_entry", "coin", "our_side",
                      "entry_ts_ms", "entry_src", "entry_px_mid",
                      "exit_ts_ms", "exit_px", "exit_src",
                      # v2.19: виконання на Binance
-                     "exch", "entry_qty", "exit_fill_frac", "funding_pct", "exec_delay_s"]
+                     "exch", "entry_qty", "exit_fill_frac", "funding_pct", "exec_delay_s",
+                "decision_ms", "detect_ms", "exit_decision_ms", "exit_px_filled", "trig_hash"]
                     + [f"m{i}" for i in range(1, TWAP_HOLD_MIN + 1)]
                     + ["eol"])
 TWAP_CURVE_CSV   = os.path.join(DATA_DIR, "twap_curves.csv")
@@ -9545,8 +9973,9 @@ def _twap_enter(rec, now, px):
     move = float(rec.get("move") or 0.0)
     # v2.16: ціна входу — зі свіжого стакану (виконувана на $1000 з нашого
     # боку), запит ДО локу; без стакану — жива ціна поллера з позначкою
+    decision_ms = int(now * 1000)   # v2.20: котирування не раніше за рішення
     epx, esrc, emeta = _paper_px(rec["coin"], "SELL" if our == "SHORT" else "BUY",
-                                 strict=True)
+                                 strict=True, min_recv_ms=decision_ms)
     if not epx:
         # аудит v2.16 №1: без повного стакану paper-входу немає. Рев'ю:
         # транзиторний збій l2Book (бюджет prio-каналу, проксі) — як
@@ -9590,6 +10019,8 @@ def _twap_enter(rec, now, px):
                   "hour": time.localtime().tm_hour, "algo_v": DATA_ALGO_V,
                   "entry_src": esrc, "entry_px_mid": emeta.get("mid") or px,
                   "px_age_ms": emeta.get("px_age_ms"), **_xf,
+                  "decision_ms": decision_ms,
+                  "detect_ms": (int(float(rec.get("created") or 0) * 1000) or None),   # момент реєстрації поста
                   "twap": {"src": rec["src"], "twap_side": rec["side"],
                            "usd": rec["usd"], "dur": rec["dur"], "kind": rec["kind"],
                            "kind_src": rec.get("kind_src") or "",
@@ -10560,6 +10991,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "px_last_ok_s_ago": (round(time.time() - stats["px_last_ok"], 1)
                                      if stats.get("px_last_ok") else None),
                 "px_age_s":       _px_age_s(),
+                "bn_px_age_s":    _bn_px_age_s(),   # v2.20: потік цін Binance (bookTicker)
                 "px_fail":        stats.get("px_fail", 0),
                 "book_ok":        stats.get("book_ok", 0),
                 "book_fail":      stats.get("book_fail", 0),
@@ -10747,6 +11179,7 @@ def main():
     threading.Thread(target=run_sim_loop,        daemon=True).start()
     threading.Thread(target=run_fc_loop,         daemon=True).start()
     threading.Thread(target=run_px_poller,       daemon=True).start()
+    threading.Thread(target=run_bn_px_poller,    daemon=True).start()   # v2.20: потік цін Binance
     threading.Thread(target=run_strat2_loop,     daemon=True).start()
     threading.Thread(target=run_prio_fetcher,    daemon=True).start()
     threading.Thread(target=_prio_probe,         daemon=True).start()
