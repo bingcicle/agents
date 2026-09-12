@@ -32,11 +32,17 @@ class Transient(Exception):
         super().__init__(msg)
         self.code = code
 
-SETTLE_V = "3"                     # v2: без stale-цін, епізод 300 с/startPosition, записані
+SETTLE_V = "4"                     # v2: без stale-цін, епізод 300 с/startPosition, записані
                                    # часи виходу, status, curve_tape; v3 (аудит-3): факти
                                    # позиції кита (full_close/partial_close, база R7), tape_gap,
-                                   # curve_n, витрати за ногою — рядки v1/v2 перераховуються
-                                   # (сервер до того показує їх як pending, settle_old_v)
+                                   # curve_n, витрати за ногою; v4 (аудит v2.17 F/G): реплей TP
+                                   # R8 (ринковий після перетину + лімітний), фандинг Binance за
+                                   # утримання, повнота стрічки за завершеним обходом (cover_ok),
+                                   # насичення історії HL (hl_sat), curve_final — рядки v1/v2
+                                   # перераховуються (сервер показує їх як pending), v3 —
+                                   # придатні (ціни ті самі), перераховуються у чергу
+TP_DETECT_MS = 2000                # R8-реплей: затримка виявлення перетину TP (поллер міда 5 с/2)
+FUND_URL = "https://fapi.binance.com/fapi/v1/fundingRate"
 UNLISTED_TTL_MS = 7 * 86400000     # символ, на який Binance відповів 400 (Invalid symbol):
                                    # стрічки немає — не питати тиждень (нові лістинги підхопляться)
 ZIP_URL = ("https://data.binance.vision/data/futures/um/daily/aggTrades/"
@@ -61,7 +67,8 @@ EP_GAP_MS = 300000                 # епізод кита: пауза між ф
 EP_POS_TOL = 0.01                  # епізод: допуск «позиція не виросла» — 1% від startPosition
 CURVE_H = {"fol": 60, "rev": 60, "twap": 120}   # горизонт кривої по стрічці, хв
 CURVE_MARGIN_MS = 30000            # крива остаточна, якщо розрахована після entry+H+запас
-CURVE_FULL = 0.9                   # крива «повна», якщо заповнено ≥90% точок горизонту
+CURVE_FULL = 1.0                   # крива «повна» лише при 100% точок (аудит v2.17 G: 54/60
+                                   # робили рядок остаточним назавжди); PnL остаточний окремо
 COVER_EDGE_MS = 60000              # покриття вікна стрічкою: трейд у перших/останніх 60 с
 RETRY_BASE_MS = 10 * MIN_MS        # бекоф відкладеного рядка: 10 хв × 2^(n−1), стеля 6 год
 RETRY_CAP_MS = 6 * HOUR_MS
@@ -76,7 +83,10 @@ HEADERS = ["key", "family", "strategy", "coin", "symbol", "settle_v", "settled_a
            "whale_fill_ts_ms", "whale_px", "lag_s", "dump_first_ts_ms",
            "dump_last_ts_ms", "dump_dur_s", "dump_move_pct", "dump_bucket",
            "whale_pos_start", "whale_pos_after", "whale_max_fill_pct", "whale_max_fill_usd",
-           "curve_tape", "flags", "status", "curve_n", "eol"]
+           "curve_tape", "flags", "status", "curve_n",
+           # v4 (аудит v2.17): реплей TP R8, фандинг, повнота стрічки/кривої
+           "tp_hit_ms", "net_tp_mkt_pct", "net_tp_lim_pct", "funding_pct", "cover_ok",
+           "curve_final", "eol"]
 
 
 # ── дрібні хелпери ──────────────────────────────────────────────────────
@@ -240,6 +250,7 @@ class Tape:
         self._lru = OrderedDict()       # (symbol, day) → (ts, px)
         self._lru_rest = OrderedDict()  # (symbol, b0) → (ts, px)
         self._miss = set()              # ключі без даних у цьому запуску
+        self._bucket_ok = {}            # (symbol, b0) → обхід відра завершено (аудит G)
         self._t_rest = 0.0
         self.stats = {"zip_fetch": 0, "zip_miss": 0, "rest_req": 0, "rest_fail": 0, "unlisted": 0}
         # символи, що не торгуються на Binance (REST 400 Invalid symbol):
@@ -318,18 +329,26 @@ class Tape:
         return None
 
     def _rest_fetch(self, symbol, b0, b1):
-        """Усі трейди [b0, b1) через REST (пагінація по T, ≤1 запит/с) →
-        [[ts, px, agg_id], …] у порядку (ts, agg_id) або None при збої.
-        Трейди однієї мс — у порядку біржі (agg_id), не за ціною; без id
-        (a = −1) лишається порядок надходження."""
-        out, start, last_id, pages = [], b0, -1, 0
-        while start < b1 and pages < 200:
+        """Усі трейди [b0, b1) через REST (≤1 запит/с) → ([[ts, px, agg_id], …]
+        у порядку (ts, agg_id), complete) або (None, False) при збої.
+        Аудит v2.17 G: перша сторінка — за часом, ДАЛІ — за ідентифікатором
+        (fromId = останній id + 1): повторний запит за тією самою мс при
+        насиченні (1000 трейдів однієї мс) повертав ті самі id, n=0 «завершував»
+        збір і хвіст губився, а відро кешувалось як повне. complete = обхід
+        дійшов до кінця вікна (коротка сторінка або трейд за межею), а не
+        обірвався капом сторінок / збоєм."""
+        out, start, last_id, pages, complete = [], b0, -1, 0, False
+        by_id = False
+        while pages < 200:
             self._t_rest = _pace(self._t_rest, self.pace)
             self.stats["rest_req"] += 1
             pages += 1
             try:
-                rows = self.fetch_rest("%s?symbol=%s&startTime=%d&endTime=%d&limit=1000"
-                                       % (REST_URL, symbol, start, b1 - 1))
+                if by_id:
+                    url = "%s?symbol=%s&fromId=%d&limit=1000" % (REST_URL, symbol, last_id + 1)
+                else:
+                    url = "%s?symbol=%s&startTime=%d&endTime=%d&limit=1000" % (REST_URL, symbol, start, b1 - 1)
+                rows = self.fetch_rest(url)
             except Transient as e:
                 if getattr(e, "code", None) != 400:
                     raise                    # мережа/429/5xx — рядок відкладається
@@ -337,8 +356,8 @@ class Tape:
                 rows = None
             if rows is None:
                 self.stats["rest_fail"] += 1
-                return None
-            n = 0
+                return None, False
+            n, crossed = 0, False
             for r in rows:
                 try:
                     a, t, p = int(r.get("a", -1)), int(r["T"]), float(r["p"])
@@ -346,13 +365,27 @@ class Tape:
                     continue
                 if a >= 0 and a <= last_id:
                     continue                 # дубль на межі сторінки
+                if t >= b1:
+                    crossed = True           # за межею вікна — кінець обходу
+                    break
+                if t < b0:
+                    continue
                 last_id = max(last_id, a)
                 out.append([t, p, a])
                 n += 1
-            if len(rows) < 1000 or n == 0:
+            if crossed or len(rows) < 1000:
+                complete = True
                 break
-            start = out[-1][0] if last_id >= 0 else out[-1][0] + 1
-        return [r for _, r in sorted(enumerate(out), key=lambda ir: (ir[1][0], ir[1][2], ir[0]))]
+            if last_id < 0:
+                # без id (a = −1) — лише за часом: n == 0 при повній сторінці =
+                # насичення, продовжити нема як → неповне
+                if n == 0:
+                    break
+                start = out[-1][0] + 1
+            else:
+                by_id = True                 # далі — за id, насичена мс не губиться
+        srt = [r for _, r in sorted(enumerate(out), key=lambda ir: (ir[1][0], ir[1][2], ir[0]))]
+        return srt, complete
 
     def _rest_bucket(self, symbol, b0):
         """10-хв відро через REST: диск (лише повні відра) → пам'ять (і неповні —
@@ -382,15 +415,97 @@ class Tape:
             if b0 + REST_BUCKET_MS < now - REST_MAX_AGE_MS:
                 self._miss.add(key)          # поза REST-вікном — перетягнути нема як
                 return None
-            rows = self._rest_fetch(symbol, b0, b0 + REST_BUCKET_MS)
+            rows, crawl_ok = self._rest_fetch(symbol, b0, b0 + REST_BUCKET_MS)
             if rows is None:
                 self._miss.add(key)
                 return None
-            if complete:
+            # аудит G: на диск — лише ПОВНЕ відро (час минув І обхід завершено);
+            # неповний обхід не оголошується повним кешем
+            self._bucket_ok[key] = bool(crawl_ok)
+            if complete and crawl_ok:
                 _save_json(path, rows)
+        else:
+            self._bucket_ok[key] = True      # з диска — лише повні відра
         v = (array("q", (int(r[0]) for r in rows)), array("d", (float(r[1]) for r in rows)))
         self._put(self._lru_rest, self.rest_lru_max, key, v)
         return v
+
+    def window_complete(self, symbol, t0, t1):
+        """Аудит v2.17 G: стрічка на [t0, t1] зібрана ПОВНІСТЮ — кожен день
+        із zip, а без zip кожне 10-хв відро вікна отримане повним обходом
+        (не обірваним капом/збоєм, не «поточне» без кінця). Лише тоді
+        відсутність трейдів у вікні — факт ринку, а не діра збору."""
+        if self.is_unlisted(symbol):
+            return False
+        now = self._now()
+        for dn in range(int(t0) // DAY_MS, int(t1) // DAY_MS + 1):
+            day_ms = dn * DAY_MS
+            if self._get(self._lru, (symbol, _day_str(day_ms))) is not None \
+                    or os.path.exists(os.path.join(self.dir, "%s-aggTrades-%s.zip" % (symbol, _day_str(day_ms)))):
+                continue
+            lo, hi = max(int(t0), day_ms), min(int(t1), day_ms + DAY_MS - 1)
+            if (hi // REST_BUCKET_MS) * REST_BUCKET_MS + REST_BUCKET_MS > now - MIN_MS:
+                return False                 # останнє відро ще триває — кінця вікна не
+                                             # бачимо; перевірка ДО будь-яких запитів
+            b = (lo // REST_BUCKET_MS) * REST_BUCKET_MS
+            while b <= hi:
+                if (symbol, b) not in self._bucket_ok:
+                    # рев'ю v2.19 №4: відро, якого ніхто ще не торкався (середина
+                    # вікна між двома ногами), — не «неповне», а невідоме:
+                    # тягнемо (кеш/диск/REST) і лише тоді судимо
+                    self._rest_bucket(symbol, b)
+                if not self._bucket_ok.get((symbol, b)):
+                    return False
+                b += REST_BUCKET_MS
+        return True
+
+    def funding(self, symbol, t0, t1):
+        """Аудит v2.17 (фандинг Binance): суми ставок фандингу з fundingTime у
+        (t0, t1] — REST fundingRate (вага 1), кеш по (символ, UTC-день) на
+        диску <tape>/funding (лише минулі дні). → список (ts, rate) або None
+        при збої/unlisted (викликач ставить no_funding)."""
+        if self.is_unlisted(symbol):
+            return None
+        fdir = os.path.join(self.dir, "funding")
+        os.makedirs(fdir, exist_ok=True)
+        out = []
+        now = self._now()
+        for dn in range(int(t0) // DAY_MS, int(t1) // DAY_MS + 1):
+            day_ms = dn * DAY_MS
+            key = (symbol, "fund", dn)
+            rows = self._get(self._lru_rest, key)
+            if isinstance(rows, tuple):
+                # рев'ю v2.19 №7: поточний день у пам'яті — (момент запиту, рядки);
+                # вікно, що сягає за момент запиту, могло отримати нове
+                # нарахування (08:00 UTC посеред довгого циклу) — тягнемо знову
+                rows = rows[1] if int(t1) <= rows[0] else None
+            path = os.path.join(fdir, "%s-%s.json" % (symbol, _day_str(day_ms)))
+            if rows is None:
+                rows = _load_json(path)
+                if not isinstance(rows, list):
+                    self._t_rest = _pace(self._t_rest, self.pace)
+                    self.stats["rest_req"] += 1
+                    raw = self.fetch_rest("%s?symbol=%s&startTime=%d&endTime=%d&limit=100"
+                                          % (FUND_URL, symbol, day_ms, day_ms + DAY_MS - 1))
+                    if raw is None:
+                        self.stats["rest_fail"] += 1
+                        return None
+                    rows = []
+                    for r in raw:
+                        try:
+                            rows.append([int(r["fundingTime"]), float(r["fundingRate"])])
+                        except (TypeError, ValueError, KeyError, AttributeError):
+                            continue
+                    if day_ms + DAY_MS <= now - MIN_MS:
+                        _save_json(path, rows)   # минулий день — незмінний
+                if day_ms + DAY_MS <= now - MIN_MS:
+                    self._put(self._lru_rest, self.rest_lru_max, key, rows)
+                else:
+                    self._put(self._lru_rest, self.rest_lru_max, key, (now, rows))
+            for ft, fr in rows:
+                if int(t0) < ft <= int(t1):
+                    out.append((ft, fr))
+        return out
 
     def window(self, symbol, t0, t1):
         """Усі трейди symbol з ts у [t0, t1] (дні/відра зшиваються) → (ts, px);
@@ -462,15 +577,18 @@ def _first_cross(symbol, t_from, t_to, level, above, cfg):
 
 def _covered(symbol, t_from, t_to, ctx, edge_ms=COVER_EDGE_MS):
     """Стрічка ПОКРИВАЄ вікно [t_from, t_to]: є трейд у [t_from, t_from+edge]
-    І трейд у [t_to−edge, t_to]. Без цього «тригера не було» (no_trigger) не
-    відрізнити від «стрічки не було» (tape_gap): неповна стрічка створює
-    обидва, а вердикт має право лише на покритому вікні."""
+    І трейд у [t_to−edge, t_to] І (аудит v2.17 G) стрічка вікна зібрана
+    ПОВНІСТЮ (window_complete: zip або повний обхід кожного відра) — два
+    крайні трейди не доводять, що середина завантажена. Без цього «тригера
+    не було» (no_trigger) не відрізнити від «стрічки не було» (tape_gap)."""
     tape = _tape(ctx)
     ts, _ = tape.window(symbol, int(t_from), int(t_from) + edge_ms)
     if not len(ts):
         return False
     ts, _ = tape.window(symbol, int(t_to) - edge_ms, int(t_to))
-    return bool(len(ts))
+    if not len(ts):
+        return False
+    return tape.window_complete(symbol, int(t_from), int(t_to))
 
 
 def _leg_costs(costs_full, entry_src, exit_src):
@@ -501,7 +619,8 @@ class HLFills:
         self.fetch_hl = fetch_hl or default_fetch_hl
         self.log, self.now_ms, self.pace = log, now_ms, pace_s
         self._mem, self._miss, self._t = {}, set(), 0.0
-        self.stats = {"req": 0, "fail": 0}
+        self._sat = set()               # (addr, h): година насичена (2000 філів однієї мс / кап сторінок)
+        self.stats = {"req": 0, "fail": 0, "sat": 0}
 
     def _now(self):
         return self.now_ms if self.now_ms is not None else int(time.time() * 1000)
@@ -537,11 +656,18 @@ class HLFills:
                     seen.add(k)
                     rows.append(f)
                     n += 1
-                if len(page) < 2000 or n == 0:
+                if len(page) < 2000:
+                    break
+                if n == 0 or pages >= 8:
+                    # аудит v2.17 G: 2000 філів однієї мс (повторна сторінка з
+                    # тими самими id) або кап сторінок — історія години НЕПОВНА:
+                    # явна невизначеність (hl_sat), не «зібрано»
+                    self._sat.add(key)
+                    self.stats["sat"] += 1
                     break
                 start = int(page[-1].get("time") or start + 1)
             rows.sort(key=lambda f: int(f.get("time") or 0))
-            if complete:
+            if complete and key not in self._sat:
                 _save_json(path, rows)
         # у пам'яті — і неповна година: ctx живе один цикл, а всі рядки одного
         # епізоду кита ділять адресу/годину (6–15 рядків = 1 запит, не 15)
@@ -558,6 +684,11 @@ class HLFills:
             out.extend(f for f in rows if t0_ms <= int(f.get("time") or -1) <= t1_ms)
         out.sort(key=lambda f: int(f.get("time") or 0))
         return out
+
+    def saturated(self, addr, t0_ms, t1_ms):
+        """Чи якась година вікна насичена (історія неповна) — після user_fills."""
+        return any((addr, h) in self._sat
+                   for h in range(int(t0_ms) // HOUR_MS, int(t1_ms) // HOUR_MS + 1))
 
 
 def hl_user_fills(addr, t0_ms, t1_ms, ctx):
@@ -733,14 +864,38 @@ def _net(e, x, long, costs):
     return None if not (e and x) else (x / e - 1) * 100 * (1 if long else -1) - costs
 
 
-def _result(out, long, e_tape, x_tape, e_live, net_live, costs, tape_flag="no_tape"):
+def _funding(out, symbol, t0, t1, long, ctx):
+    """v4: фандинг Binance за утримання (t0, t1] у % (додатний = ми платимо):
+    Σ ставок × знак (LONG платить додатну). Збій/unlisted → 0 і прапорець
+    no_funding (net по стрічці без фандингу — не приховано)."""
+    if t0 is None or t1 is None or t1 <= t0:
+        out["funding_pct"] = 0.0
+        return 0.0
+    tape = _tape(ctx)
+    try:
+        rows = tape.funding(symbol, int(t0), int(t1)) if hasattr(tape, "funding") else None
+    except Transient:
+        raise
+    except Exception:
+        rows = None
+    if rows is None:
+        out["flags"].append("no_funding")
+        out["funding_pct"] = 0.0
+        return 0.0
+    f = sum(r for _, r in rows) * 100.0 * (1.0 if long else -1.0)
+    out["funding_pct"] = f
+    return f
+
+
+def _result(out, long, e_tape, x_tape, e_live, net_live, costs, tape_flag="no_tape", funding=0.0):
     """Спільний хвіст: gross/net по стрічці, зсув входу, офіційний результат і
     status. net_official = min(net_live, net_tape), коли є обидва; інакше той,
     що є (записаний результат ніколи не зникає). status: verified — обидві ноги
     по стрічці і є net_live; tape_only — стрічка є, net_live немає; live_only —
     ноги по стрічці немає (no_tape / partial / no_trigger), live є; none — нічого.
     flags: no_tape (нема входу по стрічці; tape_flag=None — не ставити, напр.
-    no_trigger), partial (вхід є, а виходу або net_live немає)."""
+    no_trigger), partial (вхід є, а виходу або net_live немає). v4: net по
+    стрічці — мінус фандинг за утримання (funding)."""
     net_tape = None
     if e_tape is None:
         if tape_flag:
@@ -751,6 +906,7 @@ def _result(out, long, e_tape, x_tape, e_live, net_live, costs, tape_flag="no_ta
         net_tape = _net(e_tape, x_tape, long, costs)
         if net_tape is not None:
             out["gross_tape_pct"] = net_tape + costs
+            net_tape -= float(funding or 0.0)
     out["net_live_pct"], out["net_tape_pct"] = net_live, net_tape
     if net_live is not None and net_tape is not None:
         out["net_official_pct"] = min(net_live, net_tape)
@@ -780,6 +936,7 @@ def _curve(out, symbol, entry_t, e, side_out, long, costs, h, ctx):
         vals.append("" if n is None else "%.4f" % n)
     out["curve_tape"] = ";".join(vals)
     out["curve_n"] = sum(1 for v in vals if v)
+    out["curve_final"] = int(out["curve_n"] >= h)   # аудит G: 100% точок, окремо від PnL
 
 
 def _tape_last_px(symbol, t_ms, ctx):
@@ -809,6 +966,8 @@ def _whale(out, row, t0, ctx, close_only, symbol=None):
     if fills is None:
         out["flags"].append("no_fills")
         return
+    if hasattr(hl, "saturated") and hl.saturated(addr, t0 - 600000, t0):
+        out["flags"].append("hl_sat")        # аудит G: історія неповна — епізод не доведений
     first, last, inep = close_episode(fills, row.get("coin"), t0, close_only)
     if first is None:
         out["flags"].append("no_whale_fill")
@@ -846,7 +1005,8 @@ def settle_follow(row, ctx):
     side_in, side_out = ("BUY", "SELL") if long else ("SELL", "BUY")
     e = _leg(out, "entry", symbol, t_in, side_in, ctx)
     x = _leg(out, "exit", symbol, t_out, side_out, ctx)
-    _result(out, long, e, x, e_live, fnum(row.get("net_pct")), costs)
+    fund = _funding(out, symbol, t_in, t_out, long, ctx) if e is not None else 0.0
+    _result(out, long, e, x, e_live, fnum(row.get("net_pct")), costs, funding=fund)
     _curve(out, symbol, t_in, e, side_out, long, costs, CURVE_H["fol"], ctx)
     _whale(out, row, t_in, ctx, close_only=False, symbol=symbol)
     return out
@@ -861,20 +1021,51 @@ def _m30(row):
     return None
 
 
-def _r8_tp_flag(out, row, symbol, entry_t, e, long, ctx):
-    """R8: реплей TP по стрічці від входу — ЛИШЕ прапорець tp_tape_hit /
-    tp_tape_miss, ціни не міняє. TP = записаний tp_px (те, чого чекав бот);
-    без нього — 0.8×дамп від ціни входу зі стрічки; без дампу — no_dump."""
+def _r8_tp_replay(out, row, symbol, entry_t, e, long, costs, side_out, ctx):
+    """R8 (аудит v2.17 F): НЕЗАЛЕЖНИЙ реплей всього правила виходу по стрічці
+    від входу — не лише прапорець. TP = записаний tp_px (те, чого чекав бот);
+    без нього — 0.8×дамп від ціни входу зі стрічки; без дампу — no_dump.
+    Дві моделі: (1) РИНКОВИЙ вихід після виявлення перетину — перший трейд
+    ≥TP (LONG) у (вхід, +30 хв], виявлення через TP_DETECT_MS, ціна = гірша у
+    наступні 3 с (net_tp_mkt_pct) — ЦЕ нога виходу по стрічці для R8;
+    (2) ЛІМІТКА на TP — виконана, якщо трейд пройшов КРІЗЬ рівень (строго за
+    TP), ціна = TP (net_tp_lim_pct, ті самі витрати — консервативно). Без
+    перетину — таймер m30 по стрічці. → (x_tape, x_t, reason_tape)."""
     tp = fnum(row.get("tp_px"))
     if tp is None:
         dump = abs(fnum(row.get("dump_move_pct")) or fnum(row.get("move_3m_pct")) or 0.0)
         if dump <= 0:
             out["flags"].append("no_dump")
-            return
+            x_t = entry_t + HOLD30_MS
+            return exec_px(symbol, x_t, side_out, ctx)["px"], x_t, "m30"
         tp = e * (1 + R8_TP_K * dump / 100.0 * (1 if long else -1))
     scan_from = entry_t + {"tape3s": 3000, "tape10s": 10000}.get(out.get("entry_src"), 0)
     hit = _first_cross(symbol, scan_from, entry_t + HOLD30_MS, tp, long, ctx)
-    out["flags"].append("tp_tape_hit" if hit is not None else "tp_tape_miss")
+    if hit is None:
+        out["flags"].append("tp_tape_miss")
+        if not _covered(symbol, scan_from, entry_t + HOLD30_MS, ctx):
+            out["flags"].append("tape_gap")  # «не перетнув» має право лише на повній стрічці
+        x_t = entry_t + HOLD30_MS
+        x = exec_px(symbol, x_t, side_out, ctx)["px"]
+        out["net_tp_mkt_pct"] = _net(e, x, long, costs)
+        out["net_tp_lim_pct"] = out["net_tp_mkt_pct"]
+        return x, x_t, "m30_replay"
+    t_hit, px_hit = hit
+    out["flags"].append("tp_tape_hit")
+    out["tp_hit_ms"] = int(t_hit)
+    x_t = int(t_hit) + TP_DETECT_MS
+    xm = exec_px(symbol, x_t, side_out, ctx)["px"]
+    if xm is None:
+        # рідка стрічка після перетину (тест/тонка монета): ціна перетину —
+        # реальний принт за TP; позначаємо, що вікно 10 с порожнє
+        xm = px_hit
+        out["flags"].append("tp_replay_thin")
+    out["net_tp_mkt_pct"] = _net(e, xm, long, costs)
+    # лімітка: заповнена лише якщо ціна пройшла крізь рівень (строго за TP)
+    through = _first_cross(symbol, scan_from, entry_t + HOLD30_MS,
+                           tp * (1 + 1e-6) if long else tp * (1 - 1e-6), long, ctx)
+    out["net_tp_lim_pct"] = _net(e, tp, long, costs) if through is not None else None
+    return xm, x_t, "tp_replay"
 
 
 def settle_rev(row, ctx):
@@ -958,16 +1149,25 @@ def settle_rev(row, ctx):
     out["exit_reason_tape"] = x_reason if x_rec is not None else "m30"
     x = None
     if e is not None:
-        x = _leg(out, "exit", symbol, x_t, side_out, ctx)
         if is_r8:
-            _r8_tp_flag(out, row, symbol, entry_t, e, long, ctx)
+            # аудит F: нога виходу R8 по стрічці — реплей правила (TP після
+            # перетину / таймер m30), а не записаний live-час
+            x, x_t, out["exit_reason_tape"] = _r8_tp_replay(out, row, symbol, entry_t, e, long,
+                                                             costs, side_out, ctx)
+            out["exit_ts_ms"], out["exit_px_tape"] = int(x_t), x
+            out["exit_src"] = "tape_replay" if x is not None else "none"
         else:
+            x = _leg(out, "exit", symbol, x_t, side_out, ctx)
             x60 = exec_px(symbol, entry_t + HOLD60_MS, side_out, ctx)["px"]
             out["net60_tape_pct"] = _net(e, x60, long, costs)
     else:
         out["exit_ts_ms"] = x_t
-    _result(out, long, e, x, e_live, net_live, costs)
+    fund = _funding(out, symbol, entry_t, x_t, long, ctx) if e is not None else 0.0
+    _result(out, long, e, x, e_live, net_live, costs, funding=fund)
     _curve(out, symbol, entry_t, e, side_out, long, costs, CURVE_H["rev"], ctx)
+    # рев'ю v2.19 №4: покриття — ПІСЛЯ кривої (вона торкається кожної хвилини
+    # вікна; window_complete і сам дотягує невідомі відра)
+    out["cover_ok"] = int(_covered(symbol, entry_t, x_t, ctx)) if e is not None else 0
     _whale(out, row, t0, ctx, close_only=True, symbol=symbol)
     return out
 
@@ -1013,7 +1213,8 @@ def settle_twap(row, ctx):
     side_in, side_out = ("BUY", "SELL") if long else ("SELL", "BUY")
     e = _leg(out, "entry", symbol, t_in, side_in, ctx)
     x = _leg(out, "exit", symbol, t_out, side_out, ctx)
-    _result(out, long, e, x, e_live, net_live, costs)
+    fund = _funding(out, symbol, t_in, t_out, long, ctx) if e is not None else 0.0
+    _result(out, long, e, x, e_live, net_live, costs, funding=fund)
     _curve(out, symbol, t_in, e, side_out, long, costs, CURVE_H["twap"], ctx)
     _whale(out, row, t_in, ctx, close_only=False, symbol=symbol)
     return out
@@ -1315,8 +1516,18 @@ def settle_pending(data_dir, symbol_map=None, limit=None, force=False, log=print
                 _defer(key)
                 log("[settle] збій %s: %r" % (key, e))
 
-    _run(range(len(ready)), (lim + 1) // 2 if lim else None)   # новіші першими
-    _run(range(len(ready) - 1, -1, -1), lim)                    # решта — старіші першими
+    # аудит v2.17 H: НОВІ і СТАРІ рядки чергуються (новіший, найстаріший,
+    # наступний новіший, …) — квота на кількість спроб без чергування не
+    # гарантувала бек-логу мережевого бюджету (перші 20 нових з'їдали кап
+    # HL-запитів циклу, старі отримували лише budget-винятки)
+    n_r = len(ready)
+    order, i, j = [], 0, n_r - 1
+    while i <= j:
+        order.append(i)
+        if j != i:
+            order.append(j)
+        i += 1; j -= 1
+    _run(order, lim)
     if n_old:
         log("[settle] пропущено рядків до v%s: %d" % (".".join(map(str, MIN_ALGO_V)), n_old))
     _prune_tape(data_dir, log)
