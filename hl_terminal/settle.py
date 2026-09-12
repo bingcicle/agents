@@ -261,6 +261,7 @@ class Tape:
         self._lru_rest = OrderedDict()  # (symbol, b0) → (ts, px)
         self._miss = set()              # ключі без даних у цьому запуску
         self._bucket_ok = {}            # (symbol, b0) → обхід відра завершено (аудит G)
+        self._partial = set()           # рев'ю v2.20 №3: відра, зняті ще ВІДКРИТИМИ (знімок неповний)
         self._t_rest = 0.0
         self.stats = {"zip_fetch": 0, "zip_miss": 0, "rest_req": 0, "rest_fail": 0, "unlisted": 0}
         # символи, що не торгуються на Binance (REST 400 Invalid symbol):
@@ -406,13 +407,22 @@ class Tape:
         (_tape_last_px: референс/кінець дампу) і межа вікна стають хибними.
         Такий файл видаляється, відро тягнеться знову, якщо ще у REST-вікні."""
         key = (symbol, b0)
+        now = self._now()
+        complete = b0 + REST_BUCKET_MS <= now - MIN_MS
         v = self._get(self._lru_rest, key)
+        if v is not None and key in self._partial and complete:
+            # рев'ю v2.20 №3: відро знято, поки ще тривало (короткий обхід =
+            # «повний» лише до цієї миті); тепер воно закрилось — знімок у
+            # пам'яті неповний, друга половина відра порожня не як факт ринку:
+            # перетягнути, а не судити повноту вікна за ним
+            self._partial.discard(key)
+            self._lru_rest.pop(key, None)
+            self._bucket_ok.pop(key, None)
+            v = None
         if v is not None or key in self._miss:
             return v
         path = os.path.join(self.rest_dir, "%s-%d.json" % (symbol, b0))
         raw = _load_json(path)
-        now = self._now()
-        complete = b0 + REST_BUCKET_MS <= now - MIN_MS
         in_window = b0 + REST_BUCKET_MS >= now - REST_MAX_AGE_MS
         rows, legacy = None, False
         if isinstance(raw, dict) and raw.get("v") == CACHE_V and isinstance(raw.get("rows"), list):
@@ -447,8 +457,11 @@ class Tape:
                 self._miss.add(key)
                 return None
             # аудит G: на диск — лише ПОВНЕ відро (час минув І обхід завершено);
-            # неповний обхід не оголошується повним кешем
-            self._bucket_ok[key] = bool(crawl_ok)
+            # неповний обхід не оголошується повним кешем; рев'ю v2.20 №3:
+            # відкрите відро — не «ок» (кінця ще нема) і позначене як частковий знімок
+            self._bucket_ok[key] = bool(crawl_ok) and complete
+            if not complete:
+                self._partial.add(key)
             if complete and crawl_ok:
                 _save_json(path, {"v": CACHE_V, "symbol": symbol, "b0": b0, "complete": True,
                                   "n": len(rows), "last_id": (rows[-1][2] if rows else None),
@@ -476,10 +489,12 @@ class Tape:
                                              # бачимо; перевірка ДО будь-яких запитів
             b = (lo // REST_BUCKET_MS) * REST_BUCKET_MS
             while b <= hi:
-                if (symbol, b) not in self._bucket_ok:
+                if (symbol, b) not in self._bucket_ok or (symbol, b) in self._partial:
                     # рев'ю v2.19 №4: відро, якого ніхто ще не торкався (середина
                     # вікна між двома ногами), — не «неповне», а невідоме:
-                    # тягнемо (кеш/диск/REST) і лише тоді судимо
+                    # тягнемо (кеш/диск/REST) і лише тоді судимо; рев'ю v2.20 №3:
+                    # частковий знімок відкритого відра — теж перепитуємо (відро
+                    # могло закритись → _rest_bucket перетягне повним обходом)
                     self._rest_bucket(symbol, b)
                 if not self._bucket_ok.get((symbol, b)):
                     return False
@@ -1025,7 +1040,10 @@ def _tape_last_px(symbol, t_ms, ctx):
     return px[-1] if len(px) else None
 
 
-def _whale(out, row, t0, ctx, close_only, symbol=None):
+NEG_LAG_LOOK_MS = 120_000   # рев'ю v2.20: наскільки ПІСЛЯ входу шукати записаний тригер (від'ємний лаг)
+
+
+def _whale(out, row, t0, ctx, close_only, symbol=None, trigger=False):
     """Філи кита перед t0 → lag/dump-колонки + факти позиції (whale_pos_* /
     whale_max_fill_*) і прапорець full_close / partial_close / close_unknown
     (_close_flag); збій → flag no_fills.
@@ -1036,26 +1054,46 @@ def _whale(out, row, t0, ctx, close_only, symbol=None):
     dump_tape; знак: додатний = у бік тиску кита); лише філи (сирі ціни
     перший→останній) — фолбек dump_fills (одним пострілом = 0%)."""
     hl, addr = ctx.get("hl"), (row.get("whale_addr") or "").strip()
-    fills = hl.user_fills(addr, t0 - 600000, t0) if (hl is not None and addr) else None
+    # рев'ю v2.20 (причинність): рядок із записаним тригером (trig_hash /
+    # fill_ts_ms) — філи дивимось і ТРОХИ ПІСЛЯ входу: тригер, що стався
+    # після ціни входу (від'ємний лаг), має бути знайдений і дати lag_s<0
+    # (→ sig_ok=0 neg_lag), а не «зникнути» за межею вікна
+    has_trig = bool((row.get("trig_hash") or "").strip()) or _ms(row.get("fill_ts_ms")) is not None
+    look = NEG_LAG_LOOK_MS if has_trig else 0
+    fills = hl.user_fills(addr, t0 - 600000, t0 + look) if (hl is not None and addr) else None
     if fills is None:
         out["flags"].append("no_fills")
         return
-    if hasattr(hl, "saturated") and hl.saturated(addr, t0 - 600000, t0):
+    if hasattr(hl, "saturated") and hl.saturated(addr, t0 - 600000, t0 + look):
         out["flags"].append("hl_sat")        # аудит G: історія неповна — епізод не доведений
     t_end = t0
-    if not close_only and fills:
+    anchor = None
+    if not trigger and look and fills:
+        # реверс: тригер шукаємо лише щоб виявити від'ємний лаг; у звичайному
+        # випадку (тригер до входу) епізод — до входу, як раніше
+        anchor, _how = _trigger_fill(fills, row)
+        if anchor is not None and _ftime(anchor) > t0:
+            t_end = _ftime(anchor)
+            out["flags"].append("neg_lag")
+        else:
+            anchor = None
+    if trigger and fills:
         # v5 (аудит v2.19 №3): Follow звіряється з ТРИГЕРНОЮ транзакцією, яку
         # записав бот (trig_hash, а для старих рядків — fill_ts_ms), не з
         # «останнім підхожим філом перед входом»: інший (мейкерський, дрібний)
         # філ за секунду до входу «виправляв» лаг непридатного сигналу.
-        # Не знайдено — trigger_unmatched: перевірка НЕПОВНА, не дозвіл
+        # Не знайдено — trigger_unmatched: перевірка НЕПОВНА, не дозвіл.
+        # Рев'ю v2.20 №2: лише Follow (trigger=True) — TWAP-рядки тригера не
+        # записують (нема trig_hash/fill_ts_ms), їхній епізод — як раніше
         anchor, how = _trigger_fill(fills, row)
         out["trig_match"] = how
         if anchor is None:
             out["flags"].append("trigger_unmatched")
             return
         t_end = _ftime(anchor)
-        fills = [f for f in fills if _ftime(f) <= t_end]
+        if t_end > t0:
+            out["flags"].append("neg_lag")   # тригер після входу — lag_s<0 → sig_ok=0
+    fills = [f for f in fills if _ftime(f) <= t_end]
     first, last, inep = close_episode(fills, row.get("coin"), t_end, close_only)
     if first is None:
         out["flags"].append("no_whale_fill")
@@ -1119,7 +1157,7 @@ def settle_follow(row, ctx):
     fund = _funding(out, symbol, t_in, t_out, long, ctx) if e is not None else 0.0
     _result(out, long, e, x, e_live, fnum(row.get("net_pct")), costs, funding=fund)
     _curve(out, symbol, t_in, e, side_out, long, costs, CURVE_H["fol"], ctx)
-    _whale(out, row, t_in, ctx, close_only=False, symbol=symbol)
+    _whale(out, row, t_in, ctx, close_only=False, symbol=symbol, trigger=True)
     return out
 
 
@@ -1204,8 +1242,9 @@ def settle_rev(row, ctx):
     strat = row.get("strategy") or ""
     is_r2, is_r8 = strat.startswith("R2"), ("R8" in strat)
     t_rec = _ms(row.get("entry_ts_ms"))          # записаний вхід (v2.16)
-    # t0 = детекція: detect_ts_ms, для не-R2 entry_ts_ms (вхід на детекті), інакше date
-    t0, _ = _ts(row, ("detect_ts_ms",) if is_r2 else ("detect_ts_ms", "entry_ts_ms"), "date")
+    # t0 = детекція: detect_ms (v2.20, мс виявлення філа) / detect_ts_ms, для не-R2
+    # entry_ts_ms (вхід на детекті), інакше date
+    t0, _ = _ts(row, ("detect_ms", "detect_ts_ms") if is_r2 else ("detect_ms", "detect_ts_ms", "entry_ts_ms"), "date")
     if t0 is None and t_rec is None:
         return None
     if t0 is None:
@@ -1416,7 +1455,7 @@ FAMILIES = (   # (файл, fn, ключ, ms-колонка сортування
      lambda r: r.get("trade_id") or None, ("open_ts_ms",), "date_open"),
     ("rev_trades.csv", settle_rev,
      lambda r: ("%s|%s" % (r["sig_id"], r.get("strategy") or "")) if r.get("sig_id") else None,
-     ("detect_ts_ms", "entry_ts_ms"), "date"),
+     ("detect_ms", "detect_ts_ms", "entry_ts_ms"), "date"),
     ("twap_trades.csv", settle_twap,
      lambda r: ("%s|%s" % (r["twap_id"], r.get("strategy") or "")) if r.get("twap_id") else None,
      ("entry_ts_ms",), "date_entry"),

@@ -316,17 +316,17 @@ class HLF:
     def saturated(self, *a): return False
 ctx3 = {"hl": HLF(fills), "tape": None}
 o = {"flags": []}
-S._whale(o, {"whale_addr": "0xw", "coin": "AAA", "trig_hash": "0xtrig"}, t_in, ctx3, close_only=False, symbol=None)
+S._whale(o, {"whale_addr": "0xw", "coin": "AAA", "trig_hash": "0xtrig"}, t_in, ctx3, close_only=False, symbol=None, trigger=True)
 assert o["trig_match"] == "hash" and abs(o["lag_s"] - 100.0) < 1e-9 and o["whale_pos_start"] == 1000 \
        and "partial_close" in o["flags"]                                            # лаг від ТРИГЕРА, не від мейкера (1 с)
 o = {"flags": []}
-S._whale(o, {"whale_addr": "0xw", "coin": "AAA", "trig_hash": "0xzzz"}, t_in, ctx3, close_only=False, symbol=None)
+S._whale(o, {"whale_addr": "0xw", "coin": "AAA", "trig_hash": "0xzzz"}, t_in, ctx3, close_only=False, symbol=None, trigger=True)
 assert "trigger_unmatched" in o["flags"] and "lag_s" not in o and o["trig_match"] == "unmatched"
 o = {"flags": []}
-S._whale(o, {"whale_addr": "0xw", "coin": "AAA"}, t_in, ctx3, close_only=False, symbol=None)
+S._whale(o, {"whale_addr": "0xw", "coin": "AAA"}, t_in, ctx3, close_only=False, symbol=None, trigger=True)
 assert "trigger_unmatched" in o["flags"]                                            # без ідентичності — неповна перевірка
 o = {"flags": []}
-S._whale(o, {"whale_addr": "0xw", "coin": "AAA", "trig_hash": "0xtrig"}, t_in, {"hl": HLF([]), "tape": None}, close_only=False, symbol=None)
+S._whale(o, {"whale_addr": "0xw", "coin": "AAA", "trig_hash": "0xtrig"}, t_in, {"hl": HLF([]), "tape": None}, close_only=False, symbol=None, trigger=True)
 assert "no_whale_fill" in o["flags"] and "trigger_unmatched" not in o["flags"]      # філів нема — як і раніше
 print("3) settlement Follow: тригер за hash / за часом; інший філ не підставляється; без ідентичності — trigger_unmatched")
 
@@ -642,9 +642,137 @@ assert t_a2["settled"] == 0 and t_a2["px_ok"] is None and abs(t_a2["net30"] + 2.
 t1 = o["strategies"]["T1_твап_відкриття"]
 assert t1["n_confirmed"] == 0 and t1["n"] == 0 and t1["n_paper"] == 1                         # completed без settlement — не «підтверджено»
 assert "by_coin" in r1 and "pct_verified" in r1 and "eval" in r1
+# рев'ю v2.20 №1: status tape_thin із settlement (R8, tp_path_gap) — НЕ verified: px_ok 0, поза
+# заголовком, окремий лічильник n_tape_thin; tp_tape_miss + tp_path_gap — «не перетнув» не доведено
+ON = api["_official_net"]
+thin = {"net_tape_pct": "0.5", "status": "tape_thin", "flags": "full_close;tp_tape_hit;tp_path_gap"}
+off, nt, sd, fl, vs = ON(1.0, thin, fnum)
+assert vs == "tape_thin" and off == 0.5 and sd == 1 and api["_px_check"](vs, 0) == 0
+assert ON(None, thin, fnum)[4] == "tape_thin"                                                  # і без live
+assert ON(1.0, {"net_tape_pct": "0.5", "status": "verified", "flags": "full_close;tp_tape_hit"}, fnum)[4] == "verified"
+assert ON(1.0, {"net_tape_pct": "0.5", "status": "", "flags": "full_close;tp_replay_thin"}, fnum)[4] == "tape_thin"   # за прапорцем, без status
+wcsv("rev.csv", rh, [revr("a1"), revr("a3", algo="2.17", exit_src="book_partial", exit_fill_frac=""),
+                     revr("r8a", st=FH["R8_NAME"], exit_reason="tp", tp_px="100.8"),
+                     revr("r8b", st=FH["R8_NAME"], exit_reason="timer", tp_px="100.8")])
+wcsv("settlements.csv", S.HEADERS, [setr("a1|R1_загальний", "rev", "R1_загальний"), setr("a3|R1_загальний", "rev", "R1_загальний"),
+                                    setr("r8a|" + FH["R8_NAME"], "rev", FH["R8_NAME"], status="tape_thin", flags="full_close;dump_tape;tp_tape_hit;tp_path_gap"),
+                                    setr("r8b|" + FH["R8_NAME"], "rev", FH["R8_NAME"], status="tape_thin", flags="full_close;dump_tape;tp_tape_miss;tp_path_gap")])
+api["_strat2_cache"]["ts"] = 0.0; api["_settle_cache"]["key"] = None
+o = api["strat2_api"]()
+r8 = o["strategies"][FH["R8_NAME"]]
+ta, tb = [t for t in r8["trades"] if t["exit_reason"] == "tp"][0], [t for t in r8["trades"] if t["exit_reason"] == "timer"][0]
+assert ta["status"] == "tape_thin" and ta["px_ok"] == 0 and ta["settled"] == 1 and ta["exit_ok"] == 1                # hit доведено; ціна — ні
+assert tb["status"] == "tape_thin" and tb["px_ok"] == 0 and tb["exit_ok"] is None and tb["exit_why"] == "tape_thin"  # miss з дірою — не доведено
+assert r8["n"] == 0 and r8["n_paper"] == 2 and r8["n_tape_thin"] == 2 and r8["n_verified_all"] == 0 and r8["n_tape_only"] == 0
+assert r8["n_settled"] == r8["n_verified_all"] + r8["n_live_only"] + r8["n_tape_only"] + r8["n_tape_thin"]
+r1 = o["strategies"]["R1_загальний"]
+assert r1["n"] == 1 and r1["n_tape_thin"] == 0 and r1["n_settled"] == r1["n_verified_all"] + r1["n_live_only"] + r1["n_tape_only"] + r1["n_tape_thin"]
+# n_sig_unmatched окремо від «чекає»
+blk_u = AG["_agg_block"]([tr(0.5, sig=None, sig_why="trig_unmatched"), tr(0.4, sig=None, sig_why="pending"), tr(0.3)], time.time(), 60)
+assert blk_u["n_sig_unmatched"] == 1 and blk_u["n_sig_pending"] == 1 and blk_u["n"] == 1
 print("10) статистики: групи через _head_ok, eval-період, pct_verified, старі R у журналі, старий partial → px_ok 0, TWAP confirmed ∩ заголовок, фандинг у кривій/net60/net_live, no_funding")
 
+# ═══ 12. Рев'ю дифу v2.20 (settlement) ══════════════════════════════════
+# №2: TWAP-рядок тригера не записує — епізод кита за останнім філом, як раніше (без trigger_unmatched);
+#     Follow — лише з trigger=True
+o12 = {"flags": []}
+S._whale(o12, {"whale_addr": "0xw", "coin": "AAA"}, t_in, ctx3, close_only=False, symbol=None)     # як settle_twap
+assert "trigger_unmatched" not in o12["flags"] and "trig_match" not in o12 and abs(o12["lag_s"] - 1.0) < 1e-9, o12   # останній філ (мейкер, 1 с) — як до v2.20
+o12 = {"flags": []}
+S._whale(o12, {"whale_addr": "0xw", "coin": "AAA"}, t_in, ctx3, close_only=False, symbol=None, trigger=True)   # як settle_follow
+assert "trigger_unmatched" in o12["flags"] and o12["trig_match"] == "none"
+src_settle = open((_HL + "/settle.py"), encoding="utf-8").read()
+assert src_settle.count("symbol=symbol, trigger=True)") == 1 \
+       and src_settle.index("def settle_follow") < src_settle.index("symbol=symbol, trigger=True)") < src_settle.index("def settle_twap")
+# №3: відро, зняте ще ВІДКРИТИМ, — не «ок»; після закриття відра знімок у пам'яті перетягується
+b12 = ((BASE // S.REST_BUCKET_MS) * S.REST_BUCKET_MS) + 3 * S.HOUR_MS
+ROWS12 = [(k, b12 + 1000 + k * 1000, 100.0) for k in range(20)] + [(20 + k, b12 + 7 * S.MIN_MS + k * 1000, 101.0) for k in range(10)]
+now12 = [b12 + 5 * S.MIN_MS]; calls12 = []
+def rest12(url):
+    calls12.append(url)
+    q = dict(p.split("=") for p in url.split("?")[1].split("&"))
+    vis = [r for r in ROWS12 if r[1] <= now12[0]]                       # біржа віддає лише те, що вже сталось
+    if "fromId" in q:
+        return [{"a": a, "p": str(p), "q": "1", "T": t, "m": False} for a, t, p in vis if a >= int(q["fromId"])][:1000]
+    st, en = int(q["startTime"]), int(q["endTime"])
+    return [{"a": a, "p": str(p), "q": "1", "T": t, "m": False} for a, t, p in vis if st <= t <= en][:1000]
+tape12 = S.Tape(tempfile.mkdtemp(), fetch_zip=lambda u: None, fetch_rest=rest12, now_ms=now12[0], rest_pace_s=0)
+ts12, _ = tape12.window("XUSDT", b12, b12 + 4 * S.MIN_MS)
+assert len(ts12) == 20 and tape12._bucket_ok.get(("XUSDT", b12)) is False and ("XUSDT", b12) in tape12._partial
+assert not tape12.window_complete("XUSDT", b12, b12 + 4 * S.MIN_MS)
+n12 = len(calls12)
+assert len(tape12.window("XUSDT", b12, b12 + 4 * S.MIN_MS)[0]) == 20 and len(calls12) == n12   # поки відро триває — з пам'яті
+now12[0] = b12 + 20 * S.MIN_MS; tape12.now_ms = now12[0]                                    # відро закрилось
+assert tape12.window_complete("XUSDT", b12, b12 + 9 * S.MIN_MS) and len(calls12) > n12           # перетягнуто, обхід повний
+assert len(tape12.window("XUSDT", b12, b12 + 9 * S.MIN_MS)[0]) == 30 and tape12._bucket_ok[("XUSDT", b12)] \
+       and ("XUSDT", b12) not in tape12._partial
+meta12 = json.load(open(os.path.join(tape12.rest_dir, "XUSDT-%d.json" % b12)))
+assert meta12["complete"] is True and meta12["n"] == 30
+# детекція R у мс (detect_ms, v2.20) — перша у списку колонок часу
+assert S._ts({"detect_ms": str(BASE + 1000), "detect_ts_ms": "", "entry_ts_ms": str(BASE + 2000)},
+             ("detect_ms", "detect_ts_ms", "entry_ts_ms"), "date") == (BASE + 1000, "ms")
+assert [f for f in S.FAMILIES if f[0] == "rev_trades.csv"][0][3][0] == "detect_ms"
+# причинність у settlement: тригер ПІСЛЯ входу знаходиться (вікно +120 с) → lag_s<0, neg_lag → sig_ok=0 (F і R)
+late = hfill(t_in + 2000, "Close Long", 100, 500, True, "0xlate")
+o = {"flags": []}
+S._whale(o, {"whale_addr": "0xw", "coin": "AAA", "trig_hash": "0xlate"}, t_in, {"hl": HLF(fills + [late]), "tape": None}, close_only=False, symbol=None, trigger=True)
+assert o["trig_match"] == "hash" and "neg_lag" in o["flags"] and abs(o["lag_s"] + 2.0) < 1e-9, o
+assert api["_sig_check_fol"]({"flags": ";".join(o["flags"]), "lag_s": str(o["lag_s"])}, fnum) == (0, "neg_lag")
+o = {"flags": []}
+S._whale(o, {"whale_addr": "0xw", "coin": "AAA", "trig_hash": "0xlate"}, t_in, {"hl": HLF(fills + [late]), "tape": None}, close_only=True, symbol=None)   # реверс
+assert "neg_lag" in o["flags"] and abs(o["lag_s"] + 2.0) < 1e-9, o
+assert api["_sig_check_rev"]("R1_загальний", {"flags": "full_close;neg_lag", "dump_bucket": "2", "dump_move_pct": "1.5", "lag_s": "-2.0"}, fnum) == (0, "neg_lag")
+o = {"flags": []}
+S._whale(o, {"whale_addr": "0xw", "coin": "AAA", "trig_hash": "0xtrig"}, t_in, {"hl": HLF(fills + [late]), "tape": None}, close_only=True, symbol=None)   # тригер до входу — як раніше
+assert "neg_lag" not in o["flags"] and abs(o["lag_s"] - 100.0) < 1e-9, o
+o = {"flags": []}
+S._whale(o, {"whale_addr": "0xw", "coin": "AAA"}, t_in, {"hl": HLF(fills + [late]), "tape": None}, close_only=True, symbol=None)   # без тригера — вікно лише до входу
+assert "neg_lag" not in o["flags"] and abs(o["lag_s"] - 100.0) < 1e-9, o
+# №5: _seen_pairs з боком — фліп у НЕкваліфікований бік (ratio<2) = старий бік закрито → carried, не дроп
+n = mk_uw({"0xw": {"AAA": dict(wl["0xw"]["AAA"], ratio_hi_ts=tsc - 5000)}})
+n["update_watchlist"]({"AAA": [{"addr": "0xw", "size": 1.0, "val": 1e4, "side": "SHORT", "entry": 1.0}]}, depth10, tsc, None, {"0xw": tsc})
+assert n["watchlist"]["0xw"]["AAA"]["side"] == "LONG" and n["watchlist"]["0xw"]["AAA"].get("_gone_ts") and n["stats"]["scan_gone_carried"] == 1, n["watchlist"]
+n = mk_uw({"0xw": {"AAA": dict(wl["0xw"]["AAA"], ratio_hi_ts=tsc - 5000)}})
+n["update_watchlist"]({"AAA": [{"addr": "0xw", "size": 1.0, "val": 1e4, "side": "LONG", "entry": 1.0}]}, depth10, tsc, None, {"0xw": tsc})
+assert n["watchlist"] == {} and not n["stats"].get("scan_gone_carried")                    # той самий бік без ratio — звичайний дроп
+# №6: стала мітка — live-запис новіший за знімок (merge лишає його), пара жива → мітка знята з ЖИВОГО запису
+n = mk_uw({"0xw": {"AAA": dict(wl["0xw"]["AAA"], _gone_ts=tsc - 3 * 3600, upd=tsc + 5)}})
+n["update_watchlist"]({"AAA": [{"addr": "0xw", "size": 1.0, "val": 5e5, "side": "LONG", "entry": 1.0}]}, depth10, tsc, None, {"0xw": tsc})
+assert "_gone_ts" not in n["watchlist"]["0xw"]["AAA"] and n["watchlist"]["0xw"]["AAA"]["upd"] == tsc + 5, n["watchlist"]
+n["update_watchlist"]({}, depth10, tsc + 10, None, {"0xw": tsc + 10})                     # тепер справді зникла → carried, не dropped
+assert n["watchlist"]["0xw"]["AAA"].get("_gone_ts") and not n["stats"].get("scan_gone_dropped"), n["watchlist"]
+assert src.count('watchlist[addr][coin].pop("_gone_ts", None)') == 3                        # усі гілки sweep, де позиція оновлюється
+# №7: частковий сигнал (тінь) і повне закриття того самого батчу — різні id (-p)
+n = mk_rev(mid_ts_off=1.0); n["fc_episodes"][(A, "AAA")] = dict(EP)
+n["rev_on_close"](A, "AAA", OLD_R, [dict(FILLS[0], sz=400.0)], False)                      # 40% → тіньовий сигнал
+assert n["rev_open"] and all(k.split("|")[0].endswith("-p") for k in n["rev_open"]), list(n["rev_open"])
+n["fc_episodes"][(A, "AAA")] = dict(EP)
+n["rev_on_close"](A, "AAA", OLD_R, FILLS, True)
+assert len(n["rev_open"]) == 2 and any(not k.split("|")[0].endswith("-p") for k in n["rev_open"]), list(n["rev_open"])
+# дрібне: протерміновані записи _ingest_retry зникають зі словника
+from collections import OrderedDict as _OD
+FAIL12 = {"sim"}
+def _stub12(name):
+    def f(*a, **k):
+        if name in FAIL12: raise RuntimeError("boom " + name)
+    return f
+ING = load({"_ingest_txs", "_tx_key", "_grace_val"}, dict(C, _ingested=_OD(), _ingested_lock=threading.Lock(), INGEST_LRU=20000,
+           INGEST_CONSUMERS=("sim", "fc", "rev", "fol"), INGEST_RETRY_MAX=50, _fc_done={}, _ingest_retry={}, stats={},
+           _journal=lambda *a, **k: None, fc_lock=threading.Lock(), fc_episodes={}, sim_on_market_txs=_stub12("sim"),
+           fc_on_txs=_stub12("fc"), rev_on_close=_stub12("rev"), follow_on_txs=_stub12("fol"), fc_on_full_close=_stub12("fcfull")))
+txi = lambda h, ts: {"hash": h, "ts": ts, "px": 100.0, "sz": 10.0, "sp": 100.0, "dir": "Close Long", "agg": 1}
+ING["_ingest_txs"]("0xw", "AAA", OLD_R, [txi("0x1", 1000)], 900.0, False, "ws", 1500)
+assert [f["hash"] for f in ING["_ingest_retry"][("0xw", "AAA")]] == ["0x1"]
+ING["_ingest_retry"][("0xw", "AAA")][0]["_rt_ts"] -= 4000                                    # протерміновано (>1 год)
+FAIL12.clear()
+ING["_ingest_txs"]("0xw", "AAA", OLD_R, [txi("0x2", 2000)], 800.0, False, "sweep", 2500)
+assert ("0xw", "AAA") not in ING["_ingest_retry"], ING["_ingest_retry"]
+assert src.count('p["exit_retry_at"] = now2 + 15.0') == 4 and src.count('if p["_stale_n"] >= 2:') == 2   # повторно застарілий стакан — бекоф 15 с
+print("12) рев'ю дифу: TWAP без trigger_unmatched (тригер лише у Follow), відкрите відро — не «ок» і перетягується після закриття, detect_ms у settlement, "
+      "neg_lag через тригер після входу, _seen_pairs з боком, стала мітка _gone_ts, -p для часткового сигналу, retry-очищення, бекоф виходу")
+
 # ═══ 11. Структурні ═══════════════════════════════════════════════════════
+assert '"bn_px_fail":     stats.get("bn_px_fail", 0)' in src and '"settle_prev_v":  stats.get("settle_prev_v", 0)' in src   # рев'ю №2
 assert "threading.Thread(target=run_bn_px_poller" in src and '"bn_px_age_s":    _bn_px_age_s()' in src
 assert "def _tr_px_now(p, max_age=30.0):" in src and src.count("px = _tr_px_now(p, 30.0)") == 2
 assert "min_recv_ms=decision_ms" in src and src.count('"decision_ms": decision_ms') >= 3
@@ -654,7 +782,8 @@ assert 'def _trigger_fill(fills, row):' in open((_HL + "/settle.py"), encoding="
 wd = open((_HL + "/watchdog.py"), encoding="utf-8").read()
 assert 'bn_px_age_s' in wd and "bn_px_stale" in wd
 ui = open((_HL + "/hyperliquid-terminal.html"), encoding="utf-8").read()
-for m in ("tape_thin", "neg_lag:", "trig_unmatched", "no_tp:", "pct_verified", "eval_since", "by_coin", "bookTicker"):
+for m in ("tape_thin", "neg_lag:", "trig_unmatched", "no_tp:", "pct_verified", "eval_since", "by_coin", "bookTicker",
+          "n_tape_thin", "n_sig_unmatched", "стрічка неповна"):
     assert m in ui, m
 _js = "\n".join(re.findall(r"<script(?![^>]*src)[^>]*>(.*?)</script>", ui, re.S))
 _jp = os.path.join(tempfile.mkdtemp(), "inline.js"); open(_jp, "w", encoding="utf-8").write(_js)

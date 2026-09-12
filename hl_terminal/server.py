@@ -1749,7 +1749,10 @@ def update_watchlist(result, depth_snap, scan_start=0, failed_addrs=None,
         # не бачив, реверс-подія губилась). Обмеження — GONE_MAX_S, далі дроп
         carried_gone = dropped_gone = 0
         # пари, ПРИСУТНІ у знімку скану (позиція є, хай і без ratio/грейсу) — не «закриті»
-        _seen_pairs = {(p_["addr"].lower(), c_) for c_, ps_ in result.items() for p_ in ps_
+        # рев'ю v2.20: разом із БОКОМ — фліп у некваліфікований бік (ratio<2) теж
+        # означає, що старий бік закрито; без боку пара «бачилась» і старий
+        # запис дропався мовчки (реверс-подія губилась саме там)
+        _seen_pairs = {(p_["addr"].lower(), c_, p_.get("side")) for c_, ps_ in result.items() for p_ in ps_
                        if p_.get("size") and p_.get("addr")}
         for _wa, _wcoins in list(watchlist.items()):
             if _wa not in (fetch_times or {}):
@@ -1757,12 +1760,15 @@ def update_watchlist(result, depth_snap, scan_start=0, failed_addrs=None,
             _ft_a = (fetch_times or {}).get(_wa, scan_start)
             for _wc, _wp in _wcoins.items():
                 _nw = new_wl.get(_wa, {}).get(_wc)
-                if _nw is None and (_wa, _wc) in _seen_pairs:
-                    continue   # позиція жива, просто не кваліфікується (ratio/грейс) — звичайний дроп
+                if _nw is None and (_wa, _wc, _wp.get("side")) in _seen_pairs:
+                    continue   # позиція жива (той самий бік), просто не кваліфікується (ratio/грейс) — звичайний дроп
                 if _nw is not None:
                     if (_nw.get("side") == _wp.get("side")
                             or (_wp.get("upd", 0) >= _ft_a > 0)):
-                        _nw.pop("_gone_ts", None)   # пара жива у знімку — мітка знімається
+                        # пара жива у знімку — мітка знімається з ЖИВОГО запису (рев'ю
+                        # v2.20: merge нижче може лишити саме його, а не свіжу копію)
+                        _wp.pop("_gone_ts", None)
+                        _nw.pop("_gone_ts", None)
                         continue
                     # ФЛІП у знімку (інший бік), а realtime старий бік ще не закрив:
                     # старий запис лишається з міткою — sweep побачить розворот,
@@ -2415,6 +2421,13 @@ def _ingest_txs(addr, coin, old, mfills, new_size, full_close, det_src, snap_ms,
         # для цієї пари (курсор філів уже пішов далі — інакше джерела повтору
         # немає); стеля INGEST_RETRY_MAX на пару, старші за годину — геть
         _rt = [f for f in _ingest_retry.get(fc_key, ()) if now - float(f.get("_rt_ts") or now) < 3600.0]
+        if fc_key in _ingest_retry:
+            # рев'ю v2.20: протерміновані записи (>1 год) справді зникають, а не
+            # лежать у словнику назавжди (їх ніколи не «пред'являли», тож _release не чистив)
+            if _rt:
+                _ingest_retry[fc_key] = _rt
+            else:
+                _ingest_retry.pop(fc_key, None)
         _have = {_tx_key(f) for f in mfills}
         mfills = list(mfills) + [f for f in _rt if _tx_key(f) not in _have]
     keys = [(addr, coin, _tx_key(f)) for f in mfills]
@@ -2762,6 +2775,7 @@ def run_realtime_monitor():
                             watchlist[addr][coin]["size"] = new_pos["size"]
                             watchlist[addr][coin]["val"]  = new_pos["val"]
                             watchlist[addr][coin]["upd"]  = time.time()
+                            watchlist[addr][coin].pop("_gone_ts", None)   # рев'ю v2.20: позиція жива
                             if _r9 is not None:
                                 _mark_ratio(watchlist[addr][coin], _r9)
                     if full_close:
@@ -2870,6 +2884,7 @@ def run_realtime_monitor():
                             watchlist[addr][coin]["size"] = new_pos["size"]
                             watchlist[addr][coin]["val"]  = new_pos["val"]
                             watchlist[addr][coin]["upd"]  = time.time()
+                            watchlist[addr][coin].pop("_gone_ts", None)   # рев'ю v2.20: позиція жива
                             if _r9 is not None:
                                 _mark_ratio(watchlist[addr][coin], _r9)
                     if full_close:
@@ -2928,6 +2943,7 @@ def run_realtime_monitor():
                             watchlist[addr][coin]["size"] = new_pos["size"]
                             watchlist[addr][coin]["val"]  = new_pos["val"]
                             watchlist[addr][coin]["upd"]  = time.time()
+                            watchlist[addr][coin].pop("_gone_ts", None)   # рев'ю v2.20: позиція жива
                             if _r9 is not None:
                                 _mark_ratio(watchlist[addr][coin], _r9)
                 if full_close:
@@ -5721,6 +5737,11 @@ def rev_on_close(addr, coin, old, mfills, full_close, detect_src="sweep", detect
     # одного епізоду — різні ключі, як і раніше
     _txh = str(_txs[-1].get("hash", ""))[2:10]
     sig_id = f"{int(fill_ts_ms or now * 1000)}-{coin}-{addr[2:8]}-{_txh}"
+    if not full_close:
+        # рев'ю v2.20: часткове закриття (тіньовий сигнал) і повне закриття того
+        # самого батчу — РІЗНІ події: без суфікса перший (частковий) рядок
+        # rev_signals «вигравав» дедуп і підміняв повний сигнал у статистиці
+        sig_id += "-p"
     # «одним пострілом» (ТЗ 04.09 п.2): повне закриття, у якому ОДНА
     # маркет-транзакція закрила ≥95% позиції і коштувала ≥$100k.
     # Аудит v2.10 №2: звіряємось із ЕПІЗОДОМ, а не з поточним батчем —
@@ -7577,7 +7598,14 @@ def _strat2_tick():
                             continue   # повтор через exit_retry_at; після капу — no_price
                         recv_s, _dl = _apply_delay(xmeta, now2, req)
                         if recv_s is None:
-                            continue   # застаріла — запит не відновлюємо, фаза 1 створить новий (рев'ю №2)
+                            # застаріла — запит не відновлюємо, фаза 1 створить новий (рев'ю №2);
+                            # рев'ю v2.20: ПОВТОРНО застарілий стакан (лежить/повільний) — не
+                            # щотику, а через 15 с; перший раз — наступним тиком, як у v2.19
+                            p["_stale_n"] = p.get("_stale_n", 0) + 1
+                            if p["_stale_n"] >= 2:
+                                p["exit_retry_at"] = now2 + 15.0
+                            continue
+                        p.pop("_stale_n", None)
                         tw = p.get("twap")
                         if isinstance(tw, dict):
                             tw["exit_px"] = base_px
@@ -7601,7 +7629,14 @@ def _strat2_tick():
                     if not base_px: continue   # ні стакану, ні свіжого міда — наступний тик
                     recv_s, _dl = _apply_delay(xmeta, now2, req)
                     if recv_s is None:
-                        continue   # застаріла — запит не відновлюємо, фаза 1 створить новий (рев'ю №2)
+                        # застаріла — запит не відновлюємо, фаза 1 створить новий (рев'ю №2);
+                        # рев'ю v2.20: ПОВТОРНО застарілий стакан — наступна спроба через 15 с,
+                        # перший раз — наступним тиком (v2.19: без 30-с гарду)
+                        p["_stale_n"] = p.get("_stale_n", 0) + 1
+                        if p["_stale_n"] >= 2:
+                            p["exit_retry_at"] = now2 + 15.0
+                        continue
+                    p.pop("_stale_n", None)
                     if req["kind"] == "tp" and p.get("tp_px"):
                         # лімітка на TP: не краще за TP і не краще за стакан
                         tp = p["tp_px"]
@@ -7836,10 +7871,16 @@ def _official_net(net_live, srow, fnum):
         return net_live, None, 0, "", ("live_only" if net_live is not None else "pending")
     nt = fnum(srow.get("net_tape_pct"))
     flags = srow.get("flags") or ""
+    # рев'ю v2.20 №1: нога по стрічці на НЕПОВНИХ даних (settlement v5:
+    # status tape_thin / прапорці tp_path_gap, tp_replay_thin) — не
+    # «verified»: офіційний net лишається гіршим із двох, але ціна НЕ
+    # перевірена (px_ok=0) і рядок поза заголовком
+    thin = (str(srow.get("status") or "") == "tape_thin"
+            or any(f in flags for f in ("tp_path_gap", "tp_replay_thin")))
     if nt is not None and net_live is not None:
-        return min(net_live, nt), nt, 1, flags, "verified"
+        return min(net_live, nt), nt, 1, flags, ("tape_thin" if thin else "verified")
     if nt is not None:
-        return nt, nt, 1, flags, "tape_only"
+        return nt, nt, 1, flags, ("tape_thin" if thin else "tape_only")
     if net_live is not None:
         return net_live, None, 1, flags, "live_only"
     return None, None, 1, flags, "none"
@@ -8080,8 +8121,13 @@ def _agg_block(trs, now, H, buckets=False):
            # ціна (verified + повний вихід), правило виходу; усі paper-угоди
            "paper": _stat_small(paper_all), "n_paper": len(paper_all),
            "n_sig_invalid": sum(1 for t in trs if t.get("entered", 1) != 0 and t.get("sig_ok") == 0),
+           # рев'ю v2.20: «тригер не знайдено» (старі F без trig_hash/fill_ts_ms)
+           # — назавжди, не «чекає»: окремий лічильник, не у pending
            "n_sig_pending": sum(1 for t in trs if t.get("entered", 1) != 0 and t.get("net30") is not None
-                                and "sig_ok" in t and t.get("sig_ok") is None),
+                                and "sig_ok" in t and t.get("sig_ok") is None
+                                and t.get("sig_why") != "trig_unmatched"),
+           "n_sig_unmatched": sum(1 for t in trs if t.get("entered", 1) != 0 and t.get("net30") is not None
+                                  and t.get("sig_ok") is None and t.get("sig_why") == "trig_unmatched"),
            "sig_why": _count_by(t.get("sig_why") for t in trs if t.get("sig_ok") == 0),
            "n_px_unverified": sum(1 for t in trs if t.get("entered", 1) != 0 and t.get("net30") is not None
                                   and t.get("px_ok", (1 if t.get("status") == "verified" else 0)) == 0),
@@ -8097,6 +8143,9 @@ def _agg_block(trs, now, H, buckets=False):
            "n_verified_all": sum(1 for t in trs if t.get("status") == "verified"),
            "n_live_only": sum(1 for t in trs if t.get("status") == "live_only"),
            "n_tape_only": sum(1 for t in trs if t.get("status") == "tape_only"),
+           # рев'ю v2.20 №1: стрічка неповна (R8 tp_path_gap/tp_replay_thin) — окремо,
+           # щоб verified_all + live_only + tape_only + tape_thin (+none) = settled
+           "n_tape_thin": sum(1 for t in trs if t.get("status") == "tape_thin"),
            "n_mismatch": sum(1 for t in trs if t.get("mismatch")),
            # аудит-3 №1/№2: епізод live ≠ епізод settlement (когорта інша)
            "n_ep_mismatch": sum(1 for t in trs if t.get("ep_mismatch")),
@@ -8512,9 +8561,11 @@ def strat2_api():
                     _fl8 = (flags or "")
                     if "tp_tape_hit" in _fl8:
                         _hit8 = True
-                    elif "tp_tape_miss" in _fl8 and "tape_gap" not in _fl8:
+                    elif "tp_tape_miss" in _fl8 and "tape_gap" not in _fl8 and "tp_path_gap" not in _fl8:
                         # рев'ю v2.19 №5: «не перетнув» має право лише на повній
-                        # стрічці — з tape_gap реплей не вирішений (pending)
+                        # стрічці — з tape_gap реплей не вирішений (pending);
+                        # рев'ю v2.20 №1: діра на шляху до TP (tp_path_gap) — теж
+                        # не доказ «не перетнув»
                         _hit8 = False
                     else:
                         _hit8 = None   # реплею ще нема (no_tape / діра / старий рядок)
@@ -8523,7 +8574,9 @@ def strat2_api():
                         # звірити; це не «чекає», а невизначене назавжди → поза заголовком
                         exit_ok, exit_why = 0, "no_tp"
                     elif _hit8 is None:
-                        exit_ok, exit_why = None, "pending"
+                        # tape_thin (діра на шляху до TP) — після 72 год фінал:
+                        # не «чекає», а невирішене назавжди (поза заголовком)
+                        exit_ok, exit_why = None, ("tape_thin" if vstat == "tape_thin" else "pending")
                     elif exit_reason == "tp" and not _hit8:
                         exit_ok, exit_why = 0, "tp_phantom"
                     elif exit_reason != "tp" and _hit8:
@@ -10992,6 +11045,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                      if stats.get("px_last_ok") else None),
                 "px_age_s":       _px_age_s(),
                 "bn_px_age_s":    _bn_px_age_s(),   # v2.20: потік цін Binance (bookTicker)
+                "bn_px_fail":     stats.get("bn_px_fail", 0),   # рев'ю v2.20 №2: вотчдог показує збої
+                "bn_px_n":        stats.get("bn_px_n", 0),
+                "settle_prev_v":  stats.get("settle_prev_v", 0),  # рядки settle_v≠поточної (чекають перерахунку)
                 "px_fail":        stats.get("px_fail", 0),
                 "book_ok":        stats.get("book_ok", 0),
                 "book_fail":      stats.get("book_fail", 0),
