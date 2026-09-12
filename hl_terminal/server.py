@@ -2178,17 +2178,20 @@ def get_recent_market_fills(addr, coin, since_ms, side=None):
     market_txs.sort(key=lambda x: x["ts"], reverse=True)
     return market_txs
 
-def _depth_ok(d):
+def _depth_ok(d, count=True):
     """Глибина придатна як база ratio: є, не старша за 2 цикли і 1%-діапазон
     не обрізаний (аудит-3: 1000 рівнів не вмістили → глибина занижена,
-    ratio завищений — не база для відбору)."""
+    ratio завищений — не база для відбору). count=False — без лічильників
+    (інформативні виклики, напр. ratio епізоду у профілі; рев'ю v2.18 №4)."""
     if not d:
         return False
     if d.get("ts") and time.time() - d["ts"] > 2 * REFRESH_S:
-        stats["ratio_stale_depth"] = stats.get("ratio_stale_depth", 0) + 1
+        if count:
+            stats["ratio_stale_depth"] = stats.get("ratio_stale_depth", 0) + 1
         return False
     if d.get("trunc"):
-        stats["ratio_trunc_depth"] = stats.get("ratio_trunc_depth", 0) + 1
+        if count:
+            stats["ratio_trunc_depth"] = stats.get("ratio_trunc_depth", 0) + 1
         return False
     return True
 
@@ -3211,17 +3214,22 @@ def sim_all_mids(retries=4):
     except Exception:
         return None
 
-def _sim_depth(coin, side=None):
+def _sim_depth(coin, side=None, count=True):
     """Глибина монети; із side — по стороні, яку атакує закриття кита,
     щоб вихід 'whale_exhausted' рахувався в тій самій шкалі, що і
-    side-aware ratio у watchlist."""
+    side-aware ratio у watchlist. count=False — без лічильників скану."""
     with cache_lock:
         d = cache["depth"].get(coin) or cache.get("depth_prev", {}).get(coin)
-    if not _depth_ok(d):
+    if not _depth_ok(d, count=count):
         return 0   # v2.18 (аудит №8): стара/обрізана глибина — не база (0 = невідомо)
     if side:
         return depth_for_side(d, side)
     return d["max"] if d and d.get("max") else 0
+
+def _sim_depth_quiet(coin, side=None):
+    """Те саме без лічильників ratio_stale/trunc_depth — для інформативних
+    оцінок (ratio епізодів у профілі), щоб не рахувати їх як пропуски скану."""
+    return _sim_depth(coin, side, count=False)
 
 def _sim_slip(depth):
     """Сліпаж за сторону: спред + прохід по стакану нашим розміром."""
@@ -5757,6 +5765,13 @@ def _profile_refresh_pick(now=None):
             r = _need(a)
             if r is not None:
                 cands.append((3 + r[0], r[1], a))
+        elif p.get("v") != PROFILE_ALGO_V:
+            # рев'ю v2.18 №3: не-ok профіль СТАРОЇ версії поза watchlist —
+            # теж перерахувати (найнижчий пріоритет), інакше «чекають N» у
+            # хедері не спорожніє, а група «втратив/отримав» буде неповною
+            r = _need(a)
+            if r is not None:
+                cands.append((6, r[1], a))
     cands.sort()
     return [a for _, _, a in cands[:PROFILE_REFRESH_BATCH]]
 
@@ -5883,32 +5898,46 @@ def _profile_txs(fills):
         else:
             k = (f.get("coin", "?"), h)
         agg = txs.setdefault(k, {"t": t, "cost": 0.0, "sz": 0.0, "sp": sp, "aggr": aggr,
-                                 "side": side, "seq": seq, "open": is_open, "flip": is_flip,
-                                 "coin": f.get("coin", "?")})
+                                 "side": side, "seq": seq, "coin": f.get("coin", "?"),
+                                 "sz_close": 0.0, "sz_open": 0.0, "side_open": None,
+                                 "sp_open": sp, "pure_open": True})
         if t < agg["t"] or (t == agg["t"] and seq < agg["seq"]):
             agg["t"], agg["seq"], agg["sp"] = t, seq, sp   # позиція ПЕРЕД транзакцією — з першого філа
+            if is_open: agg["sp_open"] = sp
         agg["cost"] += px * sz
         agg["sz"] += sz
         agg["aggr"] = agg["aggr"] and aggr
+        # рев'ю v2.18 №1: dir у HL — ПО ФІЛУ; один ордер через нуль несе
+        # «Close Long, …, Long > Short, Open Short» під тим самим hash —
+        # ноги рахуємо по кожному філу, а не за напрямком першого
+        if is_open:
+            agg["sz_open"] += sz
+            agg["side_open"] = side
+        elif is_flip:
+            c = min(sz, sp) if sp > 0 else 0.0
+            agg["sz_close"] += c
+            agg["sz_open"] += sz - c
+            agg["side_open"] = "SHORT" if side == "LONG" else "LONG"
+            agg["pure_open"] = False
+        else:
+            agg["sz_close"] += (min(sz, sp) if sp > 0 else sz)
+            agg["pure_open"] = False
     by_coin = {}
     for k, a in txs.items():
         px = a["cost"] / a["sz"]
         base = {"t": a["t"], "px": px, "aggr": a["aggr"], "side": a["side"], "seq": a["seq"]}
-        if a["open"]:
-            by_coin.setdefault(k[0], []).append(dict(base, kind="open", sz=a["sz"], sp=a["sp"]))
-        elif a["flip"]:
-            # фліп: закривається СТАРИЙ бік (не більше позиції), решта — відкриття
-            # нового; фліп із нуля (startPosition 0) — лише відкриття
-            szc = min(a["sz"], a["sp"]) if a["sp"] > 0 else 0.0
-            if szc > 0:
-                by_coin.setdefault(k[0], []).append(dict(base, kind="close", sz=szc, sp=a["sp"]))
-            if a["sz"] - szc > 1e-12:
-                by_coin.setdefault(k[0], []).append(dict(base, kind="open", sz=a["sz"] - szc, sp=0.0,
+        if a["sz_close"] > 1e-12:
+            # закривається СТАРИЙ бік (не більше позиції); фліп із нуля — лише відкриття
+            by_coin.setdefault(k[0], []).append(dict(base, kind="close", sz=a["sz_close"], sp=a["sp"]))
+        if a["sz_open"] > 1e-12:
+            if a["pure_open"]:
+                by_coin.setdefault(k[0], []).append(dict(base, kind="open", sz=a["sz_open"], sp=a["sp_open"],
+                                                          side=a["side_open"] or a["side"]))
+            else:
+                # відкриття нового боку ПІСЛЯ закриття старого у тому ж ордері
+                by_coin.setdefault(k[0], []).append(dict(base, kind="open", sz=a["sz_open"], sp=0.0,
                                                           seq=a["seq"] + 0.5,
-                                                          side=("SHORT" if a["side"] == "LONG" else "LONG")))
-        else:
-            szc = min(a["sz"], a["sp"]) if a["sp"] > 0 else a["sz"]
-            by_coin.setdefault(k[0], []).append(dict(base, kind="close", sz=szc, sp=a["sp"]))
+                                                          side=a["side_open"] or a["side"]))
     for lst in by_coin.values():
         lst.sort(key=lambda x: (x["t"], x["seq"]))   # ідентичність події, не лише мс
     return by_coin, bad
@@ -6055,7 +6084,15 @@ def _build_profile(fills, now_ms=None, depth_fn=None):
         завершених, не лише швидких (№10); fast_lb95 — нижня межа Вілсона
         (№9); episodes — таблиця епізодів для відтворюваності."""
     if now_ms is None: now_ms = time.time() * 1000
-    if depth_fn is None: depth_fn = globals().get("_sim_depth")   # лише інформативний ratio
+    if depth_fn is None:
+        # лише інформативний ratio: без лічильників скану (рев'ю v2.18 №4)
+        depth_fn = globals().get("_sim_depth_quiet") or globals().get("_sim_depth")
+    if depth_fn is not None:
+        _dmemo, _dfn = {}, depth_fn          # один запит глибини на (монета, бік)
+        def depth_fn(c, s=None):
+            if (c, s) not in _dmemo:
+                _dmemo[(c, s)] = _dfn(c, s)
+            return _dmemo[(c, s)]
     by_coin, bad = _profile_txs(fills)
     eps = []
     n_nosig = n_life = 0
@@ -7648,7 +7685,10 @@ def strat2_api():
                 "wallet": (r.get("whale_addr") or "")[:10], "ts": ts,
                 # v2.18: статус профілю на вході; «невизначений» — поза заголовком (unc)
                 "prof_status": (r.get("prof_status") or ""),
-                "unc": int((r.get("prof_status") or "") == "uncertain"),
+                # рев'ю v2.18 №2: «поза заголовком» — лише у стратегіях, де профіль є
+                # умовою входу; F1–F3/F6/F8 профіль не відбирають — їхня вибірка ціла
+                "unc": int(st in (F4_NAME, F10_NAME, F5_NAME, F7_NAME, F9_NAME)
+                           and (r.get("prof_status") or "") == "uncertain"),
                 "pf_lb95": fnum(r.get("prof_fast_lb95")), "pf_cont": fnum(r.get("prof_cont_pct")),
                 "pf_oneshot": fnum(r.get("prof_one_shot_pct")),
                 "_ct": (_parse_curve(srow.get("curve_tape"), REV_TRACK_MIN) if srow else None),
