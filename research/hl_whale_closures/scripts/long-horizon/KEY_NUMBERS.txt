@@ -1,0 +1,49 @@
+LONG-HORIZON LENS - key numbers (all returns in %, side-signed; mnA = coin minus EW alt index (152 Binance symbols ex BTC), mnB = minus BTC)
+Prices: Binance 1m klines, entry = close of first 1m candle closing >= bot_ts+60s; exit = close h hours later. Costs 0.146 RT + HL hourly funding proxy.
+Splits: early = 30.08-12.09 18:00 (only bot follow_trades legacy rows), disc = 12.09 18:00-21.09, test = 22.09-29.09 (72h horizon -> test decisions <= 26.09).
+Market regime: EW-alt idx early +4.6% / disc +17.9% / test +1.8%; BTC -1.3 / +12.2 / -3.4.
+Detail files: out_A.txt, out_AB_trig.txt, out_B*.txt, out_C.txt, out_flow_*.txt, out_D_panel.txt, out_campaigns.txt, out_coin_picture.txt
+
+[STRUCTURE] unwind speed vs ratio (547 6h-gap episodes, whale_txs 12.09-29.09): share of start position closed by same wallet within 1h / 24h (median; mean)
+  ratio<=2: 0.96/1.00 (0.69/0.89) | 2-3: 0.43/0.64 | 3-5: 0.50/0.90 | 5-10: 0.28/0.43 (0.41/0.55) | >10: 0.12/0.20 (0.15/0.34)
+  big campaigns (ratio_ref>=3, reached 90% closed): n=82, t10->t90 median 3.3h, q75 54h, q90 132h; ratio_ref>10: only 18% reach 90% in data, median t10->t90 15.9h
+  drift DURING unwind (whale dir, mnA, t10->t90, not tradable): n=76 med +0.00 mean +1.39 win 47%; campaigns >=2h: n=37 med +0.78 mean +2.47 win 51%
+  after 90% closed, fade dir: 24h n=72 med -0.31 mean -0.58; 72h n=64 med -2.06 mean -0.58
+
+[A] follow whale dir from unwind start (6h-gap episodes), mnA mean:        8h        24h       72h
+  disc (n=205)                                                          -0.77     -1.25     -2.24
+  test (n=287/262/189)                                                  -0.39     +0.51     +4.00  (placebo same coin/hour/side null +2.40 at 72h, P=0.07)
+  A-trig (first bot trigger after 6h silence; early n=431 / disc 226 / test 319): 8h -0.40/-0.47/+0.05 ; 24h -0.52/-0.23/+0.41 ; 72h +0.57/-0.52/+2.15
+  A-trig ratio>=5: 24h -0.55 (n=75) / +1.09 (50) / +4.03 (35) ; signperm P test = 1.00 (all events of a coin same side)
+  LONG vs SHORT flips sign between disc and test at 24-72h (disc LONG +1.6/SHORT -1.8; test LONG -2.6/SHORT +1.0 at 24h) -> regime, not signal.
+  A25 (enter when 25% of first-seen position closed, ratio>=2): 24h disc +0.87 / test -0.62 ; 48h +1.84 / -0.11
+
+[B] fade whale dir after (near-)full close. B-union (tx full closes max_val>=100k + bot full_close exits; dedupe coin&side 6h): 389 events, 70 coins, 188 wallets
+  mnA mean (median) [placebo P same coin/hour/side]:
+     h     early n=109          disc n=99            test n=160/157/151    POOLED
+     8h   +0.34 (+0.21) [0.20]  +0.94 (+0.50) [0.03]  +0.33 (-0.03) [0.22]  +0.50 (+0.15) [0.02]
+    12h   +0.98 (+0.33) [0.06]  +1.40 (+0.60) [0.00]  +0.45 (+0.00) [0.22]  +0.87 (+0.27) [0.007]
+    24h   +0.89 (+0.54) [0.18]  +0.66 (+0.37) [0.14]  +1.22 (+0.89) [0.05]  +0.97 (+0.66) [0.02]
+  B12 pooled: CI90 mean by coin [+0.38,+1.30], by day [+0.25,+1.47], by wallet [+0.22,+1.51]; win 55%; sum w/o top10% = -221 (NEGATIVE: tail-driven)
+  B12 test: CI coin [-0.32,+1.11], win 50%, sum w/o top10% -181, w/o top3 coins +0.05; LONG n=112 mean +0.73 med -0.44 ; SHORT n=45 -0.25
+  B12 net (mnA-0.146-fund): early +0.77 / disc +1.24 / test +0.29 (test median -0.10); taker0.10 test +0.34; maker0.04 test +0.40 (hedge-leg cost NOT included)
+  walk-forward horizon choice (8/12/24): early->12h -> disc +1.40 ; early+disc -> 12h -> test +0.45 (median 0.00), net +0.29
+  family-wise placebo over 8 horizons (1..72h), one event definition: max z = 2.47, P = 0.033. ~7 B event definitions tried -> ~0.2 overall.
+  fragility: B90 (fade at 90% of first-seen position, ratio>=2, ref>=200k) disc 24h = -1.49 (n=55) while B-union disc 24h = +0.66; B-trig ratio>=3 disc 24h -3.78
+  entry delay 1..60 min: B12 means nearly unchanged (test +0.45..+0.78) -> slow drift, not microstructure
+  B12 portfolio (equal notional, 365 trades, 31 days, 11.8 trades/day, max 23 concurrent): total +252 trade-% ; positive days 61%; maxDD -68 trade-%
+  vs generic reversal: pre-4h-move-matched baseline 8h ~0 (early -0.15, disc +0.01, test -0.01) -> excess 8h +0.51/+0.80/+0.58
+
+[C] net whale close flow -> next return (market-neutral)
+  hourly flow 1h -> next 1h: spearman disc +0.030, test +0.021; follow top25% |flow_rel| 1h: +0.059 / +0.045 (< cost 0.146)
+  rolling IC (all decision hours; coins with nonzero flow): fq4->24h disc +0.073 (t_day 3.3) / test +0.046 (t 2.0);
+      fd24->48h disc -0.021 / test +0.133 ; fd72->48h disc -0.054 (t -2.3) / test +0.131 (t +3.8)  -> sign flips between periods at 48h
+  tradable FLOW4 (|flow4/QV4|>=thr, 24h, non-overlapping per coin): disc-best thr=0.01: disc +0.27 -> test +0.11 (med -0.01), net -0.04 ; thr=0.003 test +0.48 (not disc-best), w/o top3 coins +0.29
+  FLOW24 grid (K=30): fq>=0.01 24h disc +0.33 / test +0.55 but w/o top3 coins -0.00 / +0.09; share of coins with positive mean 53% / 52%
+
+[D] coin level: daily IC of known whale SHORT overhang/depth with next 24h mnA: disc +0.032 / test -0.061 ; 72h +0.010 / -0.113 (inconsistent)
+  13.09-29.09 totals: PONS net whale BUY (short covering) 91 depth-units, PONS -15.8% raw / -28.9% vs idx; LIT net SELL 59.5 depths, -24% vs idx;
+  VVV net SELL 83 depths, -4.4%; CHIP net SELL 32 depths, -23%; NEAR net SELL 21 depths, +60% vs idx; XMR net BUY 38 depths, -18.5%.
+  pooled coin-days (21 big coins): spearman(net flow/depth, same-day mnA) disc +0.02 / test +0.11 ; next-day +0.07 / +0.14
+
+K (cells looked at, correlated): A ~42, B ~84 (incl. delay grid), C ~80, D ~14 -> ~220 in total.

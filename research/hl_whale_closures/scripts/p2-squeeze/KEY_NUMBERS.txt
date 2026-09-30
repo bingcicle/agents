@@ -1,0 +1,30 @@
+P2-SQUEEZE KEY NUMBERS (net %, SHORT coin + EW-alt hedge, costs 0.146+0.10, funding Binance Mar-Aug / HL proxy Sep)
+Grid: 44 pre-declared cells (GRID_DECLARED.txt). TRAIN Mar-Jun, TEST Jul-Sep(29). Pass criteria met by 0/44 cells.
+TRAIN cells mean>0: 32/44; TEST cells mean>0: 6/44.
+Structure: pumps with OI DROP are rare (L=1h ex>=3%: 3024 coin-hours, only 16 with dOI<=-5%); pumps are mostly OI-rise (new longs).
+SQZ (pump & OI drop), per cell TRAIN -> TEST mean:
+ L1: H4 +0.24->-0.30 | H12 +0.65->-0.17 | H24 +0.93->-0.10 | H48 +2.35(CIc .84,3.99)->-0.92
+ L4: H4 +0.20->-0.87 | H12 +0.92->-0.55 | H24 +0.89->-1.25 | H48 +2.05(CIc .69,3.39)->-1.61
+ L12: H4 +0.25->-0.72 | H12 +0.52->-0.91 | H24 +2.03(CIc .22,3.88)->-0.58 | H48 +3.48->-3.69
+ L24: H4 +0.98->-0.08 | H12 +1.78->-0.78 | H24 +3.44(CIc 1.75,5.32)->-2.63 | H48 +4.12->-8.13(CIc -14.7,-2.3)
+ Months SQZ L12H24: 03 +2.7 04 +2.4 05 +1.6 06 +1.7 | 07 -3.1 08 -2.3 09 +2.0 ; L24H24: +4.3 +5.0 +3.5 +2.3 | -4.3 -4.8 -0.1
+ Median TEST positive (+0.4..+2.9) while mean negative: short-gamma profile (squeezes that continue kill the mean).
+Controls: PLAIN (pump, flat OI) TRAIN -0.22..+0.80, TEST -0.76..+0.20; NEWLONG (pump, OI up) TRAIN -0.05..+0.30, TEST -0.16..+0.15.
+LIQDUMP LONG (fade dump w/ OI drop): TRAIN -0.35..-2.10 (dumps continue), TEST -1.22..+0.07. Post-hoc mirror (follow SHORT) L24H24:
+  TRAIN +1.61 (CIc .64,2.53), TEST +0.73 (CIc -0.30,1.89; CIw -0.88,2.58; wo10 -74) -> weak, not pre-declared.
+SQZTK (taker-buy share high): TEST -0.30..-5.61.
+Hedge: BTC hedge / unhedged same sign, slightly worse on TEST (e.g. L24H24 TEST btc -2.98 raw -3.66).
+Funding: we PAY on average 0.01..0.50% (squeezed coins have negative funding).
+Tails SQZ: worst trade -38..-183% (coin +250% MAE); worst week sum -21..-174% (equal notional/trade); MAE q90 9..50%.
+Stop-loss +10%/+20% on coin leg: does NOT fix TEST (e.g. L24H24 TEST -2.63 -> SL10 -1.82, SL20 -0.72; L4H24 -1.25 -> -1.30/-1.48); on TRAIN SL cuts the mean.
+  Hit rate SL20 at H24: 13-25%. Entry slippage (worst of entry minute vs close) 0.3-0.5%.
+Capacity: median 24h Binance volume of SQZ coins $35-76M (q10 $4-13M) -> ~1% = $0.05-0.7M per trade.
+PART B (27.08-28.09, sim_trades, short whale in loss being closed, dedup 1/coin/24h, EW hedge, 24h):
+ D_ANY (pnl<0) n=510: -0.05 (CIc -0.60,0.45)
+ D_ORIG (pnl<0 & liq_dist<5 frac) n=161: +0.93 (CIc .32,1.73; CId .16,1.68), sum wo top10% -34.7, halves +0.62/+1.32
+ liq_dist bins: <1 +0.81 (n61) | 1-5 +1.44 (n133) | 5-20 -0.48 (n234) | >20 -0.30 (n250)  -> non-monotone, threshold artefact
+ D_LEV (<1.0) n=61 +0.81 CIc(-0.37,2.26); D_NEAR (<0.3) n=13 +1.72 CIc(-0.20,3.92)
+ Whale events in generic SQZ signature: 3/161 (median ex24 +2.2%, dOI24 +0.2%) -> whale distress is NOT a squeeze in OI sense.
+ Generic SQZ-any coin-hours in same window: n=343, y24 mean -4.81 (squeezes kept going in Sep).
+ Value-add vs controls (D_ORIG): same coin, 1-12h BEFORE: +1.85 (CI>0); same coin 1-12h AFTER: +0.08 (CIc -0.37,0.62) -> entering hours later is just as good;
+   NN-matched other coins same week on ex4/ex24/dOI4/dOI24: +1.56 (CIc .60,2.85); OLS w coeff +1.07 t=2.11 (D_ANY: +0.16 t=0.5).

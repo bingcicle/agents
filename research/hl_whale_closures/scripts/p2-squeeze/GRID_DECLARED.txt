@@ -1,0 +1,32 @@
+PRE-DECLARED GRID (written 2026-09-30 before any outcome/return-after-decision was computed; only TRAIN feature distributions were looked at)
+Data: Binance USDT-M 1m klines + 5-min OI (metrics), 153 symbols, 2026-03-01..2026-09-29.
+Decision grid: every full hour t (UTC). Features use only data up to t:
+  ex_L  = coin return over [t-L, t] minus equal-weight mean return of all non-BTC symbols over the same window (1m closes).
+  dOI_L = sum_open_interest (contracts) of the 5-min bucket starting t-10min vs bucket starting t-10min-L (conservative publication lag).
+  tk_L  = taker-buy quote share over [t-L, t] from klines.
+Thresholds (fixed): X_L = {1h:3%, 4h:5%, 12h:8%, 24h:12%};  Y_L = {1h:1%, 4h:2%, 12h:4%, 24h:5%};
+  TK_L (q90 of tk among TRAIN pumps) = {1h:0.577, 4h:0.541, 12h:0.522, 24h:0.514}.
+Families:
+  SQZ     (we SHORT): ex_L >= X_L and dOI_L <= -Y_L                       L in {1,4,12,24} x H in {4,12,24,48}  = 16 cells  [PRIMARY]
+  PLAIN   (we SHORT): ex_L >= X_L and |dOI_L| < Y_L   (control)          L x H in {12,24}                     =  8
+  NEWLONG (we SHORT): ex_L >= X_L and dOI_L >= +Y_L   (control)          L x H in {12,24}                     =  8
+  LIQDUMP (we LONG) : ex_L <= -X_L and dOI_L <= -Y_L  (mirror)           L x H in {12,24}                     =  8
+  SQZTK   (we SHORT): ex_L >= X_L and dOI_L <= 0 and tk_L >= TK_L        L x H in {24}                        =  4
+  TOTAL 44 cells.
+Trade: entry at close of the minute ending t+2min; exit at close of minute ending t+2min+H. One position per coin per cell
+  (a new trigger in the same coin is ignored until the open one exits). Hedge (primary): opposite position in EW basket of all
+  non-BTC symbols ex coin (buy&hold weights). Also reported: BTC hedge, unhedged.
+Costs: 0.146 coin leg + 0.10 hedge leg (primary = 0.246 total); funding from Binance fundingRate archive (Mar-Aug), HL hourly
+  funding as proxy for Sep (0 if missing) -> sensitivity only.
+TRAIN = decisions 2026-03-02..2026-06-30; TEST = 2026-07-01..(exit <= 2026-09-29 23:59).
+Pass criteria (decided now): TRAIN mean > 0 and CI90(coin) lower > 0 AND TEST mean > 0 with CI90 by coin AND by week lower > 0,
+  and >= 5 of 7 months with positive mean, sum without top 10% trades > 0 on TEST. Anything else = not stable.
+Clustering: bootstrap CI90 by coin and by ISO week. Units = deduplicated trades (one per coin per cell while open).
+
+PART B (declared before computing any whale-event outcome): Sept whale leg from sim_trades.csv (27.08-28.09 decisions, exit<=29.09).
+  Whale SHORT position being bought back (sim our_side LONG), whale_pnl_pct<0. liq_dist is a FRACTION (liqPx/mark-1).
+  Variants: D_ORIG = pnl<0 & liq_dist<5 (phase-1 rule, = almost any leverage); D_LEV = pnl<0 & liq_dist<1.0; D_NEAR = pnl<0 & liq_dist<0.3;
+            D_ANY = pnl<0 (no liq filter).  Trade: SHORT coin, EW hedge, H=24h (also 4,12), costs 0.246 + funding.
+  Dedup: first tx of (wallet,coin) episode (gap 30 min), then one trade per coin per 24h.
+  Whale value-add tests: (1) same coin +-12h generic hourly entries (coin-day control); (2) nearest-neighbour generic coin-hours
+  (other coins, same week, no whale event +-24h) matched on ex_4, ex_24, dOI_4, dOI_24; (3) OLS on stacked sample with coin-clustered SE.

@@ -1,0 +1,51 @@
+WHALE-STATE LENS - PRE-DECLARED GRID (written before any TEST-period (22.09-29.09) outcome was computed or looked at)
+Written: 2026-09-30 ~21:05 UTC, after discovery exploration (explore_disc.py, regress_state.py disc) only.
+
+UNIVERSE U (events_state.parquet / build_events.py):
+  whale close tx (liq==0, Binance symbol) at which the wallet's rolling-60s close in this coin & direction reaches >=5% of the
+  position (sz / |startPosition| at the start of the 60 s) AND >=$5k, position ratio (batch_ratio) >=1.
+  Episode dedupe: per addr x coin x whale-trade-direction, a new event only after >30 min without such a tx.
+  Decision time dec = ceil(max(tx_ts + 1.5 s, bot_ts)) (bot_ts = when the bot actually saw the tx).
+  Periods: DISCOVERY = events with UTC day <= 2026-09-21 ; TEST = 2026-09-22 .. 2026-09-29.
+
+STATES (all computed from information known at dec; other wallets' txs count only if their bot_ts <= dec):
+  HERD30_1    exactly 1 other tracked wallet closed the same coin in the same direction (>= $1k) in the 30 min before the tx
+  HERD30_2P   >= 2 such other wallets in 30 min
+  HERD120_3P  >= 3 such other wallets in 120 min
+  HERDUSD30   other wallets' same-direction close USD in 30 min > 0.5 x HL 1%-depth
+  OPP30       other wallets' OPPOSITE-direction close USD in 30 min > 0.1 x depth (disagreement)
+  FRESH6      first material close after >= 6 h without any >= $1k close of this wallet in this coin (only if wallet tracked >= 6 h)
+  NEARFULL    rolling-60s close >= 50% of the position
+  MULTICOIN   wallet closed >= 3 distinct coins (>= $1k txs) before the event (past-only)
+  WDISTRESS   whale PnL at the close < -3% (price return from whale entry; entry from HL API closedPnl; events without API data excluded)
+  WPROFIT     whale PnL at the close > +3%
+
+HORIZONS / METRICS (our side = whale trade direction for 'fol', opposite for 'fad'):
+  S300, S1800 : entry worst-in-3s on Binance 1s bars at [dec, dec+2] (buy=max high, sell=min low; fallback 10 s),
+                exit worst-in-3s at dec+H. net = gross - 0.146 - side * EW-alt-index move over the window (market-neutral).
+  L8, L24     : entry close of the 1m candle opening at the first full minute after dec, exit h hours later;
+                net = side*(coin - EW-alt index) - 0.146 - funding paid by our side (HL hourly funding proxy). Hedge-leg cost NOT included
+                (sensitivity +0.10 reported).
+  Dedupe per cell: one open trade per coin & our side; an event is skipped while a previous kept trade of the same coin & side is open.
+
+GRID: 10 states x 4 horizons = 40 cells. Direction of each cell = the better of fol/fad by DISCOVERY net mean (so K on discovery = 80).
+Discovery candidate criteria: n >= 15, net mean > 0, net median > 0, state-label null p < 0.10.
+Null: shuffle the state label within coin x day among events whose state is known (500 perms), recompute cell (with dedupe) mean;
+  p = P(null mean >= observed). Also count cells with p < 0.05 vs 40*0.05 = 2 expected by chance.
+TEST: evaluate ALL 40 cells once in the declared direction; a candidate survives only if test mean > 0, median > 0,
+  CI90 of the mean (cluster bootstrap by coin AND by day) above 0, both halves > 0, sum without top-10% > 0, and
+  no coin / wallet / day > 50% of the positive sum.
+
+ADDENDUM (written 2026-09-30 ~21:05 UTC, still before any TEST outcome was computed/looked at)
+Reason: HL API gives whale PnL only for ~10% of U events (10k-most-recent-fills limit), so distress/profit-taking is ALSO tested on
+universe S = the bot simulator's own trigger events (sim_trades.csv, 27.08-29.09, episode-deduped per wallet x coin x side / 30 min),
+which carry whale_pnl_pct and liq_dist computed AT THE TRIGGER (verified vs HL closedPnl in probe_pnl.py). Discovery = 27.08-21.09.
+Decision = sim open time (CEST -> UTC-2h); same metrics/dedupe/null as above.
+S-GRID (5 states x 2 horizons = 10 cells, direction by discovery -> K = 20):
+  S_WPROFIT3  whale PnL > +3%      S_WPROFIT10 whale PnL >= +10%     S_WLOSS3 whale PnL < -3%
+  S_LIQ5      liq distance < 5%    S_DISTRESS  whale PnL < 0 AND liq distance < 5%
+  horizons S300, L24.
+Extra control for S-grid: "excess over generic reversal" = cell mean of residuals after regressing the outcome on the coin's own past
+  market-neutral returns (24h, 72h, 7d) with coefficients fitted on DISCOVERY S events only.
+Discovery note (already seen): in S discovery the whale-PnL effect on 24h mn return (+0.57 per 10 pp, t=1.9) vanishes once the coin's
+  past 24h/72h/7d market-neutral return is controlled (coef -0.02, t=-0.1) -> expected to be generic reversal, not whale state.

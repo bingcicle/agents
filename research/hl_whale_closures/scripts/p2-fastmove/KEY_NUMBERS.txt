@@ -1,0 +1,17 @@
+p2-fastmove KEY NUMBERS (1m Binance klines 2026-03-01..09-29, 151 alts, equal-weight alt index; grid K=58 pre-declared in GRID_PREDECLARED.txt)
+Events (non-overlapping per coin per cell): 705,884 trades across 58 cells. TRAIN=Mar-Jun, TEST=Jul-Sep.
+Selection rule (train n>=200 & coin-CI90 lower>0 at base cost 0.246): NO cell passes -> verdict negative by pre-declared rule.
+Alt index monthly: Mar -7.8, Apr +9.3, May -0.1, Jun -21.6, Jul -4.4, Aug +21.9, Sep +24.7 (%).
+Generic dump-fade GROSS (H60): A_DUMP_X1.5_N3 train +0.133 test +0.234 (w/o 08-22 +0.205); gross>0 in 7/7 months (+0.04..+0.39); neutral 7/7 >0 (+0.02..+0.29).
+  net base: train -0.113 CI(coin) [-0.166,-0.056]; test -0.012 [-0.093,+0.066]; Sep only -0.081 (n=2128).
+A_DUMP_X2_N5: gross train +0.123 test +0.347 (w/o 08-22 +0.269); net train -0.123 [-0.202,-0.037], test +0.101 [-0.004,+0.194]; Sep -0.031.
+Big dumps X>=3: train negative (X5_N3 net -1.01, X3_N1 -0.78); test positive (X5_N3 +1.44, X3_N1 +0.98) but >=100% of test sum comes from ONE day 2026-08-22 (alt index +7.4% -> -7.6% within hour 05 UTC). W/o top-3 days: X3_N3 -0.001, X5_N5 -0.13, X3_N1 -0.28.
+Pump fade: train gross +0.03..+0.97 (works in down/flat months), test gross negative (Aug -0.3..-2.1): trend artifact. A_PUMP_X2_N5 net train -0.070, test -0.298 [-0.408,-0.184].
+Regime (ex-post calendar week): A_DUMP_X2_N5 test gross up-week +0.501 vs down-week +0.086; A_PUMP_X3_N3 test up-week -0.538 vs down-week +0.308.
+Filters: VOLHI dump test net +0.229 but w/o top3 days +0.042 (08-22 share 0.84 of 3 days); OIDN dump train net -0.068, test +0.151, test w/o 08-22 +0.093 CI[-0.066,+0.245]; monthly gross OIDN -0.24..+0.61 (2 of 7 months negative).
+Low cost (0.15) cells >0 in train and test(w/o 08-22): A_DUMP_X2_N3 (+0.026/+0.036), B_DUMP_OIDN (+0.028/+0.189), A_PUMP_X5_N1/N5 (unstable) -> all ~breakeven.
+TP +1% (B_DUMP_TP1): win 77% but mean net -0.114 CI[-0.143,-0.086]; tails q1 -9.0%, min -39%.
+Tails (all period) A_DUMP_X1.5_N3: q1 -9.8%, q5 -5.0%, min -41.7%, max +57%; sum w/o top10% strongly negative.
+Whale add-on (Sep 12-29, whale close >= $5k same direction in move window): A_DUMP_X1.5_N3 whale n=101 net -0.080 vs no-whale same coins n=1088 +0.035; X2_N5 whale n=80 -0.843 [-1.78,-0.10] vs no-whale +0.215; within-coin diff -0.615. Whale adds nothing (if anything worse).
+Liquidity: dump-fade gross not concentrated in illiquid coins (X2_N5 test liq tercile +0.42, illiq +0.38; train illiq -0.02).
+Caveat: entry at 1m open after detection (optimistic vs worst-in-3s tape rule), so real numbers are lower still.
